@@ -159,16 +159,18 @@
         }
 
         .wrap {
-            max-width: 1440px;
+            max-width: 1480px;
             margin: 0 auto;
-            padding: 28px 28px 72px;
+            padding: 20px 32px 72px;
         }
 
         .topbar {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            margin-bottom: 26px;
+            min-height: 52px;
+            margin-bottom: 22px;
+            padding: 0 2px;
         }
 
         .brand {
@@ -178,8 +180,8 @@
         }
 
         .brand-mark {
-            width: 40px;
-            height: 40px;
+            width: 42px;
+            height: 42px;
             display: grid;
             place-items: center;
             border-radius: 10px;
@@ -191,9 +193,9 @@
         }
 
         .brand h1 {
-            font-size: 18px;
+            font-size: 16px;
             font-weight: 600;
-            letter-spacing: .02em;
+            letter-spacing: .01em;
             margin: 0;
         }
 
@@ -252,19 +254,26 @@
         }
 
         .stepper {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 22px;
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 0;
+            margin: 0 0 24px;
+            padding: 5px;
+            border: 1px solid var(--line);
+            border-radius: 14px;
+            background: var(--panel-bg);
+            box-shadow: var(--shadow-sm);
         }
 
         .step-btn {
             display: inline-flex;
             align-items: center;
+            justify-content: center;
             gap: 10px;
-            padding: 10px 18px;
+            padding: 11px 18px;
             border-radius: 10px;
-            border: 1px solid var(--line);
-            background: var(--step-bg);
+            border: 1px solid transparent;
+            background: transparent;
             color: var(--muted);
             cursor: pointer;
             transition: .18s ease;
@@ -302,9 +311,12 @@
             background: var(--panel-bg);
             border: 1px solid var(--line);
             border-radius: 14px;
-            padding: 22px;
+            padding: 24px;
             margin-bottom: 18px;
+            box-shadow: var(--shadow-sm);
         }
+
+        .panel:hover { border-color: var(--line-strong); }
 
         .panel-title {
             display: flex;
@@ -1006,6 +1018,61 @@
             color: var(--on-accent-hover);
         }
 
+        /* Product workspace: quiet hierarchy, explicit operating context, and guided flow. */
+        .workspace-hero {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 28px;
+            align-items: end;
+            padding: 28px 30px;
+            margin-bottom: 18px;
+            overflow: hidden;
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            background: linear-gradient(118deg, var(--panel-bg) 0%, var(--tint-accent-bg) 100%);
+            box-shadow: var(--shadow-sm);
+        }
+        .eyebrow {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 10px;
+            color: var(--accent);
+            font-family: "IBM Plex Mono", monospace;
+            font-size: 11px;
+            font-weight: 500;
+            letter-spacing: .12em;
+            text-transform: uppercase;
+        }
+        .eyebrow::before { content: ""; width: 18px; height: 1px; background: currentColor; }
+        .workspace-hero h2 { margin: 0; font-size: clamp(24px, 3vw, 32px); font-weight: 600; letter-spacing: -.025em; }
+        .workspace-hero p { max-width: 680px; margin: 10px 0 0; color: var(--muted); font-size: 14px; line-height: 1.65; }
+        .workspace-meta { display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+        .workspace-meta-item { min-width: 122px; padding: 10px 12px; border-left: 1px solid var(--line); }
+        .workspace-meta-label { display: block; color: var(--muted); font-size: 11px; letter-spacing: .04em; }
+        .workspace-meta-value { display: block; margin-top: 4px; color: var(--text); font-family: "IBM Plex Mono", monospace; font-size: 12px; font-weight: 500; }
+        .workspace-meta-value.online { color: var(--success); }
+        .flow-heading { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin: 0 0 10px; }
+        .flow-heading h3 { margin: 0; font-size: 13px; font-weight: 600; }
+        .flow-heading span { color: var(--muted); font-size: 12px; }
+        .scheme-picker { gap: 10px; margin-bottom: 12px; }
+        .scheme-card { position: relative; min-height: 102px; padding: 16px 18px 14px 50px; border-radius: 12px; }
+        .scheme-card::before { position: absolute; left: 17px; top: 17px; color: var(--muted); font-family: "IBM Plex Mono", monospace; font-size: 11px; content: "0" counter(scheme); }
+        .scheme-picker { counter-reset: scheme; }
+        .scheme-card { counter-increment: scheme; }
+        .scheme-card.active::before { color: var(--accent); }
+        .scheme-name { font-size: 14px; }
+        .scheme-desc { line-height: 1.5; }
+        .scheme-needs { display: flex; align-items: center; min-height: 24px; margin: 0 0 18px; padding: 0 2px; }
+        #profile-panel { border-left: 3px solid var(--accent); }
+        #profile-panel .panel-title::before { display: none; }
+        .panel-title { font-size: 16px; }
+        .form-control, .custom-select { min-height: 38px; }
+        .form-group { margin-bottom: 1rem; }
+        .badge { padding: .34em .58em; border-radius: 999px; font-weight: 600; letter-spacing: .02em; }
+        .step-btn:not(.active) { background: transparent; }
+        .step-btn:not(.active):hover { background: var(--surface-chip); }
+
         @media (max-width: 900px) {
             .wrap { padding: 18px 14px 56px; }
             .checklist-toolbar { grid-template-columns: 1fr; }
@@ -1017,7 +1084,10 @@
             .nic-row .nic-source,
             .nic-row .nic-state { grid-column: 1 / -1; }
             .nic-row .nic-state { width: 22px; height: 22px; }
-            .stepper { flex-wrap: wrap; }
+            .stepper { grid-template-columns: 1fr; gap: 4px; }
+            .workspace-hero { grid-template-columns: 1fr; padding: 22px; }
+            .workspace-meta { justify-content: flex-start; }
+            .workspace-meta-item { border-left: 0; border-top: 1px solid var(--line); }
         }
 
         .scheme-picker {
@@ -1135,6 +1205,22 @@
         </div>
     </div>
 
+    <section class="workspace-hero" aria-labelledby="workspace-title">
+        <div>
+            <div class="eyebrow">Migration control plane</div>
+            <h2 id="workspace-title">跨云虚拟机迁移工作区</h2>
+            <p>以可预检、可追踪、可恢复的流程，完成 OpenStack 与 Ceph 环境之间的块存储迁移。先建立连接，再选择工作负载，最后在统一视图中管控切换。</p>
+        </div>
+        <div class="workspace-meta" aria-label="工作区状态">
+            <div class="workspace-meta-item"><span class="workspace-meta-label">CONTROL PLANE</span><span class="workspace-meta-value online">● ONLINE</span></div>
+            <div class="workspace-meta-item"><span class="workspace-meta-label">CURRENT STAGE</span><span class="workspace-meta-value" id="workspace-stage">01 / CONNECT</span></div>
+        </div>
+    </section>
+
+    <div class="flow-heading">
+        <h3>选择数据迁移路径</h3>
+        <span>根据源端存储类型选择最合适的传输通道</span>
+    </div>
     <section class="scheme-picker" id="scheme-picker" aria-label="迁移方案">
         <button type="button" class="scheme-card active" data-scheme="rbd_full">
             <span class="scheme-head"><span class="scheme-name">RBD 直连 · 全量</span><span class="scheme-tag">推荐</span></span>
@@ -2396,6 +2482,9 @@ async function initProfilePanel() {
 function switchStep(step) {
     $$('.step-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.step === String(step)));
     for (let i = 1; i <= 3; i++) $('#step-' + i).classList.toggle('hidden', i !== step);
+    const stage = $('#workspace-stage');
+    const stageLabels = { 1: '01 / CONNECT', 2: '02 / PLAN', 3: '03 / MONITOR' };
+    if (stage) stage.textContent = stageLabels[step] || '01 / CONNECT';
     const page = $('#relay-resource-page');
     if (page) page.classList.add('hidden');
 }
