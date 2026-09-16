@@ -1,0 +1,4271 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>跨云 RBD 迁移控制台</title>
+    <script>
+        (function () {
+            try {
+                var saved = localStorage.getItem('migrate-theme');
+                if (saved === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+            } catch (err) { /* localStorage 不可用时按浅色主题渲染 */ }
+        })();
+    </script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/bootstrap.min.css') }}">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+
+        :root {
+            color-scheme: light;
+            --bg: #f4f6f9;
+            --panel: #ffffff;
+            --panel-2: #f8fafc;
+            --line: #e2e8f0;
+            --line-strong: #cbd5e1;
+            --border-input: #94a3b8;
+            --text: #1f2937;
+            --muted: #607089;
+            --accent: #2563eb;
+            --accent-2: #1d4ed8;
+            --accent-hover: #1d4ed8;
+            --success: #047857;
+            --danger: #b91c1c;
+            --warn: #92400e;
+            --on-accent: #ffffff;
+            --on-accent-hover: #ffffff;
+            --body-bg-image:
+                radial-gradient(circle at 12% -10%, rgba(37, 99, 235, .07), transparent 32%),
+                radial-gradient(circle at 88% 4%, rgba(29, 78, 216, .05), transparent 26%),
+                linear-gradient(180deg, #f4f6f9 0%, #eef2f7 100%);
+            --panel-bg: linear-gradient(180deg, #ffffff 0%, #fbfcfe 100%);
+            --preview-bg: linear-gradient(180deg, #ffffff 0%, #fbfcfe 100%);
+            --surface-soft: #f8fafc;
+            --surface-softer: #f8fafc;
+            --surface-chip: #f1f5f9;
+            --control-bg: #ffffff;
+            --control-focus-bg: #ffffff;
+            --control-focus-ring: rgba(37, 99, 235, .18);
+            --placeholder: #64748b;
+            --code-bg: #f1f5f9;
+            --code-fg: #334155;
+            --toast-bg: #ffffff;
+            --kv-line: #e2e8f0;
+            --step-bg: #ffffff;
+            --brand-mark-bg: linear-gradient(135deg, rgba(37, 99, 235, .16), rgba(29, 78, 216, .04));
+            --brand-mark-border: rgba(37, 99, 235, .35);
+            --dot-glow: rgba(4, 120, 87, .35);
+            --num-bg: rgba(15, 23, 42, .06);
+            --num-active-bg: rgba(255, 255, 255, .3);
+            --row-hover-bg: #eff6ff;
+            --row-hover-border: #bfdbfe;
+            --scheme-active-bg: linear-gradient(135deg, #e0ecff, #ffffff 70%);
+            --relay-node-border: #e2e8f0;
+            --tint-success-bg: #ecfdf5;
+            --tint-success-border: #a7f3d0;
+            --tint-danger-bg: #fef2f2;
+            --tint-danger-border: #fecaca;
+            --tint-warn-bg: #fffbeb;
+            --tint-warn-border: #fde68a;
+            --tint-accent-bg: #eff6ff;
+            --tint-accent-border: #bfdbfe;
+            --tint-muted-bg: #f1f5f9;
+            --tint-muted-border: #e2e8f0;
+            --state-ready: #047857;
+            --state-busy: #2563eb;
+            --state-unhealthy: #b91c1c;
+            --state-provisioning: #b45309;
+            --shadow-sm: 0 1px 2px rgba(15, 23, 42, .06);
+            --shadow-lg: 0 10px 30px rgba(15, 23, 42, .12);
+        }
+
+        [data-theme="dark"] {
+            color-scheme: dark;
+            --bg: #0b1220;
+            --panel: #111a2c;
+            --panel-2: #0e1626;
+            --line: #243247;
+            --line-strong: #33455f;
+            --border-input: #33455f;
+            --text: #dbe7f4;
+            --muted: #8296ae;
+            --accent: #38bdf8;
+            --accent-2: #0ea5e9;
+            --accent-hover: #7dd3fc;
+            --success: #34d399;
+            --danger: #f87171;
+            --warn: #fbbf24;
+            --on-accent: #062033;
+            --on-accent-hover: #04192b;
+            --body-bg-image:
+                radial-gradient(circle at 12% -10%, rgba(56, 189, 248, .12), transparent 32%),
+                radial-gradient(circle at 88% 4%, rgba(14, 165, 233, .08), transparent 26%),
+                linear-gradient(180deg, #0b1220 0%, #0a101c 100%);
+            --panel-bg: linear-gradient(180deg, rgba(20, 31, 53, .85), rgba(15, 24, 42, .92));
+            --preview-bg: linear-gradient(180deg, rgba(19, 30, 50, .9), rgba(12, 20, 34, .94));
+            --surface-soft: rgba(8, 15, 27, .35);
+            --surface-softer: rgba(13, 21, 36, .45);
+            --surface-chip: rgba(130, 150, 174, .08);
+            --control-bg: #0e1626;
+            --control-focus-bg: #0c1524;
+            --control-focus-ring: rgba(56, 189, 248, .15);
+            --placeholder: #5e7190;
+            --code-bg: #0b1424;
+            --code-fg: #b9cde4;
+            --toast-bg: #101a2e;
+            --kv-line: rgba(36, 50, 71, .7);
+            --step-bg: rgba(17, 26, 44, .75);
+            --brand-mark-bg: linear-gradient(135deg, rgba(56, 189, 248, .22), rgba(14, 165, 233, .06));
+            --brand-mark-border: rgba(56, 189, 248, .45);
+            --dot-glow: rgba(52, 211, 153, .6);
+            --num-bg: rgba(255, 255, 255, .12);
+            --num-active-bg: rgba(0, 0, 0, .16);
+            --row-hover-bg: rgba(56, 189, 248, .06);
+            --row-hover-border: rgba(56, 189, 248, .3);
+            --scheme-active-bg: linear-gradient(135deg, rgba(56, 189, 248, .14), rgba(17, 26, 44, .85));
+            --relay-node-border: rgba(255, 255, 255, .06);
+            --tint-success-bg: rgba(52, 211, 153, .1);
+            --tint-success-border: rgba(52, 211, 153, .4);
+            --tint-danger-bg: rgba(248, 113, 113, .1);
+            --tint-danger-border: rgba(248, 113, 113, .5);
+            --tint-warn-bg: rgba(251, 191, 36, .1);
+            --tint-warn-border: rgba(251, 191, 36, .4);
+            --tint-accent-bg: rgba(56, 189, 248, .08);
+            --tint-accent-border: rgba(56, 189, 248, .4);
+            --tint-muted-bg: rgba(130, 150, 174, .08);
+            --tint-muted-border: #243247;
+            --state-ready: #34d399;
+            --state-busy: #60a5fa;
+            --state-unhealthy: #f87171;
+            --state-provisioning: #fbbf24;
+            --shadow-sm: 0 1px 2px rgba(0, 0, 0, .3);
+            --shadow-lg: 0 12px 30px rgba(0, 0, 0, .45);
+        }
+
+        html, body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: "IBM Plex Sans", "Noto Sans SC", sans-serif;
+            min-height: 100vh;
+        }
+
+        body {
+            background-image: var(--body-bg-image);
+            background-attachment: fixed;
+        }
+
+        .mono {
+            font-family: "IBM Plex Mono", monospace;
+        }
+
+        .wrap {
+            max-width: 1440px;
+            margin: 0 auto;
+            padding: 28px 28px 72px;
+        }
+
+        .topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 26px;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .brand-mark {
+            width: 40px;
+            height: 40px;
+            display: grid;
+            place-items: center;
+            border-radius: 10px;
+            background: var(--brand-mark-bg);
+            border: 1px solid var(--brand-mark-border);
+            color: var(--accent);
+            font-size: 18px;
+            font-weight: 600;
+        }
+
+        .brand h1 {
+            font-size: 18px;
+            font-weight: 600;
+            letter-spacing: .02em;
+            margin: 0;
+        }
+
+        .brand small {
+            color: var(--muted);
+            display: block;
+            font-size: 12px;
+            margin-top: 2px;
+        }
+
+        .health {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .topbar-actions {
+            display: inline-flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .theme-toggle {
+            display: inline-grid;
+            place-items: center;
+            width: 34px;
+            height: 34px;
+            padding: 0;
+            border-radius: 10px;
+            border: 1px solid var(--line);
+            background: var(--step-bg);
+            color: var(--muted);
+            cursor: pointer;
+            transition: border-color .18s ease, color .18s ease, background .18s ease;
+        }
+
+        .theme-toggle:hover {
+            border-color: var(--accent);
+            color: var(--accent);
+            background: var(--tint-accent-bg);
+        }
+
+        .theme-toggle svg { width: 16px; height: 16px; }
+        .theme-toggle .icon-moon { display: none; }
+        [data-theme="dark"] .theme-toggle .icon-sun { display: none; }
+        [data-theme="dark"] .theme-toggle .icon-moon { display: block; }
+
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--success);
+            box-shadow: 0 0 10px var(--dot-glow);
+        }
+
+        .stepper {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 22px;
+        }
+
+        .step-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 18px;
+            border-radius: 10px;
+            border: 1px solid var(--line);
+            background: var(--step-bg);
+            color: var(--muted);
+            cursor: pointer;
+            transition: .18s ease;
+            user-select: none;
+        }
+
+        .step-btn:hover {
+            border-color: var(--line-strong);
+            color: var(--text);
+        }
+
+        .step-btn.active {
+            color: var(--on-accent);
+            background: var(--accent);
+            border-color: var(--accent);
+            font-weight: 600;
+        }
+
+        .step-btn .num {
+            width: 22px;
+            height: 22px;
+            border-radius: 7px;
+            display: grid;
+            place-items: center;
+            font-family: "IBM Plex Mono", monospace;
+            font-size: 12px;
+            background: var(--num-bg);
+        }
+
+        .step-btn.active .num {
+            background: var(--num-active-bg);
+        }
+
+        .panel {
+            background: var(--panel-bg);
+            border: 1px solid var(--line);
+            border-radius: 14px;
+            padding: 22px;
+            margin-bottom: 18px;
+        }
+
+        .panel-title {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 15px;
+            font-weight: 600;
+            margin-bottom: 18px;
+        }
+
+        .panel-title::before {
+            content: "";
+            width: 4px;
+            height: 16px;
+            border-radius: 2px;
+            background: var(--accent);
+        }
+
+        .form-label {
+            color: var(--muted);
+            font-size: 12px;
+            letter-spacing: .02em;
+            margin-bottom: 6px;
+        }
+
+        .form-control, .custom-select {
+            background: var(--control-bg);
+            border: 1px solid var(--border-input);
+            color: var(--text);
+            border-radius: 8px;
+            font-size: 13px;
+        }
+
+        .form-control:focus, .custom-select:focus {
+            background: var(--control-focus-bg);
+            border-color: var(--accent-2);
+            color: var(--text);
+            box-shadow: 0 0 0 .18rem var(--control-focus-ring);
+        }
+
+        .form-control::placeholder {
+            color: var(--placeholder);
+        }
+
+        .section-head {
+            margin: 4px 0 16px;
+            color: var(--text);
+        }
+
+        .btn {
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            transition: .18s ease;
+        }
+
+        .btn-accent {
+            background: var(--accent);
+            color: var(--on-accent);
+            border: 1px solid var(--accent);
+        }
+
+        .btn-accent:hover {
+            background: var(--accent-hover);
+            border-color: var(--accent-hover);
+            color: var(--on-accent-hover);
+        }
+
+        .btn-ghost {
+            background: transparent;
+            color: var(--text);
+            border: 1px solid var(--line-strong);
+        }
+
+        .btn-ghost:hover {
+            background: var(--tint-accent-bg);
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        .btn-danger-ghost {
+            background: transparent;
+            color: var(--danger);
+            border: 1px solid transparent;
+        }
+
+        .btn-danger-ghost:hover {
+            border-color: var(--tint-danger-border);
+        }
+
+        .btn:disabled {
+            opacity: .45;
+            pointer-events: none;
+        }
+
+        .divider {
+            height: 1px;
+            background: var(--line);
+            margin: 20px 0;
+        }
+
+        .table {
+            color: var(--text);
+            font-size: 13px;
+            margin: 0;
+        }
+
+        .table th {
+            color: var(--muted);
+            border-color: var(--line);
+            font-weight: 500;
+            white-space: nowrap;
+        }
+
+        .table td {
+            border-color: var(--line);
+            vertical-align: middle;
+        }
+
+        .empty {
+            color: var(--muted);
+            text-align: center;
+            padding: 30px 12px;
+            font-size: 13px;
+        }
+
+        .checklist-head {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 18px;
+            margin-bottom: 18px;
+        }
+
+        .checklist-head .panel-title {
+            margin-bottom: 6px;
+        }
+
+        .checklist-state {
+            flex: 0 0 auto;
+            font-size: 12px;
+            color: var(--muted);
+            padding: 6px 10px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: var(--surface-chip);
+            white-space: nowrap;
+        }
+
+        .checklist-state.ready {
+            color: var(--success);
+            border-color: var(--tint-success-border);
+            background: var(--tint-success-bg);
+        }
+
+        .checklist-state.warn {
+            color: var(--warn);
+            border-color: var(--tint-warn-border);
+            background: var(--tint-warn-bg);
+        }
+
+        .checklist-toolbar {
+            display: grid;
+            grid-template-columns: minmax(320px, 1.35fr) minmax(220px, .8fr) auto;
+            align-items: end;
+            gap: 22px;
+            padding: 16px;
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            background: var(--surface-softer);
+            margin-bottom: 16px;
+        }
+
+        .toolbar-group {
+            min-width: 0;
+        }
+
+        .toolbar-group > label {
+            display: block;
+            color: var(--muted);
+            font-size: 12px;
+            letter-spacing: .02em;
+            margin-bottom: 7px;
+        }
+
+        .toolbar-group .source-load-row {
+            display: flex;
+            gap: 8px;
+        }
+
+        .toolbar-group .source-load-row input {
+            flex: 1 1 auto;
+            min-width: 0;
+        }
+
+        #load-source-vms {
+            flex: 0 0 auto;
+            white-space: nowrap;
+        }
+
+        .toolbar-start {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 12px;
+            padding-bottom: 1px;
+        }
+
+        .selected-chip {
+            color: var(--muted);
+            font-size: 12px;
+            border: 1px solid var(--line);
+            border-radius: 999px;
+            background: var(--surface-chip);
+            padding: 5px 10px;
+            white-space: nowrap;
+        }
+
+        .selected-chip:not(:empty)::before {
+            content: "已选 ";
+        }
+
+        #start-migration {
+            white-space: nowrap;
+        }
+
+        .source-server-list {
+            max-height: 360px;
+            overflow: auto;
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            padding: 10px;
+            margin-bottom: 12px;
+            background: var(--surface-soft);
+        }
+
+        .source-server-row {
+            display: grid;
+            grid-template-columns: 26px 180px 1fr;
+            align-items: center;
+            gap: 12px;
+            padding: 8px 10px;
+            border: 1px solid transparent;
+            border-radius: 8px;
+            margin-bottom: 4px;
+            cursor: pointer;
+        }
+
+        .source-server-row:hover {
+            background: var(--row-hover-bg);
+            border-color: var(--row-hover-border);
+        }
+
+        .source-server-row .source-name {
+            font-weight: 600;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .source-server-row .source-meta {
+            color: var(--muted);
+            font-size: 12px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .advanced-excel {
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            padding: 10px 14px;
+            margin-bottom: 14px;
+            background: var(--surface-softer);
+        }
+
+        .advanced-excel summary {
+            color: var(--muted);
+            cursor: pointer;
+            font-size: 13px;
+            user-select: none;
+        }
+
+        .excel-body {
+            margin-top: 12px;
+        }
+
+        .preview-card {
+            background: var(--preview-bg);
+            border: 1px solid var(--line);
+            border-radius: 14px;
+            padding: 20px 22px;
+            margin-bottom: 14px;
+            transition: border-color .2s ease;
+        }
+
+        .preview-card.has-issue {
+            border-color: var(--tint-warn-border);
+        }
+
+        .plan-card-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            margin-bottom: 18px;
+        }
+
+        .preview-card .plan-card-body.hidden + .plan-card-head { margin-bottom: 0; }
+        .preview-card:has(.plan-card-body.hidden) .plan-card-head { margin-bottom: 0; }
+        .plan-card-body.hidden { margin-top: 0; }
+        .plan-card-body { margin-top: 18px; }
+        .plan-summary {
+            margin-top: 4px;
+            color: var(--muted);
+            font-size: 12px;
+        }
+        .plan-expand { flex: none; }
+        .bulk-bar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 12px;
+        }
+
+        .plan-title {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            min-width: 0;
+        }
+
+        .plan-index {
+            font-family: "IBM Plex Mono", monospace;
+            font-size: 11px;
+            color: var(--accent);
+            border: 1px solid var(--tint-accent-border);
+            background: var(--tint-accent-bg);
+            border-radius: 7px;
+            padding: 3px 7px;
+            letter-spacing: .06em;
+        }
+
+        .plan-title .name {
+            font-size: 16px;
+            font-weight: 600;
+            letter-spacing: .01em;
+        }
+
+        .plan-title .plan-sub {
+            color: var(--muted);
+            font-size: 12px;
+            margin-top: 3px;
+        }
+
+        .plan-state {
+            flex: 0 0 auto;
+            border-radius: 999px;
+            font-size: 12px;
+            padding: 5px 11px;
+            white-space: nowrap;
+        }
+
+        .plan-state.missing {
+            color: var(--warn);
+            background: var(--tint-warn-bg);
+            border: 1px solid var(--tint-warn-border);
+        }
+
+        .plan-state.ok {
+            color: var(--success);
+            background: var(--tint-success-bg);
+            border: 1px solid var(--tint-success-border);
+        }
+
+        .plan-section-title {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--muted);
+            letter-spacing: .04em;
+            margin: 0 0 12px;
+        }
+
+        .plan-section-title::before {
+            content: "";
+            width: 14px;
+            height: 1px;
+            background: var(--line-strong);
+        }
+
+        .spec-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(180px, 1fr));
+            gap: 14px;
+        }
+
+        .field label {
+            display: block;
+            color: var(--muted);
+            font-size: 12px;
+            margin-bottom: 6px;
+        }
+
+        .network-section {
+            margin-top: 20px;
+            padding-top: 16px;
+            border-top: 1px dashed var(--line);
+        }
+
+        .nic-header,
+        .nic-row {
+            display: grid;
+            grid-template-columns: minmax(170px, 1.1fr) minmax(160px, .9fr) minmax(180px, 1fr) minmax(140px, .85fr) 34px;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .nic-header {
+            color: var(--muted);
+            font-size: 11px;
+            letter-spacing: .04em;
+            margin-bottom: 8px;
+            padding: 0 10px;
+        }
+
+        .nic-row {
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            background: var(--surface-soft);
+            padding: 10px;
+            margin-bottom: 8px;
+            transition: border-color .18s ease, background .18s ease;
+        }
+
+        .nic-row.is-missing {
+            border-color: var(--tint-warn-border);
+            background: var(--tint-warn-bg);
+        }
+
+        .nic-source {
+            min-width: 0;
+        }
+
+        .nic-source .nic-net {
+            font-size: 13px;
+            color: var(--text);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .nic-source .nic-addr {
+            font-family: "IBM Plex Mono", monospace;
+            font-size: 11px;
+            color: var(--muted);
+            margin-top: 2px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .nic-state {
+            display: grid;
+            place-items: center;
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            font-size: 12px;
+        }
+
+        .nic-state.ok {
+            color: var(--success);
+            background: var(--tint-success-bg);
+        }
+
+        .nic-state.warn {
+            color: var(--warn);
+            background: var(--tint-warn-bg);
+        }
+
+        .source-warn-box {
+            border-left: 3px solid var(--warn);
+            background: var(--tint-warn-bg);
+            color: var(--warn);
+            border-radius: 8px;
+            padding: 10px 12px;
+            font-size: 12px;
+        }
+
+        .badge {
+            border-radius: 6px;
+            font-weight: 500;
+            padding: 5px 9px;
+        }
+
+        .badge-success { background: var(--tint-success-bg); color: var(--success); }
+        .badge-danger { background: var(--tint-danger-bg); color: var(--danger); }
+        .badge-warning { background: var(--tint-warn-bg); color: var(--warn); }
+        .badge-info { background: var(--tint-accent-bg); color: var(--accent); }
+        .badge-secondary { background: var(--tint-muted-bg); color: var(--muted); }
+
+        .vm-card {
+            background: var(--panel-2);
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            padding: 16px 18px;
+            margin-bottom: 12px;
+        }
+
+        .vm-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 14px;
+            cursor: pointer;
+        }
+
+        .vm-head .name {
+            font-weight: 600;
+        }
+
+        .phase {
+            color: var(--muted);
+            font-family: "IBM Plex Mono", monospace;
+            font-size: 12px;
+        }
+
+        .progress-thin {
+            height: 4px;
+            background: var(--line);
+            border-radius: 2px;
+            overflow: hidden;
+            margin-top: 12px;
+        }
+
+        .progress-thin > div {
+            height: 100%;
+            background: var(--accent);
+            transition: width .4s ease;
+        }
+
+        .error-box {
+            border-left: 3px solid var(--danger);
+            background: var(--tint-danger-bg);
+            padding: 10px 12px;
+            border-radius: 8px;
+            color: var(--danger);
+            font-size: 12px;
+            margin-top: 12px;
+        }
+
+        .success-box {
+            border-left: 3px solid var(--success);
+            background: var(--tint-success-bg);
+            padding: 10px 12px;
+            border-radius: 8px;
+            color: var(--success);
+            font-size: 13px;
+            font-weight: 600;
+            margin-top: 12px;
+        }
+
+        .job-list-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            width: 100%;
+            text-align: left;
+            background: var(--panel-2);
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 8px 12px;
+            color: var(--text);
+            margin-bottom: 6px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+
+        .job-list-item:hover {
+            border-color: var(--accent);
+        }
+
+        .job-list-actions {
+            margin-left: auto;
+            display: flex;
+            gap: 6px;
+        }
+
+        .kv {
+            display: flex;
+            justify-content: space-between;
+            padding: 5px 0;
+            border-bottom: 1px dashed var(--kv-line);
+            font-size: 12px;
+        }
+
+        .kv dt { color: var(--muted); margin: 0; }
+        .kv dd { margin: 0; text-align: right; font-family: "IBM Plex Mono", monospace; }
+
+        .hidden { display: none !important; }
+
+        .toast-box {
+            position: fixed;
+            top: 22px;
+            right: 22px;
+            z-index: 2000;
+            max-width: 420px;
+        }
+
+        .toast-msg {
+            padding: 12px 16px;
+            border-radius: 10px;
+            border: 1px solid var(--line-strong);
+            background: var(--toast-bg);
+            color: var(--text);
+            font-size: 13px;
+            margin-top: 8px;
+            box-shadow: var(--shadow-lg);
+        }
+
+        .toast-msg.error { border-color: var(--tint-danger-border); }
+        .toast-msg.success { border-color: var(--tint-success-border); }
+
+        .diag-block {
+            background: var(--code-bg);
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 12px 14px;
+            font-family: "IBM Plex Mono", monospace;
+            font-size: 12px;
+            line-height: 1.65;
+            color: var(--code-fg);
+            white-space: pre-wrap;
+            word-break: break-all;
+            max-height: 420px;
+            overflow: auto;
+            margin-top: 10px;
+        }
+
+        .password-wrap {
+            position: relative;
+        }
+
+        .password-wrap .form-control {
+            padding-right: 38px;
+        }
+
+        .password-toggle {
+            position: absolute;
+            right: 4px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: transparent;
+            border: none;
+            color: var(--muted);
+            cursor: pointer;
+            font-size: 14px;
+            padding: 4px 6px;
+            line-height: 1;
+        }
+
+        .password-toggle:hover {
+            color: var(--accent);
+        }
+
+        .range-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 14px;
+        }
+
+        .footer-note {
+            color: var(--muted);
+            font-size: 12px;
+            text-align: center;
+            margin-top: 24px;
+        }
+
+        .text-muted { color: var(--muted) !important; }
+        .text-success { color: var(--success) !important; }
+        .text-danger { color: var(--danger) !important; }
+        .text-warning { color: var(--warn) !important; }
+
+        .btn-primary {
+            background: var(--accent);
+            border: 1px solid var(--accent);
+            color: var(--on-accent);
+        }
+
+        .btn-primary:hover,
+        .btn-primary:focus,
+        .btn-primary:not(:disabled):not(.disabled):active {
+            background: var(--accent-hover);
+            border-color: var(--accent-hover);
+            color: var(--on-accent-hover);
+        }
+
+        @media (max-width: 900px) {
+            .wrap { padding: 18px 14px 56px; }
+            .checklist-toolbar { grid-template-columns: 1fr; }
+            .scheme-picker { grid-template-columns: 1fr; }
+            .toolbar-start { justify-content: flex-start; }
+            .spec-grid { grid-template-columns: 1fr; }
+            .nic-header { display: none; }
+            .nic-row { grid-template-columns: 1fr 1fr; }
+            .nic-row .nic-source,
+            .nic-row .nic-state { grid-column: 1 / -1; }
+            .nic-row .nic-state { width: 22px; height: 22px; }
+            .stepper { flex-wrap: wrap; }
+        }
+
+        .scheme-picker {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+            margin-bottom: 10px;
+        }
+        .scheme-card {
+            text-align: left;
+            padding: 12px 16px;
+            border-radius: 12px;
+            border: 1px solid var(--line);
+            background: var(--step-bg);
+            color: var(--text);
+            cursor: pointer;
+            transition: border-color .15s, background .15s, transform .15s;
+        }
+        .scheme-card:hover { border-color: var(--line-strong); transform: translateY(-1px); }
+        .scheme-card.active {
+            border-color: var(--accent);
+            background: var(--scheme-active-bg);
+        }
+        .scheme-head { display: flex; align-items: center; gap: 8px; }
+        .scheme-name { font-weight: 600; }
+        .scheme-tag {
+            font-size: 11px;
+            padding: 1px 7px;
+            border-radius: 999px;
+            border: 1px solid var(--tint-accent-border);
+            color: var(--accent);
+        }
+        .scheme-tag.warn { border-color: var(--tint-warn-border); color: var(--warn); }
+        .scheme-tag.muted { border-color: var(--line-strong); color: var(--muted); }
+        .scheme-desc { display: block; margin-top: 6px; color: var(--muted); font-size: 12px; }
+        .scheme-needs { margin-bottom: 18px; color: var(--muted); font-size: 12px; }
+
+        .relay-pool-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+            gap: 0.75rem;
+        }
+        .relay-node {
+            background: var(--panel-2);
+            border: 1px solid var(--relay-node-border);
+            border-radius: 8px;
+            padding: 0.75rem 0.9rem;
+            font-size: 0.85rem;
+        }
+        .relay-node .name { font-weight: 600; }
+        .relay-node .meta { color: var(--muted); font-size: 0.78rem; }
+        .relay-node[data-state="ready"] { border-left: 3px solid var(--state-ready); }
+        .relay-node[data-state="busy"] { border-left: 3px solid var(--state-busy); }
+        .relay-node[data-state="unhealthy"] { border-left: 3px solid var(--state-unhealthy); }
+        .relay-node[data-state="provisioning"] { border-left: 3px solid var(--state-provisioning); }
+        .relay-node .hint {
+            margin-top: 6px;
+            padding-top: 6px;
+            border-top: 1px dashed var(--line);
+            color: var(--warn);
+            font-size: 0.76rem;
+            line-height: 1.5;
+        }
+        .relay-guide {
+            border: 1px solid var(--tint-accent-border);
+            border-left: 3px solid var(--accent);
+            border-radius: 8px;
+            padding: 12px 14px;
+            background: var(--tint-accent-bg);
+        }
+        .relay-guide-title { font-weight: 600; font-size: 13px; }
+        .relay-guide-body { color: var(--muted); font-size: 12px; margin-top: 4px; }
+        .relay-guide-list { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: 12px; }
+        .relay-guide-list li { margin-bottom: 4px; }
+        .relay-guide-list strong { color: var(--text); }
+        .picker-row {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .picker-row .form-control { width: auto; min-width: 240px; flex: 0 1 320px; }
+        .field-optional { color: var(--muted); font-weight: 400; }
+        .channel-select {
+            max-width: 150px;
+            margin-left: auto;
+        }
+    </style>
+</head>
+<body>
+<div class="wrap">
+    <div class="topbar">
+        <div class="brand">
+            <div class="brand-mark">RBD</div>
+            <div>
+                <h1>跨云 RBD 迁移控制台</h1>
+                <small>Cross-OpenStack · Cross-Ceph · BFV</small>
+            </div>
+        </div>
+        <div class="topbar-actions">
+            <button type="button" class="theme-toggle" id="theme-toggle"
+                    aria-label="切换深色/浅色主题" title="切换深色/浅色主题">
+                <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                    <circle cx="12" cy="12" r="4"/>
+                    <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>
+                </svg>
+                <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>
+                </svg>
+            </button>
+            <div class="health"><span class="dot"></span> API 正常</div>
+        </div>
+    </div>
+
+    <section class="scheme-picker" id="scheme-picker" aria-label="迁移方案">
+        <button type="button" class="scheme-card active" data-scheme="rbd_full">
+            <span class="scheme-head"><span class="scheme-name">RBD 直连 · 全量</span><span class="scheme-tag">推荐</span></span>
+            <span class="scheme-desc">Ceph → Ceph，一次性导出导入</span>
+        </button>
+        <button type="button" class="scheme-card" data-scheme="rbd_incremental">
+            <span class="scheme-head"><span class="scheme-name">RBD 直连 · 增量预拷贝</span><span class="scheme-tag warn">实验</span></span>
+            <span class="scheme-desc">停机前多轮增量，缩短停机窗口</span>
+        </button>
+        <button type="button" class="scheme-card" data-scheme="relay_full">
+            <span class="scheme-head"><span class="scheme-name">中转机 · 全量</span><span class="scheme-tag muted">商业存储</span></span>
+            <span class="scheme-desc">iSCSI/FC，源卷没有可寻址 RBD 对象</span>
+        </button>
+    </section>
+    <div class="scheme-needs" id="scheme-needs"></div>
+
+    <nav class="stepper" aria-label="迁移向导">
+        <button type="button" class="step-btn active" data-step="1"><span class="num">1</span>环境配置</button>
+        <button type="button" class="step-btn" data-step="2"><span class="num">2</span>迁移清单</button>
+        <button type="button" class="step-btn" data-step="3"><span class="num">3</span>迁移监控</button>
+    </nav>
+
+    <!-- Step 1: environment -->
+    <section id="step-1">
+        <div class="panel" id="profile-panel">
+            <div class="d-flex align-items-center justify-content-between">
+                <div>
+                    <div class="panel-title mb-0">环境档案</div>
+                    <div class="text-muted small">保存源/目标凭据与 Ceph conf，下次迁移直接载入；密码与 conf 加密存储、不回显。</div>
+                </div>
+                <div class="d-flex align-items-center gap-2">
+                    <select class="form-control" id="profile-select" style="min-width:220px">
+                        <option value="">（不使用档案，手工填写）</option>
+                    </select>
+                    <button type="button" class="btn btn-ghost btn-sm" id="profile-save">保存为新档案</button>
+                    <button type="button" class="btn btn-ghost btn-sm" id="profile-delete">删除</button>
+                </div>
+            </div>
+            <div class="form-group mt-3 mb-0">
+                <label class="form-label" for="profile-name">档案名称</label>
+                <input class="form-control" id="profile-name" placeholder="例如 客户A-生产迁移">
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-title">OpenStack 与 Ceph 凭据</div>
+            <div class="row">
+                <div class="col-lg-6">
+                    <div class="d-flex align-items-center mb-3">
+                        <span class="badge badge-info mr-2">源</span>
+                        <strong>源环境</strong>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Auth URL</label>
+                        <input class="form-control mono" name="source_auth_url" placeholder="https://source.example.com:5000/v3">
+                    </div>
+                    <div class="row">
+                        <div class="col-6"><div class="form-group"><label class="form-label">项目</label><input class="form-control" name="source_project_name"></div></div>
+                        <div class="col-6"><div class="form-group"><label class="form-label">用户名</label><input class="form-control" name="source_username"></div></div>
+                    </div>
+                    <div class="row">
+                        <div class="col-6"><div class="form-group"><label class="form-label">密码</label><div class="password-wrap"><input type="password" class="form-control" name="source_password"><button type="button" class="password-toggle" data-target="source_password" title="显示/隐藏密码">👁</button></div></div></div>
+                        <div class="col-6"><div class="form-group"><label class="form-label">用户域</label><input class="form-control" name="source_user_domain_name"></div></div>
+                    </div>
+                    <div class="form-group mb-0">
+                        <label class="form-label">项目域</label>
+                        <input class="form-control" name="source_project_domain_name">
+                    </div>
+                    <div class="form-row mt-2">
+                        <div class="form-group flex-grow-1">
+                            <label class="form-label">项目 UUID（优先）</label>
+                            <input class="form-control mono" name="source_project_id" placeholder="点「载入项目」自动填入，也可手填">
+                        </div>
+                        <div class="form-group d-flex align-items-end">
+                            <button type="button" class="btn btn-ghost" id="load-source-projects">载入项目</button>
+                        </div>
+                    </div>
+                    <div id="source-project-picker" class="hidden"></div>
+                </div>
+                <div class="col-lg-6 mt-4 mt-lg-0">
+                    <div class="d-flex align-items-center mb-3">
+                        <span class="badge badge-warning mr-2">目标</span>
+                        <strong>目标环境</strong>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Auth URL</label>
+                        <input class="form-control mono" name="target_auth_url" placeholder="https://target.example.com:5000/v3">
+                    </div>
+                    <div class="row">
+                        <div class="col-6"><div class="form-group"><label class="form-label">项目</label><input class="form-control" name="target_project_name"></div></div>
+                        <div class="col-6"><div class="form-group"><label class="form-label">用户名</label><input class="form-control" name="target_username"></div></div>
+                    </div>
+                    <div class="row">
+                        <div class="col-6"><div class="form-group"><label class="form-label">密码</label><div class="password-wrap"><input type="password" class="form-control" name="target_password"><button type="button" class="password-toggle" data-target="target_password" title="显示/隐藏密码">👁</button></div></div></div>
+                        <div class="col-6"><div class="form-group"><label class="form-label">用户域</label><input class="form-control" name="target_user_domain_name"></div></div>
+                    </div>
+                    <div class="form-group mb-0">
+                        <label class="form-label">项目域</label>
+                        <input class="form-control" name="target_project_domain_name">
+                    </div>
+                    <div class="form-row mt-2">
+                        <div class="form-group flex-grow-1">
+                            <label class="form-label">项目 UUID（优先）</label>
+                            <input class="form-control mono" name="target_project_id" placeholder="点「载入项目」自动填入，也可手填">
+                        </div>
+                        <div class="form-group d-flex align-items-end">
+                            <button type="button" class="btn btn-ghost" id="load-target-projects">载入项目</button>
+                        </div>
+                    </div>
+                    <div id="target-project-picker" class="hidden"></div>
+                </div>
+            </div>
+
+            <div class="divider" data-cfg-group="ceph"></div>
+
+            <div class="row" data-cfg-group="ceph">
+                <div class="col-md-6">
+                    <div class="form-group">
+                        <label class="form-label">源 Ceph 配置文件</label>
+                        <input type="file" class="form-control-file" name="source_ceph_conf_file">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">源 Pool</label>
+                        <input class="form-control mono" name="source_ceph_pool" value="volumes">
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="form-group">
+                        <label class="form-label">目标 Ceph 配置文件</label>
+                        <input type="file" class="form-control-file" name="target_ceph_conf_file">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">目标 Pool</label>
+                        <input class="form-control mono" name="target_ceph_pool" value="volumes">
+                    </div>
+                </div>
+            </div>
+            <div class="text-muted small" id="profile-ceph-hint"></div>
+
+            <div class="divider"></div>
+
+            <div class="range-grid">
+                <div class="form-group">
+                    <label class="form-label">默认 VM 密码</label>
+                    <div class="password-wrap">
+                        <input type="password" class="form-control mono" name="admin_password" autocomplete="new-password">
+                        <button type="button" class="password-toggle" data-target="admin_password" title="显示/隐藏密码">👁</button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">目标卷类型（可选，默认目标）</label>
+                    <input class="form-control mono" name="target_volume_type" placeholder="留空使用目标默认">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">同时迁移 VM 数</label>
+                    <input class="form-control mono" type="number" min="1" max="10" name="vm_concurrency" value="1">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">单台卷拷贝并发</label>
+                    <input class="form-control mono" type="number" min="1" max="8" name="volume_concurrency" value="1">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">单卷拷贝限速 (MiB/s，0 不限)</label>
+                    <input class="form-control mono" type="number" min="0" step="any" name="rate_limit_mb_s" value="0" placeholder="0 = 不限速">
+                </div>
+                <div class="form-group hidden" data-cfg-group="delta">
+                    <label class="form-label">增量轮次上限</label>
+                    <input class="form-control mono" type="number" min="0" max="10" name="delta_rounds" value="3">
+                </div>
+                <div class="form-group hidden" data-cfg-group="delta">
+                    <label class="form-label">增量阈值 (MiB，小于即进入切换)</label>
+                    <input class="form-control mono" type="number" min="0" name="delta_threshold_mb" value="512">
+                </div>
+                <div class="form-group hidden" data-cfg-group="delta">
+                    <label class="form-label">增量轮次间隔 (秒)</label>
+                    <input class="form-control mono" type="number" min="0" name="delta_interval_seconds" value="300">
+                </div>
+                <div class="form-group hidden" data-cfg-group="delta">
+                    <label class="form-label">切换方式</label>
+                    <select class="form-select" name="cutover_mode">
+                        <option value="auto">自动（增量收敛后立即停机切换）</option>
+                        <option value="manual">手动确认（基线后不自动同步，按需点「同步一次」/「开始切换」）</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel hidden" id="relay-pool-panel">
+            <div class="d-flex align-items-center justify-content-between">
+                <div class="panel-title mb-0">中转机池</div>
+                <div class="d-flex align-items-center gap-2">
+                    <button type="button" class="btn btn-ghost btn-sm" id="load-relay-catalog">载入两侧目录</button>
+                    <button type="button" class="btn btn-ghost btn-sm" id="relay-preflight">预检</button>
+                    <button type="button" class="btn btn-ghost btn-sm" id="relay-ops-open">中转机运维</button>
+                </div>
+            </div>
+            <div class="form-group mt-3">
+                <label class="form-label">数据通道</label>
+                <select class="form-control" name="data_channel" id="data-channel">
+                    <option value="rbd">RBD 直连（Ceph）</option>
+                    <option value="relay">中转机全量拷贝（iSCSI/FC 商业存储）</option>
+                </select>
+            </div>
+            <div id="relay-pool-config" class="hidden">
+                <div class="form-group">
+                    <label class="form-label">中转机模式</label>
+                    <select class="form-control" name="relay_node_mode" id="relay-node-mode">
+                        <option value="ephemeral">作业级临时池（默认，作业结束销毁）</option>
+                        <option value="persistent">常驻池（租户内共享，自动扩缩容）</option>
+                    </select>
+                </div>
+                <div class="text-muted small hidden" id="relay-persistent-hint">
+                    常驻池：提交作业时平台会用下面填写的参数自动建机（首次创建该池时生效），
+                    池已存在时沿用原有建机参数。节点跨作业复用，作业失败或取消都不会删除节点；
+                    日常运维（查看节点、手动扩缩容、删除、看 SSH 密码）在「中转机资源」页。
+                </div>
+                <div class="form-grid hidden" id="relay-persistent-capacity">
+                    <div class="form-group">
+                        <label class="form-label">单机槽位（并发 VM 数）</label>
+                        <input class="form-control mono" type="number" min="1" max="20"
+                               name="relay_slots_per_node" value="5">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">节点数上限（每租户每角色）</label>
+                        <input class="form-control mono" type="number" min="1" max="20"
+                               name="relay_max_nodes" value="6">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">常驻节点数（缩容底线）</label>
+                        <input class="form-control mono" type="number" min="0" max="20"
+                               name="relay_min_nodes" value="1">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">空闲缩容（小时）</label>
+                        <input class="form-control mono" type="number" min="0"
+                               name="relay_idle_scale_down_hours" value="24">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">中转机回连平台地址</label>
+                    <input class="form-control mono" name="relay_platform_url" value="{{ request.host_url }}" placeholder="https://migrate.example.com:19099">
+                </div>
+                <div class="row">
+                    <div class="col-lg-6">
+                        <div class="form-group">
+                            <label class="form-label">agent 安装方式</label>
+                            <select class="form-control" name="relay_agent_install">
+                                <option value="bootstrap">cloud-init 自助安装（用标准镜像即可）</option>
+                                <option value="baked">镜像内已预装（/opt/relay + relay-agent）</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="col-lg-6">
+                        <div class="form-group">
+                            <label class="form-label">数据面监听端口</label>
+                            <input class="form-control mono" type="number" min="1" max="65535" name="relay_data_port" value="9200">
+                        </div>
+                    </div>
+                </div>
+                <div class="row">
+                    <div class="col-lg-6">
+                        <div class="form-group">
+                            <label class="form-label">中转机 root 密码</label>
+                            <div class="password-wrap">
+                                <input type="password" class="form-control mono" name="relay_admin_password" placeholder="留空则只用密钥登录">
+                                <button type="button" class="password-toggle" data-target="relay_admin_password" title="显示/隐藏密码">👁</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-lg-6">
+                        <div class="form-group">
+                            <label class="form-label">平台 SSH 公钥（写入中转机 authorized_keys）</label>
+                            <textarea class="form-control mono" name="relay_ssh_public_key" rows="3" placeholder="ssh-ed25519 AAAA... migrate-platform"></textarea>
+                        </div>
+                    </div>
+                </div>
+                <div class="row">
+                    <div class="col-lg-3">
+                        <div class="form-group">
+                            <label class="form-label">注册超时 (秒)</label>
+                            <input class="form-control mono" type="number" min="30" name="relay_ready_timeout" value="180">
+                        </div>
+                    </div>
+                    <div class="col-lg-3">
+                        <div class="form-group">
+                            <label class="form-label">心跳间隔 (秒)</label>
+                            <input class="form-control mono" type="number" min="1" name="relay_heartbeat_interval" value="10">
+                        </div>
+                    </div>
+                    <div class="col-lg-3">
+                        <div class="form-group">
+                            <label class="form-label">心跳超时 (秒)</label>
+                            <input class="form-control mono" type="number" min="1" name="relay_heartbeat_timeout" value="30">
+                        </div>
+                    </div>
+                    <div class="col-lg-3">
+                        <div class="form-group">
+                            <label class="form-label">拷贝重试次数</label>
+                            <input class="form-control mono" type="number" min="0" max="10" name="relay_copy_retries" value="3">
+                        </div>
+                    </div>
+                    <div class="col-lg-3">
+                        <div class="form-group">
+                            <label class="form-label">停滞判死 (秒)</label>
+                            <input class="form-control mono" type="number" min="30" name="relay_stall_timeout" value="300">
+                        </div>
+                    </div>
+                    <div class="col-lg-3">
+                        <div class="form-group">
+                            <label class="form-label">空洞模式</label>
+                            <select class="form-control" name="relay_hole_mode">
+                                <option value="skip" selected>skip（空盘最快，依赖空白卷）</option>
+                                <option value="zero">zero（目标端写零，最稳）</option>
+                                <option value="off">off（关闭，整盘搬移）</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+                <div class="form-group form-check">
+                    <input type="checkbox" class="form-check-input" name="relay_full_verify" id="relay-full-verify">
+                    <label class="form-check-label" for="relay-full-verify">整卷校验（拷完对整盘做一次 sha256，慢但最稳）</label>
+                </div>
+                <div class="row">
+                    <div class="col-lg-6" id="relay-source-pool"></div>
+                    <div class="col-lg-6" id="relay-target-pool"></div>
+                </div>
+            </div>
+            <div id="relay-preflight-result" class="mt-2"></div>
+        </div>
+
+        <div class="d-flex justify-content-end gap-2">
+            <button type="button" class="btn btn-ghost mr-2" id="diag-target">环境诊断</button>
+            <button type="button" class="btn btn-accent" id="load-target-catalog">查询目标目录</button>
+        </div>
+        <div id="diag-result" class="hidden mt-3"></div>
+    </section>
+
+    <!-- Step 2: migration checklist -->
+    <section id="step-2" class="hidden">
+        <div class="panel">
+            <div class="checklist-head">
+                <div>
+                    <div class="panel-title">迁移清单</div>
+                    <div class="text-muted small">
+                        每台 VM 独立选择目标 AZ、镜像、Flavor，并为每个源网卡指定目标网络/子网与目标 IP（留空则同网段自动复用源 IP）。
+                    </div>
+                </div>
+                <div class="checklist-state" id="checklist-summary"></div>
+            </div>
+            <div class="checklist-toolbar">
+                <div class="toolbar-group">
+                    <label for="source-vm-search">① 加载源 VM（当前源项目）</label>
+                    <div class="source-load-row">
+                        <input class="form-control mono" id="source-vm-search" placeholder="按名称搜索后回车">
+                        <button type="button" class="btn btn-accent btn-sm" id="load-source-vms">↻ 加载 VM</button>
+                    </div>
+                </div>
+                <div class="toolbar-group">
+                    <label for="global-image">② 默认目标镜像（可逐台覆盖）</label>
+                    <select class="form-control" id="global-image"><option value="">先加载目标目录</option></select>
+                </div>
+                <div class="toolbar-group">
+                    <label for="global-mode">③ 迁移模式（可逐台覆盖）</label>
+                    <select class="form-control" id="global-mode">
+                        <option value="full">全量拷贝</option>
+                        <option value="incremental">增量预拷贝（实验）</option>
+                    </select>
+                </div>
+                <div class="toolbar-start">
+                    <span class="selected-chip" id="selected-count">0 台</span>
+                    <button type="button" class="btn btn-accent" id="start-migration">开始迁移</button>
+                </div>
+            </div>
+            <div id="source-server-list" class="source-server-list hidden"></div>
+            <details class="advanced-excel">
+                <summary>高级：Excel 批量导入</summary>
+                <div class="excel-body">
+                    <div class="form-row align-items-end">
+                        <div class="form-group flex-grow-1">
+                            <label class="form-label">Excel 迁移清单（vm_name / target_az）</label>
+                            <input type="file" class="form-control-file" id="excel_file" name="excel_file">
+                        </div>
+                        <button type="button" class="btn btn-ghost mr-2" id="parse-excel">解析清单</button>
+                    </div>
+                </div>
+            </details>
+            <div id="preview-wrap">
+                <div class="empty">请先加载源 VM 或展开“高级：Excel 批量导入”。</div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Step 3: monitoring -->
+    <section id="step-3" class="hidden">
+        <div class="panel">
+            <div class="d-flex align-items-center justify-content-between">
+                <div class="panel-title mb-0">任务监控</div>
+                <div class="d-flex align-items-center gap-2" id="job-summary"></div>
+            </div>
+            <div class="mt-2">
+                <button type="button" class="btn btn-ghost btn-sm mr-2" id="load-jobs">刷新任务列表</button>
+                <span id="job-list-hint" class="text-muted small">刷新页面后可在这里恢复查看历史任务</span>
+            </div>
+            <div id="job-list" class="mt-2"></div>
+            <div class="divider"></div>
+            <div id="relay-pool-view" class="hidden">
+                <div class="plan-section-title">中转机池</div>
+                <div class="d-flex align-items-center gap-3 mb-2" id="relay-pool-counters"></div>
+                <div class="relay-pool-grid" id="relay-pool-grid"></div>
+                <div class="plan-section-title mt-3">卷拷贝进度</div>
+                <div id="relay-volume-progress" class="text-muted small">暂无在途卷。</div>
+                <div class="mt-2">
+                    <button type="button" class="btn btn-ghost btn-sm" id="relay-reconcile">立即对账清理</button>
+                </div>
+                <div class="divider"></div>
+            </div>
+            <div id="vm-list"><div class="empty">暂无任务。</div></div>
+        </div>
+    </section>
+
+    <!-- 中转机资源：常驻节点池、池参数与租户凭据（环境级，独立于迁移作业） -->
+    <section id="relay-resource-page" class="hidden">
+        <div class="panel">
+            <div class="d-flex align-items-center justify-content-between">
+                <div class="panel-title mb-0">中转机资源（运维）</div>
+                <div class="d-flex align-items-center gap-2">
+                    <button type="button" class="btn btn-ghost btn-sm" id="relay-ops-close">返回迁移向导</button>
+                    <button type="button" class="btn btn-ghost btn-sm" id="relay-resource-refresh">刷新</button>
+                    <button type="button" class="btn btn-ghost btn-sm" id="relay-resource-reconcile">节点对账</button>
+                </div>
+            </div>
+            <div class="relay-guide mt-3">
+                <div class="relay-guide-title">日常迁移不需要来这一页</div>
+                <div class="relay-guide-body">
+                    在「环境配置」里填好中转机参数并提交作业后，平台会<strong>自动加密保存该租户凭据</strong>、
+                    写入池建机参数并创建常驻节点，之后按槽位自动扩容；日常只走
+                    「环境配置 → 迁移清单 → 迁移监控」，本页所有字段都由作业自动写入。
+                    只有下面三种情况需要手工介入：
+                </div>
+                <ul class="relay-guide-list">
+                    <li><strong>节点卡住或不可用</strong>（状态长期停在「provisioning」、agent 版本为空）→ 在「节点」里对该节点点<strong>重建</strong>，重建会重新装机并换发令牌。</li>
+                    <li><strong>要改镜像 / Flavor / 网络 / 系统盘类型</strong> → 先在「节点」里清空该池节点，再到「池建机参数」用下面的下拉选到那个池、改完保存。</li>
+                    <li><strong>要回收资源</strong> → 先 drain 排空在途任务再删除节点；整池不再使用就点「删除该池参数」。</li>
+                </ul>
+            </div>
+            <div id="relay-env-summary" class="relay-pool-grid mt-3"></div>
+            <div class="form-grid mt-3">
+                <div class="form-group">
+                    <label class="form-label">租户键（auth_url|project）<span class="field-optional">可选，留空显示全部</span></label>
+                    <input class="form-control mono" id="relay-filter-tenant" placeholder="留空显示全部">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">角色 <span class="field-optional">可选</span></label>
+                    <select class="form-control" id="relay-filter-role">
+                        <option value="">全部</option>
+                        <option value="source">源端</option>
+                        <option value="target">目标端</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">可用区 <span class="field-optional">可选</span></label>
+                    <input class="form-control mono" id="relay-filter-az" placeholder="留空显示全部">
+                </div>
+            </div>
+            <div class="relay-pool-grid mt-3" id="relay-pool-summary"></div>
+        </div>
+
+        <div class="panel">
+            <div class="d-flex align-items-center justify-content-between flex-wrap gap-2">
+                <div class="panel-title mb-0">池建机参数（高级）</div>
+                <div class="picker-row">
+                    <select class="form-control form-control-sm" id="relay-profile-pick">
+                        <option value="">选择已有池会自动填入下方字段…</option>
+                    </select>
+                    <button type="button" class="btn btn-ghost btn-sm" id="relay-profile-prefill">从环境配置带入</button>
+                    <button type="button" class="btn btn-danger-ghost btn-sm" id="relay-profile-delete">删除该池参数</button>
+                </div>
+            </div>
+            <div class="text-muted small mt-1">
+                正常迁移时这些值由「环境配置」页自动写入，<strong>只有要改某个池的建机参数时才来这里</strong>。
+                带 <strong>*</strong> 的是建机必需项；「从环境配置带入」会把当前向导里填的镜像/Flavor/网络/系统盘类型直接搬过来，
+                不用再抄 ID。已有池不会被作业表单覆盖，改完必须点下面的「保存池参数」。
+            </div>
+            <div class="form-grid mt-2">
+                <div class="form-group">
+                    <label class="form-label">租户键 *</label>
+                    <input class="form-control mono" name="pp_tenant_key" placeholder="auth_url|project_id">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">角色 *</label>
+                    <select class="form-control" name="pp_role">
+                        <option value="source">源端</option>
+                        <option value="target">目标端</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">可用区 *</label>
+                    <input class="form-control mono" name="pp_az">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">镜像 ID *</label>
+                    <input class="form-control mono" name="pp_image">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Flavor ID *</label>
+                    <input class="form-control mono" name="pp_flavor">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">网络 ID *</label>
+                    <input class="form-control mono" name="pp_network">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">子网 ID <span class="field-optional">可选，留空自动选</span></label>
+                    <input class="form-control mono" name="pp_subnet">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">系统盘卷类型 *</label>
+                    <input class="form-control mono" name="pp_system_volume_type">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">数据面浮动 IP 网络 <span class="field-optional">可选，跨云/跨二层时必填</span></label>
+                    <input class="form-control mono" name="pp_data_floating_network"
+                           placeholder="外部网络 ID，留空则用内网地址">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">中转机回连平台地址 <span class="field-optional">可选，默认当前平台</span></label>
+                    <input class="form-control mono" name="pp_platform_url" value="{{ request.host_url }}">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">单机槽位（并发 VM 数）<span class="field-optional">可选，默认 5</span></label>
+                    <input class="form-control mono" type="number" min="1" name="pp_slots_per_node" value="5">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">最大节点数 <span class="field-optional">可选，默认 6</span></label>
+                    <input class="form-control mono" type="number" min="1" name="pp_max_nodes" value="6">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">最小节点数 <span class="field-optional">可选，默认 1</span></label>
+                    <input class="form-control mono" type="number" min="0" name="pp_min_nodes" value="1">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">空闲缩容（小时）</label>
+                    <input class="form-control mono" type="number" min="0" name="pp_idle_hours" value="24">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">数据面端口基数</label>
+                    <input class="form-control mono" type="number" min="1" max="65535" name="pp_data_port" value="9200">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">SSH 公钥（可选）</label>
+                    <input class="form-control mono" name="pp_ssh_public_key" placeholder="ssh-ed25519 AAAA... migrate-platform">
+                </div>
+            </div>
+            <div class="d-flex align-items-center gap-2 mt-2">
+                <button type="button" class="btn btn-primary btn-sm" id="relay-profile-save">保存池参数</button>
+                <span class="text-muted small">建机参数按 (租户, 角色, AZ) 保存，扩容时使用</span>
+            </div>
+            <div id="relay-profile-list" class="mt-2"></div>
+        </div>
+
+        <div class="panel">
+            <div class="d-flex align-items-center justify-content-between flex-wrap gap-2">
+                <div class="panel-title mb-0">租户云凭据（高级）</div>
+                <div class="picker-row">
+                    <select class="form-control form-control-sm" id="relay-cred-pick">
+                        <option value="">选择已有租户会填入租户键…</option>
+                    </select>
+                    <button type="button" class="btn btn-ghost btn-sm" id="relay-cred-prefill-source">带入源端凭据</button>
+                    <button type="button" class="btn btn-ghost btn-sm" id="relay-cred-prefill-target">带入目标端凭据</button>
+                </div>
+            </div>
+            <div class="text-muted small mt-1">
+                正常迁移提交作业时会自动加密保存当次使用的认证，<strong>平时不需要手填</strong>；
+                这里只用于轮换密码或清理旧租户。点上面的「带入源端/目标端凭据」即可把当前向导里填的认证搬过来，
+                无需重复输入；密码不回显，保存后只显示「已配置」。
+            </div>
+            <div class="form-grid mt-2">
+                <div class="form-group">
+                    <label class="form-label">租户键 * <span class="field-optional">格式 auth_url|project_id</span></label>
+                    <input class="form-control mono" name="cred_tenant_key" placeholder="auth_url|project_id">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">认证地址 *</label>
+                    <input class="form-control mono" name="cred_auth_url" placeholder="https://keystone.example.com:5000/v3">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">用户名 *</label>
+                    <input class="form-control mono" name="cred_username">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">密码 *</label>
+                    <input class="form-control mono" type="password" name="cred_password">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">用户域 <span class="field-optional">可选，默认 Default</span></label>
+                    <input class="form-control mono" name="cred_user_domain_name" value="Default">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">项目 ID <span class="field-optional">与项目名二选一</span></label>
+                    <input class="form-control mono" name="cred_project_id">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">项目名 <span class="field-optional">与项目 ID 二选一</span></label>
+                    <input class="form-control mono" name="cred_project_name">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">项目域 <span class="field-optional">可选，默认 Default</span></label>
+                    <input class="form-control mono" name="cred_project_domain_name" value="Default">
+                </div>
+            </div>
+            <div class="d-flex align-items-center gap-2 mt-2">
+                <button type="button" class="btn btn-primary btn-sm" id="relay-credential-save">保存凭据</button>
+                <span class="text-muted small">AES-GCM 加密落盘，页面只显示"已配置"，不回显密码</span>
+            </div>
+            <div id="relay-tenant-credentials" class="mt-2"></div>
+        </div>
+
+        <div class="panel">
+            <div class="d-flex align-items-center justify-content-between">
+                <div class="panel-title mb-0">节点</div>
+                <div class="d-flex align-items-center gap-2">
+                    <input class="form-control mono" type="number" min="0" max="6" id="relay-scale-target" value="1" style="width:90px">
+                    <button type="button" class="btn btn-ghost btn-sm" id="relay-scale-apply">扩缩容到</button>
+                </div>
+            </div>
+            <form id="relay-scale-form" class="form-grid mt-2">
+                <div class="form-group">
+                    <label class="form-label">租户键</label>
+                    <input class="form-control mono" name="scale_tenant_key">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">角色</label>
+                    <select class="form-control" name="scale_role">
+                        <option value="source">源端</option>
+                        <option value="target">目标端</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">可用区</label>
+                    <input class="form-control mono" name="scale_az">
+                </div>
+            </form>
+            <div class="relay-pool-grid mt-3" id="relay-node-grid"></div>
+        </div>
+
+        <div id="relay-node-password-modal" class="hidden">
+            <div class="panel">
+                <div class="d-flex align-items-center justify-content-between">
+                    <div class="panel-title mb-0">节点 SSH 密码</div>
+                    <button type="button" class="btn btn-ghost btn-sm" id="relay-password-close">关闭</button>
+                </div>
+                <div class="mono mt-2" id="relay-password-value"></div>
+            </div>
+        </div>
+    </section>
+</div>
+
+<div class="toast-box" id="toast-box"></div>
+
+<script src="{{ url_for('static', filename='js/jquery.slim.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/popper.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/bootstrap.min.js') }}"></script>
+<script>
+const state = {
+    scheme: 'rbd_full',
+    targetCatalog: {
+        images: [],
+        flavors: [],
+        networks: [],
+        subnets: [],
+        availability_zones: []
+    },
+    previewRows: [],
+    sourceServers: [],
+    sourceServersNextMarker: null,
+    sourceServerLoading: false,
+    selectedServerIds: new Set(),
+    relayCatalog: null,
+    relayProfiles: [],
+    relayTenants: [],
+    jobId: null,
+    pollTimer: null
+};
+
+const $ = (sel, root) => (root || document).querySelector(sel);
+const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+
+function text(tag, className, value) {
+    const el = document.createElement(tag);
+    if (className) el.className = className;
+    if (value !== undefined && value !== null) el.textContent = value;
+    return el;
+}
+
+function toast(message, type) {
+    const box = $('#toast-box');
+    const node = text('div', 'toast-msg ' + (type || ''), message);
+    box.appendChild(node);
+    setTimeout(() => node.remove(), 4200);
+}
+
+function readAuth(prefix) {
+    return {
+        auth_url: $(`[name="${prefix}_auth_url"]`).value.trim(),
+        project_name: $(`[name="${prefix}_project_name"]`).value.trim(),
+        project_id: $(`[name="${prefix}_project_id"]`).value.trim(),
+        username: $(`[name="${prefix}_username"]`).value.trim(),
+        password: $(`[name="${prefix}_password"]`).value,
+        user_domain_name: $(`[name="${prefix}_user_domain_name"]`).value.trim(),
+        project_domain_name: $(`[name="${prefix}_project_domain_name"]`).value.trim()
+    };
+}
+
+// 平台启用 MIGRATION_API_TOKEN 时，给所有同源 API 请求自动带上访问令牌。
+// 令牌来源优先级：URL 的 ?token=xxx（会自动记住）> localStorage 里的旧值。
+const API_TOKEN_KEY = 'migration-api-token';
+(function initApiToken() {
+    try {
+        const params = new URLSearchParams(window.location.search);
+        const fromUrl = params.get('token');
+        if (fromUrl) {
+            localStorage.setItem(API_TOKEN_KEY, fromUrl);
+            params.delete('token');
+            const qs = params.toString();
+            window.history.replaceState(
+                null, '', window.location.pathname + (qs ? '?' + qs : '') + window.location.hash
+            );
+        }
+    } catch (err) {
+        // 旧浏览器/隐私模式下 localStorage 不可用：退化为不带令牌（平台未启用鉴权时无影响）。
+    }
+})();
+
+const nativeFetch = window.fetch.bind(window);
+window.fetch = async function apiFetch(input, init) {
+    init = init || {};
+    const headers = new Headers(init.headers || {});
+    let token = '';
+    try {
+        token = localStorage.getItem(API_TOKEN_KEY) || '';
+    } catch (err) {
+        token = '';
+    }
+    if (token && !headers.has('X-API-Token')) headers.set('X-API-Token', token);
+    init.headers = headers;
+    let res = await nativeFetch(input, init);
+    if (res.status === 401 && String(input).indexOf('/api/') === 0) {
+        const entered = window.prompt('该平台已启用访问令牌，请输入 MIGRATION_API_TOKEN：');
+        if (entered) {
+            try {
+                localStorage.setItem(API_TOKEN_KEY, entered);
+            } catch (err) {
+                // 存不下就只在本次请求里用。
+            }
+            headers.set('X-API-Token', entered);
+            init.headers = headers;
+            res = await nativeFetch(input, init);
+        }
+    }
+    return res;
+};
+
+async function postJson(url, body) {
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || '请求失败');
+    return data;
+}
+
+function relayPoolFields(prefix, label) {
+    return `
+        <div class="d-flex align-items-center mb-3">
+            <span class="badge badge-info mr-2">${label}</span>
+            <strong>${label}中转机</strong>
+        </div>
+        <div class="form-group"><label class="form-label">镜像</label>
+            <select class="form-control" name="relay_${prefix}_image" data-role="image"></select></div>
+        <div class="form-group"><label class="form-label">Flavor</label>
+            <select class="form-control" name="relay_${prefix}_flavor" data-role="flavor"></select></div>
+        <div class="form-group"><label class="form-label">可用区</label>
+            <select class="form-control" name="relay_${prefix}_az" data-role="az"></select></div>
+        <div class="form-group"><label class="form-label">网络</label>
+            <select class="form-control" name="relay_${prefix}_network" data-role="network"></select></div>
+        <div class="form-group"><label class="form-label">网段（子网）</label>
+            <select class="form-control" name="relay_${prefix}_subnet" data-role="subnet"></select></div>
+        <div class="form-group"><label class="form-label">指定 IP（留空自动分配，多台用逗号分隔）</label>
+            <input class="form-control mono" name="relay_${prefix}_ips" placeholder="例如 10.0.0.11,10.0.0.12"></div>
+        <div class="form-group"><label class="form-label">中转机系统盘类型（必选）</label>
+            <select class="form-control" name="relay_${prefix}_system_volume_type" data-role="system_volume_type">
+                <option value="">（先点「载入两侧目录」）</option>
+            </select>
+            <small class="text-muted">中转机从镜像生成启动云硬盘再启动（镜像直起会因本地盘等环境问题建机失败）</small></div>
+        <div class="form-group"><label class="form-label">数据面浮动 IP 网络（跨云必选）</label>
+            <select class="form-control" name="relay_${prefix}_data_floating_network" data-role="data_floating_network">
+                <option value="">（不使用浮动 IP）</option>
+            </select>
+            <small class="text-muted">两侧中转机不在同一二层时（各自 Geneve 网络），绑浮动 IP 让对端能连过来</small></div>
+        <div class="form-group"><label class="form-label">${prefix === 'source'
+            ? '源端派生卷类型（默认值，留空继承源卷类型）'
+            : '目标卷类型（默认值，留空走 __DEFAULT__）'}</label>
+            <select class="form-control" name="relay_${prefix}_volume_type" data-role="volume_type">
+                <option value="">（先点「载入两侧目录」）</option>
+            </select></div>
+        <div class="form-group"><label class="form-label">池大小</label>
+            <input class="form-control mono" type="number" min="1" max="8" name="relay_${prefix}_size" value="2"></div>
+    `;
+}
+
+function fillRelaySubnets(prefix, networkId) {
+    const select = $(`[name="relay_${prefix}_subnet"]`);
+    if (!select) return;
+    const current = select.value;
+    select.innerHTML = '';
+    select.appendChild(new Option('自动选择', ''));
+    const subnets = (state.relayCatalog && state.relayCatalog[prefix].subnets) || [];
+    subnets
+        .filter(subnet => !networkId || subnet.network_id === networkId)
+        .forEach(subnet =>
+            select.appendChild(new Option(`${subnet.name} (${subnet.cidr})`, subnet.id))
+        );
+    if (current) select.value = current;
+}
+
+function fillRelaySelect(root, role, items) {
+    if (!root) return;
+    const select = root.querySelector(`[data-role="${role}"]`);
+    if (!select) return;
+    select.innerHTML = '';
+    items.forEach(item => {
+        const option = document.createElement('option');
+        option.value = item.id;
+        option.textContent = item.name || item.id;
+        select.appendChild(option);
+    });
+}
+
+// 服务端/agent 上报的字符串（节点名、云名、错误文案）一律转义后再进 innerHTML，
+// 否则中转机名或云目录里的 HTML 会变成存储型 XSS。
+function escapeHtml(value) {
+    return String(value == null ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function renderRelayPreflight(json) {
+    const box = $('#relay-preflight-result');
+    if (!box) return;
+    const lines = [];
+    (json.errors || []).forEach(item => lines.push(`<div class="text-danger small">✗ ${escapeHtml(item)}</div>`));
+    (json.warnings || []).forEach(item => lines.push(`<div class="text-warning small">! ${escapeHtml(item)}</div>`));
+    if (!lines.length) lines.push('<div class="text-success small">✓ 预检通过</div>');
+    box.innerHTML = lines.join('');
+}
+
+function relayAuthForm() {
+    const data = new FormData();
+    ['source', 'target'].forEach(prefix => {
+        Object.entries(readAuth(prefix)).forEach(([key, value]) => data.append(`${prefix}_${key}`, value));
+    });
+    return data;
+}
+
+function initRelayPanel() {
+    if (!$('#relay-source-pool')) return;
+    $('#relay-source-pool').innerHTML = relayPoolFields('source', '源');
+    $('#relay-target-pool').innerHTML = relayPoolFields('target', '目标');
+
+    $('#data-channel').addEventListener('change', event => {
+    $('#relay-pool-config').classList.toggle('hidden', event.target.value !== 'relay');
+    });
+
+    const relayModeSelect = $('#relay-node-mode');
+    if (relayModeSelect) {
+        const syncPersistentHint = () => {
+            const hint = $('#relay-persistent-hint');
+            const persistent = relayModeSelect.value === 'persistent';
+            if (hint) hint.classList.toggle('hidden', !persistent);
+            const capacity = $('#relay-persistent-capacity');
+            if (capacity) capacity.classList.toggle('hidden', !persistent);
+        };
+        relayModeSelect.addEventListener('change', syncPersistentHint);
+        syncPersistentHint();
+    }
+
+    $('#load-relay-catalog').addEventListener('click', async () => {
+        const res = await fetch('/api/relay/catalog', { method: 'POST', body: relayAuthForm() });
+        const json = await res.json();
+        if (!json.ok) { toast('目录载入失败：' + json.error, 'error'); return; }
+        const zones = { source: $('#relay-source-pool'), target: $('#relay-target-pool') };
+        state.relayCatalog = json.catalog;
+        ['source', 'target'].forEach(side => {
+            const data = json.catalog[side];
+            fillRelaySelect(zones[side], 'image', data.images);
+            fillRelaySelect(zones[side], 'flavor', data.flavors);
+            fillRelaySelect(zones[side], 'az', data.azs.map(name => ({ id: name, name })));
+            fillRelaySelect(zones[side], 'network', data.networks);
+            fillRelaySelect(
+                zones[side],
+                'system_volume_type',
+                data.volume_types || []
+            );
+            fillRelaySelect(zones[side], 'data_floating_network', [
+                { id: '', name: '（不使用浮动 IP）' },
+                ...(data.external_networks || []),
+            ]);
+            fillRelaySelect(zones[side], 'volume_type', [
+                {
+                    id: '',
+                    name: side === 'source'
+                        ? '继承源卷类型（推荐）'
+                        : '使用 __DEFAULT__（可能配额为 0）',
+                },
+                ...(data.volume_types || []),
+            ]);
+            fillRelaySubnets(side, $(`[name="relay_${side}_network"]`).value);
+        });
+        toast('两侧目录已载入', 'success');
+    });
+
+    ['source', 'target'].forEach(side => {
+        const networkSelect = $(`[name="relay_${side}_network"]`);
+        if (networkSelect) {
+            networkSelect.addEventListener('change', () => {
+                fillRelaySubnets(side, networkSelect.value);
+            });
+        }
+    });
+
+    $('#relay-preflight').addEventListener('click', async () => {
+        const data = relayAuthForm();
+        data.append('data_channel', $('#data-channel').value);
+        data.append('relay_platform_url', $('[name="relay_platform_url"]').value.trim());
+        data.append('relay_agent_install', $('[name="relay_agent_install"]').value);
+        data.append('relay_data_port', $('[name="relay_data_port"]').value);
+        ['relay_admin_password', 'relay_ssh_public_key', 'relay_ready_timeout',
+         'relay_heartbeat_interval', 'relay_heartbeat_timeout', 'relay_copy_retries',
+         'relay_stall_timeout', 'relay_hole_mode'
+        ].forEach(name => {
+            const el = $(`[name="${name}"]`);
+            if (el) data.append(name, el.value);
+        });
+        data.append(
+            'relay_full_verify',
+            $('[name="relay_full_verify"]').checked ? '1' : ''
+        );
+        ['source', 'target'].forEach(prefix => {
+            ['image', 'flavor', 'az', 'network', 'subnet', 'ips',
+             'system_volume_type', 'data_floating_network',
+             'volume_type'].forEach(field => {
+                const el = $(`[name="relay_${prefix}_${field}"]`);
+                data.append(`relay_${prefix}_${field}`, el ? el.value : '');
+            });
+            data.append(`relay_${prefix}_size`, $(`[name="relay_${prefix}_size"]`).value);
+        });
+        const res = await fetch('/api/relay/preflight', { method: 'POST', body: data });
+        renderRelayPreflight(await res.json());
+    });
+
+    $('#relay-reconcile').addEventListener('click', async () => {
+        if (!state.jobId) { toast('还没有选中的任务', 'error'); return; }
+        const res = await fetch(`/api/jobs/${state.jobId}/relay/reconcile`, { method: 'POST' });
+        const json = await res.json();
+        toast(json.ok ? `已清理 ${json.cleaned.length} 项` : json.error, json.ok ? 'success' : 'error');
+    });
+
+    $('#relay-pool-grid').addEventListener('click', async event => {
+        const button = event.target.closest('.relay-rebuild');
+        if (!button || !state.jobId) return;
+        button.disabled = true;
+        try {
+            const res = await fetch(
+                `/api/jobs/${state.jobId}/relay/nodes/${button.dataset.nodeId}/rebuild`,
+                { method: 'POST' }
+            );
+            const json = await res.json();
+            toast(
+                json.ok ? `已重建 ${json.node.name}` : json.error,
+                json.ok ? 'success' : 'error'
+            );
+            await refreshRelayPool();
+        } finally {
+            button.disabled = false;
+        }
+    });
+}
+
+async function refreshRelayPool() {
+    if (!state.jobId) return;
+    const view = $('#relay-pool-view');
+    if (!view) return;
+    try {
+        const res = await fetch(`/api/jobs/${state.jobId}/relay`);
+        const json = await res.json();
+        if (!json.relay) { view.classList.add('hidden'); return; }
+        view.classList.remove('hidden');
+        const nodes = [...json.relay.source, ...json.relay.target];
+        const busy = nodes.filter(node => node.state === 'busy').length;
+        const unhealthy = nodes.filter(node => node.state === 'unhealthy').length;
+        const ledger = json.relay.ledger || { in_flight: 0, done: 0, cleaned: 0, failed: 0 };
+        $('#relay-pool-counters').innerHTML = `
+            <span class="badge badge-info">共 ${nodes.length} 台</span>
+            <span class="badge badge-info">忙碌 ${busy}</span>
+            <span class="badge badge-info">异常 ${unhealthy}</span>
+            <span class="badge badge-info">在途卷 ${ledger.in_flight}</span>
+            <span class="badge badge-info">已完成 ${ledger.done}</span>
+            <span class="badge badge-info">已清理 ${ledger.cleaned}</span>
+            <span class="badge ${ledger.failed ? 'badge-danger' : 'badge-info'}">失败 ${ledger.failed}</span>
+        `;
+        relayVolumeProgress(json.relay.volumes);
+        $('#relay-pool-grid').innerHTML = nodes.map(node => `
+            <div class="relay-node" data-state="${escapeHtml(node.state)}">
+                <div class="name">${escapeHtml(node.name)}</div>
+                <div class="meta">${node.role === 'source' ? '源端' : '目标端'} · ${escapeHtml(node.az)}</div>
+                <div class="meta">${escapeHtml(node.data_address || '—')}:${escapeHtml(node.data_port)}</div>
+                <div class="meta">状态 ${escapeHtml(node.state)}${node.current_task_id ? ' · ' + escapeHtml(node.current_task_id) : ''}</div>
+                <button type="button" class="btn btn-ghost btn-sm relay-rebuild" data-node-id="${escapeHtml(node.node_id)}">重建</button>
+            </div>
+        `).join('');
+    } catch (err) {
+        view.classList.add('hidden');
+    }
+}
+
+function formatGiB(bytes) {
+    return ((Number(bytes) || 0) / (1024 ** 3)).toFixed(2) + ' GiB';
+}
+
+function relayVolumeProgress(volumes) {
+    const box = $('#relay-volume-progress');
+    if (!box) return;
+    const rows = (volumes || []).filter(volume => volume.total_bytes > 0 || volume.copied_bytes > 0);
+    if (!rows.length) {
+        box.innerHTML = '暂无在途卷。';
+        return;
+    }
+    box.innerHTML = rows.map(volume => {
+        const percent = Math.max(0, Math.min(100, Number(volume.progress_percent) || 0));
+        const speed = volume.throughput_mb_s != null ? ` · ${volume.throughput_mb_s} MiB/s` : '';
+        const total = volume.total_bytes ? formatGiB(volume.total_bytes) : '—';
+        const skipped = Number(volume.skipped_bytes) > 0
+            ? ` · 跳过 ${formatGiB(volume.skipped_bytes)}`
+            : '';
+        // 与 RBD 直连的卷进度单元格保持同一种读法：阶段标签 · 百分比 · 速率。
+        const phase = volume.progress_label || volume.phase || '';
+        const head = `${escapeHtml(volume.vm_id || '未命名')} · ${phase ? escapeHtml(phase) + ' · ' : ''}` +
+            `${percent.toFixed(1)}%${speed}`;
+        const detail = `${formatGiB(volume.copied_bytes)} / ${total}${skipped}`;
+        return `
+            <div class="mb-1">
+                <div>${head}</div>
+                <div class="progress-thin"><div style="width:${percent}%"></div></div>
+                <div class="text-muted small">${detail}</div>
+            </div>
+        `;
+    }).join('');
+}
+
+initRelayPanel();
+
+const SCHEMES = {
+    rbd_full: {
+        channel: 'rbd', mode: 'full', groups: ['ceph'],
+        needs: '源/目标凭据 · 源/目标 Ceph conf · 目标镜像 · 逐台 AZ/Flavor/网络'
+    },
+    rbd_incremental: {
+        channel: 'rbd', mode: 'incremental', groups: ['ceph', 'delta'],
+        needs: 'RBD 全量所需 + 增量轮次/阈值/间隔'
+    },
+    relay_full: {
+        channel: 'relay', mode: 'full', groups: ['relay'],
+        needs: '源/目标凭据 · 中转机池（常驻池只需两侧 AZ）· 逐台 AZ/Flavor/网络'
+    }
+};
+
+function applyScheme(scheme) {
+    const config = SCHEMES[scheme] || SCHEMES.rbd_full;
+    state.scheme = scheme;
+    $$('.scheme-card').forEach(card =>
+        card.classList.toggle('active', card.dataset.scheme === scheme)
+    );
+    $$('[data-cfg-group]').forEach(node => {
+        const groups = (node.dataset.cfgGroup || '').split(/\s+/);
+        const visible = groups.some(group => config.groups.includes(group));
+        node.classList.toggle('hidden', !visible);
+    });
+    const needs = $('#scheme-needs');
+    if (needs) needs.textContent = '本方案需要填写：' + config.needs;
+    const channel = $('#data-channel');
+    if (channel) channel.value = config.channel;
+    const mode = $('#global-mode');
+    if (mode) mode.value = config.mode;
+    const relayPanel = $('#relay-pool-panel');
+    if (relayPanel) relayPanel.classList.toggle('hidden', config.channel !== 'relay');
+    const relayConfig = $('#relay-pool-config');
+    if (relayConfig) relayConfig.classList.remove('hidden');
+}
+
+function applyTheme(theme) {
+    if (theme === 'dark') {
+        document.documentElement.setAttribute('data-theme', 'dark');
+    } else {
+        document.documentElement.removeAttribute('data-theme');
+    }
+    try {
+        localStorage.setItem('migrate-theme', theme);
+    } catch (err) { /* 隐私模式下无法持久化，忽略即可 */ }
+}
+
+function initThemeToggle() {
+    const btn = $('#theme-toggle');
+    if (!btn) return;
+    btn.addEventListener('click', () => {
+        const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+        applyTheme(isDark ? 'light' : 'dark');
+    });
+}
+
+function initSchemePicker() {
+    $$('.scheme-card').forEach(card => {
+        card.addEventListener('click', () => applyScheme(card.dataset.scheme));
+    });
+    applyScheme(state.scheme);
+}
+
+async function loadProfiles(selectedId) {
+    const select = $('#profile-select');
+    if (!select) return;
+    try {
+        const res = await fetch('/api/profiles');
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || '加载失败');
+        select.innerHTML = '';
+        select.appendChild(new Option('（不使用档案，手工填写）', ''));
+        (json.profiles || []).forEach(profile => {
+            select.appendChild(new Option(profile.name, profile.profile_id));
+        });
+        if (selectedId) select.value = selectedId;
+    } catch (err) {
+        toast('环境档案加载失败：' + err.message, 'error');
+    }
+}
+
+function fillProfileForm(profile) {
+    if (!profile) return;
+    ['source', 'target'].forEach(prefix => {
+        ['auth_url', 'project_name', 'username', 'user_domain_name',
+         'project_domain_name', 'project_id'].forEach(field => {
+            const el = $(`[name="${prefix}_${field}"]`);
+            if (el) el.value = profile[`${prefix}_${field}`] || '';
+        });
+        const password = $(`[name="${prefix}_password"]`);
+        if (password) {
+            password.value = '';
+            password.placeholder = profile[`has_${prefix}_password`]
+                ? '已配置（留空沿用档案）' : '';
+        }
+    });
+    ['source_ceph_pool', 'target_ceph_pool', 'target_volume_type'].forEach(name => {
+        const el = $(`[name="${name}"]`);
+        if (el && profile[name]) el.value = profile[name];
+    });
+    const hint = $('#profile-ceph-hint');
+    if (hint) {
+        hint.textContent = profile.has_source_ceph_conf && profile.has_target_ceph_conf
+            ? '档案已含 Ceph conf，无需再上传文件'
+            : '档案未含 Ceph conf，请上传文件';
+    }
+}
+
+function profilePayload() {
+    const payload = { name: ($('#profile-name').value || '').trim() };
+    ['source', 'target'].forEach(prefix => {
+        Object.entries(readAuth(prefix)).forEach(([key, value]) => {
+            payload[`${prefix}_${key}`] = value;
+        });
+    });
+    ['source_ceph_pool', 'target_ceph_pool', 'target_volume_type'].forEach(name => {
+        const el = $(`[name="${name}"]`);
+        if (el) payload[name] = el.value.trim();
+    });
+    return payload;
+}
+
+async function attachProfileCephConf(payload) {
+    const sourceConf = $('[name="source_ceph_conf_file"]').files[0];
+    const targetConf = $('[name="target_ceph_conf_file"]').files[0];
+    if (sourceConf) payload.source_ceph_conf = await sourceConf.text();
+    if (targetConf) payload.target_ceph_conf = await targetConf.text();
+    return payload;
+}
+
+async function saveProfile() {
+    const payload = profilePayload();
+    if (!payload.name) {
+        toast('请填写档案名称', 'error');
+        return;
+    }
+    await attachProfileCephConf(payload);
+    const selected = $('#profile-select').value;
+    if (selected) payload.profile_id = selected;
+    try {
+        const json = await postJson('/api/profiles', payload);
+        await loadProfiles(json.profile.profile_id);
+        $('#profile-name').value = json.profile.name;
+        toast('档案已保存', 'success');
+    } catch (err) {
+        toast('档案保存失败：' + err.message, 'error');
+    }
+}
+
+async function deleteProfile() {
+    const selected = $('#profile-select').value;
+    if (!selected) {
+        toast('请先选择一个档案', 'error');
+        return;
+    }
+    try {
+        const res = await fetch('/api/profiles/' + selected, { method: 'DELETE' });
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || '删除失败');
+        await loadProfiles('');
+        $('#profile-name').value = '';
+        toast('档案已删除', 'success');
+    } catch (err) {
+        toast('档案删除失败：' + err.message, 'error');
+    }
+}
+
+async function initProfilePanel() {
+    if (!$('#profile-panel')) return;
+    await loadProfiles('');
+    $('#profile-save').addEventListener('click', saveProfile);
+    $('#profile-delete').addEventListener('click', deleteProfile);
+    $('#profile-select').addEventListener('change', async event => {
+        const id = event.target.value;
+        if (!id) return;
+        try {
+            const res = await fetch('/api/profiles');
+            const json = await res.json();
+            const profile = (json.profiles || [])
+                .find(item => item.profile_id === id);
+            if (profile) {
+                fillProfileForm(profile);
+                $('#profile-name').value = profile.name;
+            }
+        } catch (err) {
+            toast('档案载入失败：' + err.message, 'error');
+        }
+    });
+}
+
+function switchStep(step) {
+    $$('.step-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.step === String(step)));
+    for (let i = 1; i <= 3; i++) $('#step-' + i).classList.toggle('hidden', i !== step);
+    const page = $('#relay-resource-page');
+    if (page) page.classList.add('hidden');
+}
+
+function openRelayOps() {
+    $$('.step-btn').forEach(btn => btn.classList.remove('active'));
+    for (let i = 1; i <= 3; i++) $('#step-' + i).classList.add('hidden');
+    const page = $('#relay-resource-page');
+    if (page) page.classList.remove('hidden');
+    refreshRelayResourcePage();
+}
+
+function closeRelayOps() {
+    const page = $('#relay-resource-page');
+    if (page) page.classList.add('hidden');
+    switchStep(1);
+}
+
+function relayResourceFilters() {
+    return {
+        tenant_key: ($('#relay-filter-tenant') || {}).value || '',
+        role: ($('#relay-filter-role') || {}).value || '',
+        az: ($('#relay-filter-az') || {}).value || '',
+    };
+}
+
+async function refreshRelayResourcePage() {
+    const [pools, nodes, profiles, tenants] = await Promise.all([
+        loadRelayPools(),
+        loadRelayNodes(),
+        loadRelayProfiles(),
+        loadRelayTenants(),
+    ]);
+    renderRelayEnvSummary({ pools, nodes, profiles, tenants });
+}
+
+async function loadRelayPools() {
+    const res = await fetch('/api/relay/pools');
+    const json = await res.json();
+    renderRelayPoolSummary(json.pools || []);
+    return json.pools || [];
+}
+
+async function loadRelayNodes() {
+    const params = new URLSearchParams(relayResourceFilters());
+    const res = await fetch('/api/relay/nodes?' + params.toString());
+    const json = await res.json();
+    renderRelayNodeGrid(json.nodes || []);
+    return json.nodes || [];
+}
+
+async function loadRelayProfiles() {
+    const res = await fetch('/api/relay/pools/profiles');
+    const json = await res.json();
+    const profiles = json.profiles || [];
+    state.relayProfiles = profiles;
+    const picker = $('#relay-profile-pick');
+    if (picker) {
+        const previous = picker.value;
+        picker.innerHTML = '';
+        picker.appendChild(new Option('选择已有池会自动填入下方字段…', ''));
+        profiles.forEach((profile, index) => {
+            picker.appendChild(new Option(
+                `${profile.role} · ${profile.az} · ${profile.tenant_key}`,
+                String(index)
+            ));
+        });
+        if (previous && profiles[Number(previous)]) picker.value = previous;
+    }
+    const box = $('#relay-profile-list');
+    if (!box) return profiles;
+    box.innerHTML = '';
+    if (!profiles.length) {
+        box.appendChild(text('div', 'text-muted small', '尚未保存任何池建机参数（提交一次中转机作业会自动生成）'));
+        return profiles;
+    }
+    profiles.forEach(profile => {
+        box.appendChild(text(
+            'div',
+            'text-muted small mono',
+            `${profile.tenant_key} · ${profile.role} · ${profile.az} · ` +
+            `${profile.image} / ${profile.flavor} / ${profile.network} · ` +
+            `槽位 ${profile.slots_per_node} · 上限 ${profile.max_nodes} · ` +
+            `系统盘 ${profile.system_volume_type || '未配置'}`
+        ));
+    });
+    return profiles;
+}
+
+async function loadRelayTenants() {
+    const res = await fetch('/api/relay/tenants');
+    const json = await res.json();
+    const tenants = json.tenants || [];
+    state.relayTenants = tenants;
+    const picker = $('#relay-cred-pick');
+    if (picker) {
+        const previous = picker.value;
+        picker.innerHTML = '';
+        picker.appendChild(new Option('选择已有租户会填入租户键…', ''));
+        tenants.forEach(tenant => picker.appendChild(new Option(tenant, tenant)));
+        if (previous && tenants.includes(previous)) picker.value = previous;
+    }
+    const box = $('#relay-tenant-credentials');
+    if (!box) return tenants;
+    box.innerHTML = '';
+    if (!tenants.length) {
+        box.appendChild(text(
+            'div',
+            'text-muted small',
+            json.ok === false
+                ? (json.error || '常驻中转机未就绪，无法读取租户凭据')
+                : '尚未保存任何租户凭据（提交一次中转机作业会自动生成）'
+        ));
+        return tenants;
+    }
+    tenants.forEach(tenant => {
+        const row = document.createElement('div');
+        row.className = 'd-flex align-items-center justify-content-between mono small';
+        row.appendChild(text('span', '', tenant));
+        row.appendChild(text('span', 'text-muted', '已配置'));
+        box.appendChild(row);
+    });
+    return tenants;
+}
+
+function renderRelayPoolSummary(pools) {
+    const box = $('#relay-pool-summary');
+    if (!box) return;
+    box.innerHTML = '';
+    if (!pools.length) {
+        box.appendChild(text('div', 'empty', '暂无常驻节点池'));
+        return;
+    }
+    pools.forEach(pool => {
+        const card = document.createElement('div');
+        card.className = 'relay-node';
+        card.appendChild(text('div', 'name', `${pool.tenant_key} · ${pool.role} · ${pool.az}`));
+        card.appendChild(text(
+            'div',
+            'meta',
+            `节点 ${pool.nodes} / 上限 ${pool.max_nodes} · 槽位 ${pool.slots_used} / ${pool.slots_total}`
+        ));
+        box.appendChild(card);
+    });
+}
+
+const RELAY_STATE_LABELS = {
+    ready: '空闲可用',
+    busy: '执行中',
+    provisioning: '装机中（等待 agent 注册）',
+    unhealthy: '心跳超时',
+};
+
+function renderRelayEnvSummary({ pools, nodes, profiles, tenants }) {
+    const box = $('#relay-env-summary');
+    if (!box) return;
+    box.innerHTML = '';
+
+    const counts = {};
+    nodes.forEach(node => { counts[node.state] = (counts[node.state] || 0) + 1; });
+    const stateText = Object.keys(counts).length
+        ? Object.entries(counts)
+            .map(([state, count]) => `${RELAY_STATE_LABELS[state] || state} ${count}`)
+            .join(' · ')
+        : '暂无节点';
+
+    const cards = [
+        ['平台地址（中转机回连用）', location.origin],
+        ['已保存租户凭据', tenants.length ? `${tenants.length} 个` : '0 个（提交作业后自动写入）'],
+        ['常驻池 / 已存池参数', `${pools.length} / ${profiles.length}`],
+        ['当前筛选下节点', `${nodes.length} 台 · ${stateText}`],
+    ];
+    cards.forEach(([label, value]) => {
+        const card = document.createElement('div');
+        card.className = 'relay-node';
+        card.appendChild(text('div', 'meta', label));
+        card.appendChild(text('div', 'name', value));
+        box.appendChild(card);
+    });
+}
+
+function renderRelayNodeGrid(nodes) {
+    const box = $('#relay-node-grid');
+    if (!box) return;
+    box.innerHTML = '';
+    if (!nodes.length) {
+        box.appendChild(text('div', 'empty', '该筛选下没有节点'));
+        return;
+    }
+    nodes.forEach(node => {
+        const card = document.createElement('div');
+        card.className = 'relay-node';
+        card.dataset.state = node.state;
+        card.appendChild(text('div', 'name', node.name));
+        card.appendChild(text(
+            'div',
+            'meta',
+            `${node.role} · ${node.az} · ${node.fixed_ip || '-'} · ` +
+            `槽位 ${node.slots_used}/${node.slots_total} · ${node.state} · ` +
+            `agent ${node.agent_version || '-'}`
+        ));
+        const hint = relayNodeHint(node);
+        if (hint) card.appendChild(text('div', 'hint', hint));
+        const actions = document.createElement('div');
+        actions.className = 'd-flex flex-wrap gap-1 mt-2';
+        [
+            ['重建', 'rebuild'],
+            ['drain', 'drain'],
+            ['恢复', 'resume'],
+            ['轮换令牌', 'rotate-token'],
+            ['删除', 'delete'],
+        ].forEach(([label, action]) => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'btn btn-ghost btn-sm';
+            btn.textContent = label;
+            btn.addEventListener('click', () => relayNodeAction(node.node_id, action));
+            actions.appendChild(btn);
+        });
+        const passwordBtn = document.createElement('button');
+        passwordBtn.type = 'button';
+        passwordBtn.className = 'btn btn-ghost btn-sm';
+        passwordBtn.textContent = '显示密码';
+        passwordBtn.addEventListener('click', () => showRelayNodePassword(node.node_id));
+        actions.appendChild(passwordBtn);
+        card.appendChild(actions);
+        box.appendChild(card);
+    });
+}
+
+async function relayNodeAction(nodeId, action) {
+    if (action === 'delete' && !confirm(`确认删除中转机 ${nodeId}？`)) return;
+    const options = { method: action === 'delete' ? 'DELETE' : 'POST' };
+    const res = await fetch(`/api/relay/nodes/${nodeId}` + (action === 'delete' ? '' : `/${action}`), options);
+    const json = await res.json();
+    toast(json.ok ? `${action} 成功` : (json.error || `${action} 失败`), json.ok ? 'success' : 'error');
+    await refreshRelayResourcePage();
+}
+
+async function showRelayNodePassword(nodeId) {
+    const res = await fetch(`/api/relay/nodes/${nodeId}/password`);
+    const json = await res.json();
+    const modal = $('#relay-node-password-modal');
+    const value = $('#relay-password-value');
+    if (!json.ok) {
+        toast(json.error || '获取密码失败', 'error');
+        return;
+    }
+    value.textContent = json.password;
+    modal.classList.remove('hidden');
+}
+
+function relayNodeHint(node) {
+    if (node.state === 'provisioning') {
+        const age = node.created_at
+            ? Math.round(Date.now() / 1000 - node.created_at) : 0;
+        const ageText = age > 0
+            ? (age >= 3600 ? `已创建约 ${Math.round(age / 3600)} 小时。` : `已创建约 ${Math.max(age, 1)} 秒。`)
+            : '';
+        return 'agent 尚未注册（last_seen 为空）。常见原因：中转机连不上平台地址、'
+            + 'cloud-init 未执行完、镜像缺 curl/python3，或 /api/relay/bootstrap 返回 401。'
+            + ageText + '持续不注册请点「重建」；确认不要了就点「删除」回收资源。';
+    }
+    if (node.state === 'unhealthy') {
+        return 'agent 心跳超时。先确认节点网络与平台地址可达，仍不行点「重建」重装 agent。';
+    }
+    if (node.state === 'busy') {
+        return '节点正在执行迁移；要下线请先点「drain」排空在途任务。';
+    }
+    return '';
+}
+
+function applyPoolProfileToForm(profile) {
+    if (!profile) return;
+    const set = (name, value) => {
+        const input = $(`[name="${name}"]`);
+        if (input) input.value = value === undefined || value === null ? '' : value;
+    };
+    set('pp_tenant_key', profile.tenant_key);
+    set('pp_role', profile.role);
+    set('pp_az', profile.az);
+    set('pp_image', profile.image);
+    set('pp_flavor', profile.flavor);
+    set('pp_network', profile.network);
+    set('pp_subnet', profile.subnet);
+    set('pp_system_volume_type', profile.system_volume_type);
+    set('pp_data_floating_network', profile.data_floating_network);
+    set('pp_platform_url', profile.platform_url || location.origin + '/');
+    set('pp_slots_per_node', profile.slots_per_node);
+    set('pp_max_nodes', profile.max_nodes);
+    set('pp_min_nodes', profile.min_nodes);
+    set('pp_idle_hours', Math.round((profile.idle_scale_down_seconds || 86400) / 3600));
+    set('pp_data_port', profile.data_port);
+    set('pp_ssh_public_key', profile.ssh_public_key);
+}
+
+function prefillPoolProfileFromWizard() {
+    const role = $('[name="pp_role"]').value || 'source';
+    const label = role === 'source' ? '源端' : '目标端';
+    const pick = name => {
+        const el = $(`[name="relay_${role}_${name}"]`);
+        return el ? el.value : '';
+    };
+    const auth = readAuth(role);
+    const project = auth.project_id || auth.project_name;
+    const set = (name, value) => {
+        const el = $(`[name="${name}"]`);
+        if (el) el.value = value === undefined || value === null ? '' : value;
+    };
+    set('pp_tenant_key', auth.auth_url && project ? `${auth.auth_url}|${project}` : '');
+    set('pp_az', pick('az'));
+    set('pp_image', pick('image'));
+    set('pp_flavor', pick('flavor'));
+    set('pp_network', pick('network'));
+    set('pp_subnet', pick('subnet'));
+    set('pp_system_volume_type', pick('system_volume_type'));
+    set('pp_data_floating_network', pick('data_floating_network'));
+    const wizard = name => {
+        const el = $(`[name="${name}"]`);
+        return el ? String(el.value ?? '').trim() : '';
+    };
+    set('pp_platform_url', wizard('relay_platform_url') || location.origin + '/');
+    set('pp_slots_per_node', wizard('relay_slots_per_node') || 5);
+    set('pp_max_nodes', wizard('relay_max_nodes') || 6);
+    set('pp_min_nodes', wizard('relay_min_nodes') || 1);
+    set('pp_idle_hours', wizard('relay_idle_scale_down_hours') || 24);
+    set('pp_data_port', wizard('relay_data_port') || 9200);
+    set('pp_ssh_public_key', wizard('relay_ssh_public_key'));
+    if (!pick('image')) {
+        toast(`当前向导还没加载${label}目录，镜像/Flavor/网络可能为空，请先在「环境配置」点「载入两侧目录」`, 'error');
+        return;
+    }
+    toast(`已按「${label}」带入，确认无误后点「保存池参数」`, 'success');
+}
+
+async function deleteRelayProfile() {
+    const tenantKey = $('[name="pp_tenant_key"]').value.trim();
+    const role = $('[name="pp_role"]').value;
+    const az = $('[name="pp_az"]').value.trim();
+    if (!tenantKey || !az) {
+        toast('请先选择或填写要删除的池（租户键 + 可用区）', 'error');
+        return;
+    }
+    if (!confirm(`确认删除池建机参数 ${tenantKey} · ${role} · ${az}？池内仍有节点时会被拒绝。`)) return;
+    const params = new URLSearchParams({ tenant_key: tenantKey, role, az });
+    const res = await fetch('/api/relay/pools/profile?' + params.toString(), { method: 'DELETE' });
+    const json = await res.json();
+    toast(json.ok ? '池建机参数已删除' : (json.error || '删除失败'), json.ok ? 'success' : 'error');
+    await refreshRelayResourcePage();
+}
+
+function prefillCredentialFromWizard(prefix) {
+    const auth = readAuth(prefix);
+    const project = auth.project_id || auth.project_name;
+    const set = (name, value) => {
+        const el = $(`[name="${name}"]`);
+        if (el) el.value = value || '';
+    };
+    set('cred_tenant_key', auth.auth_url && project ? `${auth.auth_url}|${project}` : '');
+    set('cred_auth_url', auth.auth_url);
+    set('cred_username', auth.username);
+    set('cred_password', auth.password);
+    set('cred_user_domain_name', auth.user_domain_name || 'Default');
+    set('cred_project_id', auth.project_id);
+    set('cred_project_name', auth.project_name);
+    set('cred_project_domain_name', auth.project_domain_name || 'Default');
+    toast(`已带入${prefix === 'source' ? '源端' : '目标端'}凭据，确认后点「保存凭据」`, 'success');
+}
+
+async function saveRelayProfile() {
+    const payload = {
+        tenant_key: $('[name="pp_tenant_key"]').value.trim(),
+        role: $('[name="pp_role"]').value,
+        az: $('[name="pp_az"]').value.trim(),
+        image: $('[name="pp_image"]').value.trim(),
+        flavor: $('[name="pp_flavor"]').value.trim(),
+        network: $('[name="pp_network"]').value.trim(),
+        subnet: $('[name="pp_subnet"]').value.trim(),
+        system_volume_type: $('[name="pp_system_volume_type"]').value.trim(),
+        data_floating_network: $('[name="pp_data_floating_network"]')?.value.trim() || '',
+        platform_url: $('[name="pp_platform_url"]').value.trim(),
+        ssh_public_key: $('[name="pp_ssh_public_key"]').value.trim(),
+        slots_per_node: Number($('[name="pp_slots_per_node"]').value || 5),
+        max_nodes: Number($('[name="pp_max_nodes"]').value || 6),
+        min_nodes: Number($('[name="pp_min_nodes"]').value || 1),
+        idle_scale_down_seconds: Number($('[name="pp_idle_hours"]').value || 24) * 3600,
+        data_port: Number($('[name="pp_data_port"]').value || 9200),
+    };
+    const res = await fetch('/api/relay/pools/profile', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+    const json = await res.json();
+    toast(json.ok ? '池参数已保存' : (json.error || '保存失败'), json.ok ? 'success' : 'error');
+    await refreshRelayResourcePage();
+}
+
+async function saveRelayCredential() {
+    const auth = {};
+    ['auth_url', 'username', 'password', 'user_domain_name', 'project_id',
+     'project_name', 'project_domain_name'].forEach(key => {
+        const el = $(`[name="cred_${key}"]`);
+        if (el && el.value.trim()) auth[key] = el.value.trim();
+    });
+    const res = await fetch('/api/relay/tenants', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            tenant_key: $('[name="cred_tenant_key"]').value.trim(),
+            auth,
+        }),
+    });
+    const json = await res.json();
+    toast(json.ok ? '凭据已加密保存' : (json.error || '保存失败'), json.ok ? 'success' : 'error');
+    await refreshRelayResourcePage();
+}
+
+async function applyRelayScale() {
+    const res = await fetch('/api/relay/pools/scale', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            tenant_key: $('[name="scale_tenant_key"]').value.trim(),
+            role: $('[name="scale_role"]').value,
+            az: $('[name="scale_az"]').value.trim(),
+            target_nodes: Number($('#relay-scale-target').value || 1),
+        }),
+    });
+    const json = await res.json();
+    toast(json.ok ? '扩缩容已执行' : (json.error || '扩缩容失败'), json.ok ? 'success' : 'error');
+    await refreshRelayResourcePage();
+}
+
+function initRelayResourcePage() {
+    if (!$('#relay-resource-page')) return;
+    $('#relay-resource-refresh').addEventListener('click', refreshRelayResourcePage);
+    $('#relay-resource-reconcile').addEventListener('click', () => {
+        toast('节点对账由后台巡检每 60 秒执行一次，已刷新视图', 'success');
+        refreshRelayResourcePage();
+    });
+    $('#relay-profile-save').addEventListener('click', saveRelayProfile);
+    const profilePick = $('#relay-profile-pick');
+    if (profilePick) {
+        profilePick.addEventListener('change', () => {
+            if (!profilePick.value) return;
+            applyPoolProfileToForm(state.relayProfiles[Number(profilePick.value)]);
+        });
+    }
+    const profilePrefill = $('#relay-profile-prefill');
+    if (profilePrefill) profilePrefill.addEventListener('click', prefillPoolProfileFromWizard);
+    const profileDelete = $('#relay-profile-delete');
+    if (profileDelete) profileDelete.addEventListener('click', deleteRelayProfile);
+    const credPick = $('#relay-cred-pick');
+    if (credPick) {
+        credPick.addEventListener('change', () => {
+            if (credPick.value) $('[name="cred_tenant_key"]').value = credPick.value;
+        });
+    }
+    const credPrefillSource = $('#relay-cred-prefill-source');
+    if (credPrefillSource) {
+        credPrefillSource.addEventListener('click', () => prefillCredentialFromWizard('source'));
+    }
+    const credPrefillTarget = $('#relay-cred-prefill-target');
+    if (credPrefillTarget) {
+        credPrefillTarget.addEventListener('click', () => prefillCredentialFromWizard('target'));
+    }
+    $('#relay-credential-save').addEventListener('click', saveRelayCredential);
+    $('#relay-scale-apply').addEventListener('click', applyRelayScale);
+    $('#relay-password-close').addEventListener('click', () => {
+        $('#relay-node-password-modal').classList.add('hidden');
+    });
+}
+
+function emptyOptions(select, placeholder, list, labelFn) {
+    select.innerHTML = '';
+    select.appendChild(new Option(placeholder, ''));
+    list.forEach(item => select.appendChild(new Option(labelFn(item), item.id)));
+}
+
+async function loadProjects(prefix, btnId) {
+    const btn = $(btnId);
+    btn.disabled = true;
+    try {
+        const data = await postJson('/api/projects', readAuth(prefix));
+        const auth = readAuth(prefix);
+        const selected = [];
+        const name = auth.project_name || '';
+        const domain = auth.project_domain_name || '';
+        data.projects.forEach(project => {
+            const pName = project.name || '';
+            const pDomain = project.domain_name || project.domain_id || '';
+            if (pName === name && (!domain || pDomain === domain || project.domain_id === domain)) {
+                selected.push(project);
+            }
+        });
+        if (selected.length === 1) {
+            $(`[name="${prefix}_project_id"]`).value = selected[0].id;
+            $(`[name="${prefix}_project_name"]`).value = selected[0].name;
+            if (selected[0].domain_name) {
+                $(`[name="${prefix}_project_domain_name"]`).value = selected[0].domain_name;
+            }
+            toast(`已自动匹配项目 ${selected[0].name}@${selected[0].domain_name || selected[0].domain_id || ''}`, 'success');
+        } else if (selected.length > 1) {
+            const pick = prompt('存在同名项目，请粘贴正确的项目 UUID：\n' + selected.map(p =>
+                `${p.name}@${p.domain_name || p.domain_id || ''}  ${p.id}`
+            ).join('\n'), selected[0].id || '');
+            if (pick) $(`[name="${prefix}_project_id"]`).value = pick.trim();
+        } else {
+            $(`[name="${prefix}_project_id"]`).value = '';
+            toast(`未匹配「${name || '?'}」，已载入 ${data.projects.length} 个项目，请在下方选择`, 'error');
+        }
+        state[`${prefix}Projects`] = data.projects;
+        renderProjectPicker(prefix, data.projects);
+        const picker = $(`#${prefix}-project-picker`);
+        if (data.summary && picker) {
+            const hint = document.createElement('div');
+            hint.className = 'text-muted small mt-1';
+            const scopeText = data.scope && data.scope.scoped_project_id
+                ? `当前 token 作用域项目: ${data.scope.scoped_project_name || data.scope.scoped_project_id}`
+                : '当前 token 无项目作用域';
+            hint.textContent = `显示 ${data.projects.length} 个项目（${scopeText}）`;
+            picker.appendChild(hint);
+        }
+    } catch (err) {
+        toast(`载入项目失败：${err.message}`, 'error');
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+function renderProjectPicker(prefix, projects) {
+    const target = $(`#${prefix}-project-picker`);
+    if (!target) return;
+    target.innerHTML = '';
+    const select = document.createElement('select');
+    select.className = 'form-control mono mb-1';
+    select.appendChild(new Option('选择项目（自动填入 UUID）', ''));
+    projects.forEach(project => {
+        const label = `${project.name} @ ${project.domain_name || project.domain_id || ''}  [${project.id}]`;
+        const option = new Option(label, project.id);
+        if (project.id === $(`[name="${prefix}_project_id"]`).value) option.selected = true;
+        select.appendChild(option);
+    });
+    select.addEventListener('change', () => {
+        const project = projects.find(item => item.id === select.value);
+        if (!project) return;
+        $(`[name="${prefix}_project_id"]`).value = project.id;
+        $(`[name="${prefix}_project_name"]`).value = project.name;
+        if (project.domain_name) $(`[name="${prefix}_project_domain_name"]`).value = project.domain_name;
+        toast(`已选择项目 ${project.name}`, 'success');
+    });
+    target.appendChild(select);
+    target.classList.remove('hidden');
+}
+
+function renderDiag(data) {
+    const wrap = $('#diag-result');
+    wrap.classList.remove('hidden');
+    wrap.innerHTML = '';
+    const head = text('div', 'panel-title', '环境诊断结果');
+    const summary = text(
+        'pre',
+        'diag-block',
+        JSON.stringify(data.diag, null, 2)
+    );
+    const cliTitle = text('div', 'form-label mt-3', '在目标环境手工执行以下命令复核：');
+    const cli = text('pre', 'diag-block', data.cli.openrc + '\n\n' + data.cli.commands.join('\n'));
+    wrap.append(head, summary, cliTitle, cli);
+}
+
+async function diagTarget() {
+    const btn = $('#diag-target');
+    btn.disabled = true;
+    try {
+        const data = await postJson('/api/diag', readAuth('target'));
+        renderDiag(data);
+        toast('环境诊断完成', 'success');
+    } catch (err) {
+        const wrap = $('#diag-result');
+        wrap.classList.remove('hidden');
+        wrap.innerHTML = '';
+        wrap.appendChild(text('pre', 'diag-block', '诊断失败：' + err.message));
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+async function loadTargetCatalog() {
+    const btn = $('#load-target-catalog');
+    btn.disabled = true;
+    try {
+        const data = await postJson('/api/catalog', readAuth('target'));
+        state.targetCatalog = data;
+        emptyOptions($('#global-image'), '选择目标镜像', data.images, item => item.name);
+        if (state.previewRows.length) renderPreview();
+        toast('目标目录加载完成', 'success');
+    } catch (err) {
+        toast('目标目录加载失败：' + err.message, 'error');
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+function fillSubnetOptions(select, networkId, selectedId) {
+    select.innerHTML = '';
+    select.appendChild(new Option('目标子网', ''));
+    if (!networkId) return;
+    state.targetCatalog.subnets
+        .filter(subnet => subnet.network_id === networkId)
+        .forEach(subnet =>
+            select.appendChild(new Option(`${subnet.name} (${subnet.cidr})`, subnet.id))
+        );
+    if (selectedId) select.value = selectedId;
+}
+
+function ipv4ToInt(ip) {
+    const parts = String(ip || '').split('.');
+    if (parts.length !== 4) return null;
+    let value = 0;
+    for (const part of parts) {
+        const octet = Number(part);
+        if (!Number.isInteger(octet) || octet < 0 || octet > 255) return null;
+        value = value * 256 + octet;
+    }
+    return value;
+}
+
+function ipv4InSubnet(ip, cidr) {
+    const [networkText, prefixText] = String(cidr || '').split('/');
+    const ipValue = ipv4ToInt(ip);
+    const networkValue = ipv4ToInt(networkText);
+    const prefix = Number(prefixText);
+    if (ipValue === null || networkValue === null ||
+        !Number.isInteger(prefix) || prefix < 0 || prefix > 32) {
+        return false;
+    }
+    const mask = prefix === 0 ? 0 : (~0 << (32 - prefix)) >>> 0;
+    return (ipValue & mask) === (networkValue & mask);
+}
+
+async function loadSourceServers(reset) {
+    if (state.sourceServerLoading) return;
+    state.sourceServerLoading = true;
+    const btn = $('#load-source-vms');
+    if (btn) btn.disabled = true;
+    try {
+        const search = ($('#source-vm-search').value || '').trim();
+        const payload = {
+            ...readAuth('source'),
+            search,
+            marker: reset ? '' : (state.sourceServersNextMarker || '')
+        };
+        const data = await postJson('/api/source-vms', payload);
+        if (reset) {
+            state.sourceServers = [];
+            state.sourceServersNextMarker = null;
+        }
+        state.sourceServers = state.sourceServers.concat(data.servers || []);
+        state.sourceServersNextMarker = data.next_marker || null;
+        renderSourceServers();
+        toast(`已加载 ${(data.servers || []).length} 台源 VM`, 'success');
+    } catch (err) {
+        toast('源 VM 列表加载失败：' + err.message, 'error');
+    } finally {
+        state.sourceServerLoading = false;
+        if (btn) btn.disabled = false;
+    }
+}
+
+function renderSourceServers() {
+    const box = $('#source-server-list');
+    if (!box) return;
+    box.classList.remove('hidden');
+    box.innerHTML = '';
+    const hint = $('#selected-count');
+    if (hint) hint.textContent = `${state.selectedServerIds.size} 台`;
+    if (!state.sourceServers.length) {
+        box.appendChild(text('div', 'empty', '暂无 VM，或按名称搜索无结果。'));
+        return;
+    }
+    state.sourceServers.forEach(server => {
+        const label = document.createElement('label');
+        label.className = 'source-server-row';
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = state.selectedServerIds.has(server.server_id);
+        checkbox.addEventListener('change', () => toggleSourceServer(server, checkbox));
+        const flavor = server.flavor || {};
+        const meta = text(
+            'span',
+            'source-meta mono',
+            `${server.status || ''} · ${server.availability_zone || '未知AZ'} · ` +
+            `${flavor.vcpus || '?'}vCPU/${flavor.ram || '?'}MB · ` +
+            `${server.image_name || 'BFV（卷启动）'}`
+        );
+        label.append(checkbox, text('span', 'source-name', server.name), meta);
+        box.appendChild(label);
+    });
+    if (state.sourceServersNextMarker) {
+        const moreBtn = text('button', 'btn btn-ghost btn-sm mt-2', '加载更多');
+        moreBtn.type = 'button';
+        moreBtn.onclick = () => loadSourceServers(false);
+        box.appendChild(moreBtn);
+    }
+}
+
+async function toggleSourceServer(server, checkbox) {
+    if (checkbox.checked) {
+        if (!state.selectedServerIds.has(server.server_id)) {
+            state.selectedServerIds.add(server.server_id);
+            await addSelectedSourceServer(server);
+        }
+    } else {
+        state.selectedServerIds.delete(server.server_id);
+        removePreviewRowByServerId(server.server_id);
+    }
+    renderSourceServers();
+}
+
+function removePreviewRowByServerId(serverId) {
+    state.previewRows = state.previewRows.filter(
+        row => !(row._picklist && row.server_id === serverId)
+    );
+    renderPreview();
+}
+
+async function addSelectedSourceServer(server) {
+    if (state.previewRows.some(row => row.server_id === server.server_id)) {
+        return;
+    }
+    state.previewRows.push({
+        _picklist: true,
+        server_id: server.server_id,
+        vm_name: server.name,
+        target_az: '',
+        target_image: $('#global-image').value,
+        target_flavor: '',
+        mode: ($('#global-mode') && $('#global-mode').value) || 'full',
+        source_networks: [],
+        source_flavor: server.flavor,
+        source_image: server.image_name,
+        source_az: server.availability_zone
+    });
+    await fillSourceNetworksForRows();
+    renderPreview();
+}
+
+async function parseExcel() {
+    const fileInput = $('#excel_file');
+    if (!fileInput.files.length) {
+        toast('请先选择 Excel 文件', 'error');
+        return;
+    }
+    const data = new FormData();
+    data.append('excel_file', fileInput.files[0]);
+    const btn = $('#parse-excel');
+    btn.disabled = true;
+    try {
+        const res = await fetch('/api/preview', { method: 'POST', body: data });
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || '解析失败');
+        const listRows = state.previewRows.filter(row => row.server_id);
+        const excelRows = (json.rows || []).map(row => ({
+            ...row,
+            server_id: null,
+            source_networks: [],
+            source_flavor: null,
+            source_image: null,
+            source_az: null
+        }));
+        state.previewRows = listRows.concat(excelRows);
+        await fillSourceNetworksForRows();
+        renderPreview();
+    } catch (err) {
+        toast('清单解析失败：' + err.message, 'error');
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+async function fillSourceNetworksForRows() {
+    const names = (state.previewRows || []).map(row => row.vm_name);
+    if (!names.length) return;
+    const auth = readAuth('source');
+    if (!auth.auth_url || !auth.username) {
+        toast('提示：先填写源环境认证，可自动带出每台源 VM 的 IP/网段', 'error');
+        return;
+    }
+    try {
+        const serverIds = (state.previewRows || []).map(row => row.server_id || '');
+        const data = await postJson('/api/source-vm-networks', {
+            ...auth,
+            vm_names: names,
+            server_ids: serverIds
+        });
+        state.sourceVolumeTypes = data.volume_types || [];
+        state.previewRows.forEach(row => {
+            const info = (data.servers || {})[row.vm_name] || {};
+            const ports = info.ports || [];
+            row.server_id = info.server_id || row.server_id || '';
+            row.source_networks = ports.map(p => ({
+                network: p.network_name || p.network_id || '',
+                ip: p.ip,
+                cidr: p.cidr,
+                mac: p.mac || ''
+            }));
+            row.source_volumes = info.volumes || [];
+            row.source_error = info.error || '';
+        });
+    } catch (err) {
+        toast('源 VM 网络信息获取失败：' + err.message, 'error');
+    }
+}
+
+function togglePlanCard(card, button) {
+    const body = $('.plan-card-body', card);
+    if (!body) return;
+    const hidden = body.classList.toggle('hidden');
+    button.textContent = hidden ? '展开' : '收起';
+    if (!hidden) {
+        const firstIssue = $('.nic-row.is-missing', body);
+        if (firstIssue) firstIssue.scrollIntoView({ block: 'nearest' });
+    }
+}
+
+function autoMapNetworks() {
+    const networks = state.targetCatalog.networks || [];
+    const subnets = state.targetCatalog.subnets || [];
+    let mapped = 0;
+    $$('#preview-wrap .preview-card').forEach(card => {
+        $$('.nic-row:not(.volume-row)', card).forEach(netRow => {
+            const netSelect = $('.nic-network', netRow);
+            const subnetSelect = $('.nic-subnet', netRow);
+            if (!netSelect || !subnetSelect) return;
+            const sourceNetwork = netRow.dataset.sourceNetwork || '';
+            const sourceCidr = netRow.dataset.sourceCidr || '';
+            const already = Boolean(subnetSelect.value);
+            let subnet = already
+                ? subnets.find(item => item.id === subnetSelect.value)
+                : null;
+            if (!subnet && sourceCidr) {
+                subnet = subnets.find(item => item.cidr === sourceCidr) || null;
+            }
+            if (!subnet && sourceNetwork) {
+                const match = networks.find(item => item.name === sourceNetwork);
+                subnet = match
+                    ? subnets.find(item => item.network_id === match.id) || null
+                    : null;
+            }
+            if (!subnet) return;
+            if (!netSelect.value) netSelect.value = subnet.network_id;
+            if (!subnetSelect.value) {
+                fillSubnetOptions(subnetSelect, netSelect.value, subnet.id);
+            }
+            if (!already) mapped += 1;
+        });
+    });
+    refreshChecklistUI();
+    toast(
+        mapped ? `自动映射完成，新增 ${mapped} 个网卡` : '没有可自动匹配的网卡，请手动选择',
+        mapped ? 'success' : 'error'
+    );
+}
+
+function applyBulkToSelected() {
+    const azSelect = $('#bulk-az');
+    const az = azSelect ? azSelect.value : '';
+    const image = ($('#global-image') && $('#global-image').value) || '';
+    if (!az && !image) {
+        toast('请先选择要批量应用的目标 AZ 或默认镜像', 'error');
+        return;
+    }
+    const ids = state.selectedServerIds;
+    let count = 0;
+    state.previewRows.forEach(row => {
+        if (ids.size && !ids.has(row.server_id)) return;
+        if (az) row.target_az = az;
+        if (image) row.target_image = image;
+        count += 1;
+    });
+    $$('#preview-wrap .preview-card').forEach((card, index) => {
+        const row = state.previewRows[index];
+        if (!row) return;
+        const azEl = $('[data-field="target_az"]', card);
+        if (azEl && row.target_az) azEl.value = row.target_az;
+        const imageEl = $('[data-field="target_image"]', card);
+        if (imageEl && row.target_image) imageEl.value = row.target_image;
+    });
+    renderPreview();
+    toast(`已应用到 ${count} 台 VM`, 'success');
+}
+
+function renderPreview() {
+    const { vmOverrides: previousOverrides } = collectPreviewValues();
+    const wrap = $('#preview-wrap');
+    wrap.innerHTML = '';
+    if (!state.previewRows.length) {
+        wrap.appendChild(text('div', 'empty', '清单中没有可迁移的 VM。'));
+        return;
+    }
+
+    const toolbar = document.createElement('div');
+    toolbar.className = 'd-flex align-items-center gap-3 mb-3';
+    const refreshBtn = document.createElement('button');
+    refreshBtn.type = 'button';
+    refreshBtn.className = 'btn btn-ghost btn-sm';
+    refreshBtn.textContent = '刷新源 VM 网络信息';
+    refreshBtn.addEventListener('click', async () => {
+        refreshBtn.disabled = true;
+        await fillSourceNetworksForRows();
+        refreshBtn.disabled = false;
+        renderPreview();
+    });
+    toolbar.appendChild(refreshBtn);
+    const autoMapBtn = document.createElement('button');
+    autoMapBtn.type = 'button';
+    autoMapBtn.className = 'btn btn-ghost btn-sm';
+    autoMapBtn.textContent = '自动映射目标网络';
+    autoMapBtn.addEventListener('click', autoMapNetworks);
+    toolbar.appendChild(autoMapBtn);
+    toolbar.appendChild(text(
+        'span',
+        'text-muted small',
+        `共 ${state.previewRows.length} 台 VM · 每个源网卡都必须选择目标网络/子网`
+    ));
+    wrap.appendChild(toolbar);
+
+    const bulkBar = document.createElement('div');
+    bulkBar.className = 'bulk-bar';
+    const bulkAz = document.createElement('select');
+    bulkAz.className = 'form-control form-control-sm';
+    bulkAz.id = 'bulk-az';
+    bulkAz.appendChild(new Option('批量目标 AZ（不改可留空）', ''));
+    (state.targetCatalog.availability_zones || []).forEach(az =>
+        bulkAz.appendChild(new Option(az.name, az.id))
+    );
+    const bulkBtn = document.createElement('button');
+    bulkBtn.type = 'button';
+    bulkBtn.className = 'btn btn-ghost btn-sm';
+    bulkBtn.id = 'bulk-apply';
+    bulkBtn.textContent = '批量应用到已选 VM';
+    bulkBtn.addEventListener('click', applyBulkToSelected);
+    bulkBar.append(bulkAz, bulkBtn);
+    wrap.appendChild(bulkBar);
+
+    state.previewRows.forEach((row, index) => {
+        const card = document.createElement('div');
+        card.className = 'preview-card';
+
+        const head = document.createElement('div');
+        head.className = 'plan-card-head';
+        const title = document.createElement('div');
+        title.className = 'plan-title';
+        const indexBadge = text('span', 'plan-index', 'VM ' + String(index + 1).padStart(2, '0'));
+        const nameWrap = document.createElement('div');
+        nameWrap.appendChild(text('div', 'name', row.vm_name));
+        const sourceLabel = row._picklist ? '列表选择' : 'Excel 导入';
+        nameWrap.appendChild(text(
+            'div',
+            'plan-sub',
+            `${sourceLabel} · 源 server ${row.server_id || '未获取'} · ` +
+            `源网卡 ${(row.source_networks || []).length} · ` +
+            `源镜像 ${row.source_image || 'BFV（卷启动）'} · ` +
+            `目标卷 ${$('[name="target_volume_type"]').value.trim() || '默认类型'}` +
+            `（按源盘容量向上取整到 GiB）`
+        ));
+        title.append(indexBadge, nameWrap);
+        const stateBadge = text('span', 'plan-state missing', '待配置');
+        const expandBtn = document.createElement('button');
+        expandBtn.type = 'button';
+        expandBtn.className = 'btn btn-ghost btn-sm plan-expand';
+        expandBtn.textContent = '展开';
+        expandBtn.addEventListener('click', () => togglePlanCard(card, expandBtn));
+        head.append(title, stateBadge, expandBtn);
+        card.appendChild(head);
+
+        const body = document.createElement('div');
+        body.className = 'plan-card-body hidden';
+
+        const summary = text('div', 'plan-summary', '');
+        const selectedImage = state.targetCatalog.images
+            .find(item => item.id === row.target_image);
+        summary.textContent =
+            `目标 ${row.target_az || '未选 AZ'} · ` +
+            `镜像 ${selectedImage ? selectedImage.name : (row.target_image || '未选')} · ` +
+            `flavor ${row.target_flavor || '自动匹配'} · ` +
+            `源网卡 ${(row.source_networks || []).length}`;
+        nameWrap.appendChild(summary);
+
+        const channelSelect = document.createElement('select');
+        channelSelect.className = 'form-control form-control-sm channel-select';
+        channelSelect.dataset.role = 'data-channel';
+        ['rbd', 'relay'].forEach(value => {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = value === 'rbd' ? 'RBD 直连' : '中转机全量';
+            channelSelect.appendChild(option);
+        });
+        channelSelect.value = row.data_channel
+            || ($('#data-channel') ? $('#data-channel').value : 'rbd')
+            || 'rbd';
+        channelSelect.addEventListener('change', () => {
+            row.data_channel = channelSelect.value;
+        });
+        row.data_channel = channelSelect.value;
+        body.appendChild(channelSelect);
+
+        const specTitle = text('div', 'plan-section-title', '目标规格');
+        body.appendChild(specTitle);
+        const specGrid = document.createElement('div');
+        specGrid.className = 'spec-grid';
+
+        function fieldBox(labelText) {
+            const box = document.createElement('div');
+            box.className = 'field';
+            box.appendChild(text('label', '', labelText));
+            return box;
+        }
+
+        const azField = fieldBox('目标 AZ');
+        const azSelect = document.createElement('select');
+        azSelect.className = 'form-control';
+        azSelect.appendChild(new Option('选择目标 AZ', ''));
+        (state.targetCatalog.availability_zones || []).forEach(az =>
+            azSelect.appendChild(new Option(az.name, az.id))
+        );
+        if (row.target_az) azSelect.value = row.target_az;
+        azSelect.dataset.row = index;
+        azSelect.dataset.field = 'target_az';
+        azSelect.addEventListener('change', () => {
+            row.target_az = azSelect.value;
+            refreshChecklistUI();
+        });
+        azField.appendChild(azSelect);
+
+        const imageField = fieldBox('目标镜像');
+        const imageSelect = document.createElement('select');
+        imageSelect.className = 'form-control';
+        imageSelect.appendChild(new Option('选择镜像', ''));
+        state.targetCatalog.images.forEach(image =>
+            imageSelect.appendChild(new Option(image.name, image.id))
+        );
+        if (row.target_image) imageSelect.value = row.target_image;
+        else if ($('#global-image').value) imageSelect.value = $('#global-image').value;
+        imageSelect.dataset.row = index;
+        imageSelect.dataset.field = 'target_image';
+        imageSelect.addEventListener('change', () => {
+            row.target_image = imageSelect.value;
+            refreshChecklistUI();
+        });
+        imageField.appendChild(imageSelect);
+
+        const flavorField = fieldBox('目标 Flavor');
+        const flavorSelect = document.createElement('select');
+        flavorSelect.className = 'form-control';
+        flavorSelect.appendChild(new Option('自动匹配 flavor', ''));
+        state.targetCatalog.flavors.forEach(flavor =>
+            flavorSelect.appendChild(new Option(`${flavor.name} · ${flavor.vcpus}vCPU/${flavor.ram}MB`, flavor.id))
+        );
+        if (row.target_flavor) flavorSelect.value = row.target_flavor;
+        flavorSelect.dataset.row = index;
+        flavorSelect.dataset.field = 'target_flavor';
+        flavorField.appendChild(flavorSelect);
+
+        const modeField = fieldBox('迁移模式');
+        const modeSelect = document.createElement('select');
+        modeSelect.className = 'form-control';
+        modeSelect.appendChild(new Option('全量拷贝（默认）', 'full'));
+        modeSelect.appendChild(new Option('增量预拷贝（实验）', 'incremental'));
+        modeSelect.value = row.mode || 'full';
+        modeSelect.addEventListener('change', () => {
+            row.mode = modeSelect.value;
+            refreshChecklistUI();
+        });
+        modeSelect.dataset.row = index;
+        modeSelect.dataset.field = 'mode';
+        modeField.appendChild(modeSelect);
+        specGrid.append(azField, imageField, flavorField, modeField);
+        body.appendChild(specGrid);
+
+        const networkSection = document.createElement('div');
+        networkSection.className = 'network-section';
+        networkSection.appendChild(text('div', 'plan-section-title', '网卡网络规划'));
+
+        const sources = (row.source_networks && row.source_networks.length)
+            ? row.source_networks
+            : [];
+        if (!sources.length) {
+            networkSection.appendChild(text(
+                'div',
+                'source-warn-box',
+                row.source_error
+                    ? '源信息获取失败：' + row.source_error
+                    : '未能获取该 VM 的源网卡信息，请先点击上方“刷新源 VM 网络信息”。'
+            ));
+        } else {
+            const header = document.createElement('div');
+            header.className = 'nic-header';
+            ['源端口 / 网段', '目标网络', '目标子网', '目标 IP（留空自动）', '']
+                .forEach(label => header.appendChild(text('div', '', label)));
+            networkSection.appendChild(header);
+
+            sources.forEach((net, netIndex) => {
+                const prev = (
+                    previousOverrides[row.server_id || row.vm_name] || []
+                )[netIndex] || {};
+                const netRow = document.createElement('div');
+                netRow.className = 'nic-row';
+                netRow.dataset.sourceNetwork = net.network || '';
+                netRow.dataset.sourceIp = net.ip || '';
+                netRow.dataset.sourceCidr = net.cidr || '';
+
+                const sourceBox = document.createElement('div');
+                sourceBox.className = 'nic-source';
+                sourceBox.appendChild(text('div', 'nic-net', net.network || '未知网络'));
+                sourceBox.appendChild(text(
+                    'div',
+                    'nic-addr',
+                    `${net.ip || ''}${net.cidr ? ' / ' + net.cidr : ''}${net.mac ? ' · ' + net.mac : ''}`
+                ));
+
+                const netSelect = document.createElement('select');
+                netSelect.className = 'form-control mono nic-network';
+                netSelect.appendChild(new Option('选择目标网络', ''));
+                state.targetCatalog.networks.forEach(n =>
+                    netSelect.appendChild(new Option(n.name, n.id))
+                );
+                if (prev.target_network) netSelect.value = prev.target_network;
+
+                const subnetSelect = document.createElement('select');
+                subnetSelect.className = 'form-control mono nic-subnet';
+                fillSubnetOptions(subnetSelect, netSelect.value, prev.target_subnet || '');
+                netSelect.addEventListener('change', () => {
+                    fillSubnetOptions(subnetSelect, netSelect.value, '');
+                    refreshChecklistUI();
+                });
+                subnetSelect.addEventListener('change', refreshChecklistUI);
+
+                const ipInput = document.createElement('input');
+                ipInput.className = 'form-control mono nic-ip';
+                ipInput.placeholder = '自动';
+                ipInput.value = prev.target_ip || '';
+                ipInput.addEventListener('input', refreshChecklistUI);
+
+                const stateDot = text('span', 'nic-state warn', '!');
+                netRow.append(sourceBox, netSelect, subnetSelect, ipInput, stateDot);
+                networkSection.appendChild(netRow);
+            });
+        }
+        body.appendChild(networkSection);
+
+        // 逐卷指定目标卷类型（一台 VM 可能有多块盘，分属不同卷类型）
+        const volumeSection = document.createElement('div');
+        volumeSection.className = 'volume-section';
+        volumeSection.appendChild(
+            text('div', 'plan-section-title', '目标卷类型（逐卷）')
+        );
+        const volumes = row.source_volumes || [];
+        if (!volumes.length) {
+            volumeSection.appendChild(text(
+                'div', 'text-muted small', '未获取到源卷清单，将使用上方统一的目标卷类型'
+            ));
+        }
+        volumes.forEach(volume => {
+            const volumeRow = document.createElement('div');
+            volumeRow.className = 'nic-row volume-row';
+            volumeRow.dataset.sourceVolumeId = volume.volume_id || '';
+            const label = document.createElement('div');
+            label.className = 'nic-source';
+            label.appendChild(text(
+                'div', 'nic-net',
+                (volume.is_bootable ? '系统盘' : '数据盘') + ' · ' + (volume.device || volume.volume_id || '')
+            ));
+            label.appendChild(text('div', 'nic-addr', `${volume.size || 0}G`));
+            const sourceTypeSelect = document.createElement('select');
+            sourceTypeSelect.className = 'form-control mono volume-source-type';
+            sourceTypeSelect.appendChild(new Option('源端派生卷：继承源卷类型', ''));
+            (state.sourceVolumeTypes || []).forEach(item =>
+                sourceTypeSelect.appendChild(new Option(item.name, item.id))
+            );
+            sourceTypeSelect.addEventListener('change', refreshChecklistUI);
+
+            const targetTypeSelect = document.createElement('select');
+            targetTypeSelect.className = 'form-control mono volume-target-type';
+            targetTypeSelect.appendChild(new Option('目标卷：跟随统一配置', ''));
+            (state.targetCatalog.volume_types || []).forEach(item =>
+                targetTypeSelect.appendChild(new Option(item.name, item.id))
+            );
+            targetTypeSelect.addEventListener('change', refreshChecklistUI);
+
+            volumeRow.append(label, sourceTypeSelect, targetTypeSelect);
+            volumeSection.appendChild(volumeRow);
+        });
+        body.appendChild(volumeSection);
+        card.appendChild(body);
+        wrap.appendChild(card);
+    });
+    refreshChecklistUI();
+}
+
+function networkIssues() {
+    const { vmOverrides: overrides } = collectPreviewValues();
+    const issues = [];
+    state.previewRows.forEach((row, rowIndex) => {
+        const zones = state.targetCatalog.availability_zones || [];
+        if (!row.target_az || !zones.some(zone => zone.id === row.target_az)) {
+            issues.push({
+                rowIndex,
+                nicIndex: null,
+                vm: row.vm_name,
+                message: '目标 AZ 不存在或未选择'
+            });
+        }
+        const sources = (row.source_networks && row.source_networks.length)
+            ? row.source_networks
+            : [];
+        if (!sources.length) {
+            issues.push({
+                rowIndex,
+                nicIndex: null,
+                vm: row.vm_name,
+                message: '未获取到源网卡信息'
+            });
+            return;
+        }
+        const entries = overrides[row.server_id || row.vm_name] || [];
+        sources.forEach((src, nicIndex) => {
+            const plan = entries[nicIndex] || {};
+            if (!plan.target_network || !plan.target_subnet) {
+                issues.push({
+                    rowIndex,
+                    nicIndex,
+                    vm: row.vm_name,
+                    message: `${src.network || '未知网络'} ${src.ip || ''} 未选择目标网络/子网`
+                });
+            } else if (plan.target_ip) {
+                const subnet = state.targetCatalog.subnets.find(
+                    item => item.id === plan.target_subnet
+                );
+                if (!subnet || !ipv4InSubnet(plan.target_ip, subnet.cidr)) {
+                    issues.push({
+                        rowIndex,
+                        nicIndex,
+                        vm: row.vm_name,
+                        message: `目标 IP ${plan.target_ip} 不属于子网 ${subnet ? subnet.cidr : '未知'}`
+                    });
+                }
+            }
+        });
+    });
+    return issues;
+}
+
+function refreshChecklistUI() {
+    const issues = networkIssues();
+    const summary = $('#checklist-summary');
+    if (!summary) return;
+    const issueRows = new Set(issues.map(issue => issue.rowIndex));
+    const ready = state.previewRows.length - issueRows.size;
+    if (issues.length === 0) {
+        summary.textContent = `已就绪 ${ready}/${state.previewRows.length}`;
+        summary.className = 'checklist-state ready';
+    } else {
+        summary.textContent = `待完善 ${issueRows.size} 台 · ${issues.length} 项`;
+        summary.className = 'checklist-state warn';
+    }
+    $$('.preview-card').forEach((card, rowIndex) => {
+        const rowIssues = issues.filter(issue => issue.rowIndex === rowIndex);
+        card.classList.toggle('has-issue', rowIssues.length > 0);
+        const badge = $('.plan-state', card);
+        if (badge) {
+            badge.textContent = rowIssues.length ? '待配置' : '已就绪';
+            badge.className = 'plan-state ' + (rowIssues.length ? 'missing' : 'ok');
+        }
+        let nicIndex = -1;
+        $$('.nic-row', card).forEach(nicRow => {
+            // 卷行复用 nic-row 样式，但不算网卡，否则索引会错位。
+            if (nicRow.classList.contains('volume-row')) return;
+            nicIndex += 1;
+            const missing = rowIssues.some(issue => issue.nicIndex === nicIndex);
+            nicRow.classList.toggle('is-missing', missing);
+            const dot = $('.nic-state', nicRow);
+            if (dot) {
+                dot.textContent = missing ? '!' : '✓';
+                dot.className = 'nic-state ' + (missing ? 'warn' : 'ok');
+            }
+        });
+    });
+}
+
+function collectPreviewValues() {
+    const vmOverrides = {};
+    const volumeOverrides = {};
+    state.previewRows.forEach(row => {
+        vmOverrides[row.server_id || row.vm_name] = [];
+        volumeOverrides[row.server_id || row.vm_name] = {};
+    });
+    $$('#preview-wrap [data-field]').forEach(input => {
+        const row = state.previewRows[Number(input.dataset.row)];
+        if (row) row[input.dataset.field] = input.value;
+    });
+    const cards = $$('#preview-wrap .preview-card');
+    cards.forEach((card, index) => {
+        const row = state.previewRows[index];
+        if (!row) return;
+        const entries = [];
+        $$('.nic-row', card).forEach(nicRow => {
+            if (nicRow.classList.contains('volume-row')) return;
+            entries.push({
+                source_network: nicRow.dataset.sourceNetwork || '',
+                source_ip: nicRow.dataset.sourceIp || '',
+                target_network: $('.nic-network', nicRow).value,
+                target_subnet: $('.nic-subnet', nicRow).value,
+                target_ip: ($('.nic-ip', nicRow).value || '').trim()
+            });
+        });
+        vmOverrides[row.server_id || row.vm_name] = entries;
+        $$('.volume-row', card).forEach(volumeRow => {
+            const volumeId = volumeRow.dataset.sourceVolumeId || '';
+            if (!volumeId) return;
+            const sourceType = $('.volume-source-type', volumeRow);
+            const targetType = $('.volume-target-type', volumeRow);
+            const entry = {
+                source: sourceType ? sourceType.value : '',
+                target: targetType ? targetType.value : '',
+            };
+            if (entry.source || entry.target) {
+                volumeOverrides[row.server_id || row.vm_name][volumeId] = entry;
+            }
+        });
+    });
+    return { vmOverrides, volumeOverrides };
+}
+
+async function startMigration() {
+    const { vmOverrides, volumeOverrides } = collectPreviewValues();
+    const excel = $('#excel_file').files[0];
+    if (!state.previewRows.length) {
+        toast('请先勾选源 VM，或展开高级 Excel 导入并解析清单', 'error');
+        return;
+    }
+    const incomplete = state.previewRows.find(row => !row.target_az || !row.target_image);
+    if (incomplete) {
+        toast(`VM ${incomplete.vm_name} 缺少目标 AZ 或镜像`, 'error');
+        return;
+    }
+    const issues = networkIssues();
+    if (issues.length) {
+        const preview = issues.slice(0, 3)
+            .map(issue => `${issue.vm}：${issue.message}`)
+            .join('；');
+        toast(`仍有 ${issues.length} 项网络未配置：${preview}${issues.length > 3 ? '…' : ''}`, 'error');
+        return;
+    }
+    const selectedRows = state.previewRows.map(row => ({
+        server_id: row.server_id || '',
+        vm_name: row.vm_name,
+        target_az: row.target_az,
+        target_image: row.target_image,
+        target_flavor: row.target_flavor || '',
+        mode: row.mode || 'full'
+    }));
+    const submitExcel = Boolean(excel) && state.previewRows.some(row => !row.server_id);
+
+    const data = new FormData();
+    ['source', 'target'].forEach(prefix => {
+        Object.entries(readAuth(prefix)).forEach(([key, value]) => data.append(`${prefix}_${key}`, value));
+    });
+    if (submitExcel) {
+        data.append('excel_file', excel);
+    } else {
+        data.append('selected_rows', JSON.stringify(selectedRows));
+    }
+    // 只有用户真的选了文件才 append：files[0] 为 undefined 时 FormData 会把
+    // 字符串 "undefined" 当成普通表单字段发出去，语义脏且易误判。
+    const sourceConfInput = $('[name="source_ceph_conf_file"]');
+    const targetConfInput = $('[name="target_ceph_conf_file"]');
+    const sourceConfFile = sourceConfInput && sourceConfInput.files[0];
+    const targetConfFile = targetConfInput && targetConfInput.files[0];
+    if (sourceConfFile) data.append('source_ceph_conf_file', sourceConfFile);
+    if (targetConfFile) data.append('target_ceph_conf_file', targetConfFile);
+    data.append('source_ceph_pool', $('[name="source_ceph_pool"]').value.trim());
+    data.append('target_ceph_pool', $('[name="target_ceph_pool"]').value.trim());
+    data.append(
+        'admin_password',
+        ($('[name="admin_password"]').value || '').trim()
+    );
+    data.append('target_volume_type', $('[name="target_volume_type"]').value.trim());
+    data.append('data_channel', $('#data-channel') ? $('#data-channel').value : 'rbd');
+    if ($('#profile-select') && $('#profile-select').value) {
+        data.append('profile_id', $('#profile-select').value);
+    }
+    if ($('[name="relay_platform_url"]')) {
+        ['relay_node_mode', 'relay_slots_per_node', 'relay_max_nodes',
+         'relay_min_nodes', 'relay_idle_scale_down_hours'].forEach(name => {
+            const el = $(`[name="${name}"]`);
+            if (el) data.append(name, el.value);
+        });
+        data.append('relay_platform_url', $('[name="relay_platform_url"]').value.trim());
+        data.append('relay_agent_install', $('[name="relay_agent_install"]').value);
+        data.append('relay_data_port', $('[name="relay_data_port"]').value);
+        ['relay_admin_password', 'relay_ssh_public_key', 'relay_ready_timeout',
+         'relay_heartbeat_interval', 'relay_heartbeat_timeout', 'relay_copy_retries'
+        ].forEach(name => {
+            const el = $(`[name="${name}"]`);
+            if (el) data.append(name, el.value);
+        });
+        data.append(
+            'relay_full_verify',
+            $('[name="relay_full_verify"]').checked ? '1' : ''
+        );
+    }
+    ['source', 'target'].forEach(prefix => {
+        ['image', 'flavor', 'az', 'network', 'subnet', 'ips',
+         'system_volume_type', 'data_floating_network',
+         'volume_type'].forEach(field => {
+            const el = $(`[name="relay_${prefix}_${field}"]`);
+            if (el) data.append(`relay_${prefix}_${field}`, el.value);
+        });
+        const sizeEl = $(`[name="relay_${prefix}_size"]`);
+        if (sizeEl) data.append(`relay_${prefix}_size`, sizeEl.value);
+    });
+    data.append('vm_concurrency', $('[name="vm_concurrency"]').value);
+    data.append('volume_concurrency', $('[name="volume_concurrency"]').value);
+    data.append('rate_limit_mb_s', $('[name="rate_limit_mb_s"]').value);
+    ['delta_rounds', 'delta_threshold_mb', 'delta_interval_seconds', 'cutover_mode'].forEach(name => {
+        data.append(name, $(`[name="${name}"]`).value);
+    });
+    data.append('target_image', $('#global-image').value);
+    const rowOverrides = {};
+    state.previewRows.forEach(row => {
+        rowOverrides[row.server_id || row.vm_name] = {
+            target_az: row.target_az,
+            target_image: row.target_image,
+            target_flavor: row.target_flavor,
+            mode: row.mode || 'full',
+            data_channel: row.data_channel || 'rbd'
+        };
+    });
+    data.append('row_overrides', JSON.stringify(rowOverrides));
+    data.append('vm_network_overrides', JSON.stringify(vmOverrides));
+    data.append('volume_overrides', JSON.stringify(volumeOverrides));
+
+    const btn = $('#start-migration');
+    btn.disabled = true;
+    try {
+        const res = await fetch('/api/migrate', { method: 'POST', body: data });
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || '启动失败');
+        state.jobId = json.job_id;
+        toast('任务已提交：' + json.job_id, 'success');
+        switchStep(3);
+        startPolling();
+    } catch (err) {
+        toast('迁移启动失败：' + err.message, 'error');
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+function statusBadge(status) {
+    const map = {
+        success: ['badge-success', '成功'],
+        failed: ['badge-danger', '失败'],
+        pending: ['badge-secondary', '等待'],
+        copying: ['badge-info', '拷贝中'],
+        ready: ['badge-success', '已就绪'],
+        preflight_failed: ['badge-danger', '校验失败'],
+        running: ['badge-info', '进行中'],
+        cancelled: ['badge-warning', '已取消'],
+        queued: ['badge-secondary', '等待'],
+        copying_volumes: ['badge-info', '拷贝中'],
+        precopying: ['badge-info', '增量预拷贝'],
+        starting_target: ['badge-warning', '开机中'],
+        verifying: ['badge-warning', '验证中'],
+        awaiting_flavor: ['badge-warning', '待选 flavor'],
+        awaiting_cutover: ['badge-warning', '待切换']
+    };
+    const item = map[status] || ['badge-secondary', status];
+    const el = text('span', 'badge ' + item[0], item[1]);
+    return el;
+}
+
+function volumeProgressCell(volume) {
+    const wrap = document.createElement('div');
+    if (volume.status === 'success') {
+        wrap.appendChild(text('div', 'text-muted small', '100%'));
+        return wrap;
+    }
+    const percent = Math.max(0, Math.min(100, Number(volume.progress_percent) || 0));
+    const label = volume.progress_label || '';
+    // 还在跑（copying，或基像刚开跑时仍是 pending）才画进度条。
+    // 只看 copying 会让整段基线全备都没有进度，像"到 100% 才出现"。
+    // ready：本轮已经搬完、在等下一步动作，进度条停在全满而不是消失。
+    const running = volume.status === 'copying' || volume.status === 'pending'
+        || volume.status === 'ready';
+    if (!running || (percent <= 0 && !label)) {
+        wrap.appendChild(text('div', 'text-muted small', '—'));
+        return wrap;
+    }
+    const prefix = label ? label + ' · ' : '';
+    const info = text('div', 'text-muted small',
+        prefix + percent.toFixed(1) + '%' +
+        (volume.throughput_mb_s != null ? ' · ' + volume.throughput_mb_s + ' MiB/s' : '')
+    );
+    const bar = document.createElement('div');
+    bar.className = 'progress-thin';
+    bar.style.marginTop = '4px';
+    const fill = document.createElement('div');
+    fill.style.width = percent + '%';
+    bar.appendChild(fill);
+    wrap.appendChild(info);
+    wrap.appendChild(bar);
+    return wrap;
+}
+
+function togglePasswordVisibility(button) {
+    const input = $(`[name="${button.dataset.target}"]`);
+    if (!input) return;
+    const show = input.type === 'password';
+    input.type = show ? 'text' : 'password';
+    button.textContent = show ? '🙈' : '👁';
+    button.title = show ? '隐藏密码' : '显示密码';
+}
+
+function jobStatusLabel(status) {
+    const map = {
+        running: '进行中',
+        completed: '已完成',
+        failed: '失败',
+        cancelled: '已取消',
+    };
+    return map[status] || status;
+}
+
+function jobStatusBadgeClass(status) {
+    if (status === 'failed') return 'badge-danger';
+    if (status === 'completed') return 'badge-success';
+    if (status === 'cancelled') return 'badge-warning';
+    return 'badge-info';
+}
+
+async function loadJobList() {
+    const container = $('#job-list');
+    try {
+        const res = await fetch('/api/jobs');
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || '查询失败');
+        container.innerHTML = '';
+        if (!json.jobs || !json.jobs.length) {
+            container.appendChild(text('div', 'empty small', '暂无历史任务。'));
+            return;
+        }
+        const jobs = json.jobs.slice().reverse();
+        jobs.forEach(job => {
+            const row = document.createElement('div');
+            row.className = 'job-list-item';
+            const done = job.vms.filter(vm => vm.status === 'success').length;
+            const failed = job.vms.filter(vm => vm.status === 'failed' || vm.status === 'preflight_failed').length;
+            row.appendChild(text('span', 'mono', job.id));
+            row.appendChild(text('span', 'badge ' + jobStatusBadgeClass(job.status), jobStatusLabel(job.status)));
+            row.appendChild(text('span', 'text-muted small', `${job.created_at || ''} · 成功 ${done}/${job.vms.length} · 失败 ${failed}`));
+
+            const actions = document.createElement('span');
+            actions.className = 'job-list-actions';
+            if (job.status === 'running') {
+                const cancelBtn = document.createElement('button');
+                cancelBtn.type = 'button';
+                cancelBtn.className = 'btn btn-ghost btn-sm';
+                cancelBtn.textContent = '取消';
+                cancelBtn.addEventListener('click', event => {
+                    event.stopPropagation();
+                    cancelJob(job.id);
+                });
+                actions.appendChild(cancelBtn);
+            } else {
+                const deleteBtn = document.createElement('button');
+                deleteBtn.type = 'button';
+                deleteBtn.className = 'btn btn-ghost btn-sm';
+                deleteBtn.textContent = '删除';
+                deleteBtn.addEventListener('click', event => {
+                    event.stopPropagation();
+                    deleteJob(job.id);
+                });
+                actions.appendChild(deleteBtn);
+            }
+            row.appendChild(actions);
+
+            row.addEventListener('click', () => selectJob(job.id));
+            container.appendChild(row);
+        });
+        // 自动恢复查看：优先选择进行中的任务；没有则选最新一条
+        const running = jobs.find(job => job.status === 'running');
+        const target = running || jobs[0];
+        if (target && state.jobId !== target.id) {
+            selectJob(target.id);
+        } else if (target && state.pollTimer) {
+            // 已选中同一任务时仅确保轮询继续
+            clearInterval(state.pollTimer);
+            state.pollTimer = null;
+            selectJob(target.id);
+        }
+    } catch (err) {
+        container.appendChild(text('div', 'error-box', '任务列表加载失败：' + err.message));
+    }
+}
+
+function selectJob(jobId) {
+    state.jobId = jobId;
+    const hint = $('#job-list-hint');
+    if (hint) hint.textContent = '正在监控任务 ' + jobId;
+    startPolling();
+}
+
+async function cancelJob(jobId) {
+    if (!window.confirm(`确定取消任务 ${jobId}？正在进行的卷拷贝会中止，已创建的目标资源保留。`)) {
+        return;
+    }
+    try {
+        const res = await fetch(`/api/jobs/${jobId}/cancel`, { method: 'POST' });
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || '取消失败');
+        toast(
+            json.cancelled
+                ? `已请求取消，正在等待当前卷收尾${json.relay_agents ? '（已通知 ' + json.relay_agents + ' 台中转机）' : ''}`
+                : '任务已结束，无需取消',
+            'success'
+        );
+        await loadJobList();
+    } catch (err) {
+        toast('取消失败：' + err.message, 'error');
+    }
+}
+
+async function deleteJob(jobId) {
+    if (!window.confirm(`确定删除任务 ${jobId}？任务记录与上传目录会被清除，云上已创建的资源不受影响。`)) {
+        return;
+    }
+    try {
+        const res = await fetch(`/api/jobs/${jobId}`, { method: 'DELETE' });
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || '删除失败');
+        if (state.jobId === jobId) {
+            state.jobId = null;
+            if (state.pollTimer) clearInterval(state.pollTimer);
+            state.pollTimer = null;
+            $('#vm-list').innerHTML = '<div class="empty">暂无任务。</div>';
+        }
+        toast('任务已删除', 'success');
+        await loadJobList();
+    } catch (err) {
+        toast('删除失败：' + err.message, 'error');
+    }
+}
+
+async function startPolling() {
+    if (state.pollTimer) clearInterval(state.pollTimer);
+    const poll = async () => {
+        if (!state.jobId) return;
+        try {
+            const res = await fetch('/api/jobs/' + state.jobId);
+            const json = await res.json();
+            if (!json.ok) throw new Error(json.error || '查询失败');
+            renderJob(json.job);
+            await refreshRelayPool();
+            if (json.job.status !== 'running') clearInterval(state.pollTimer);
+        } catch (err) {
+            toast('状态查询失败：' + err.message, 'error');
+            clearInterval(state.pollTimer);
+        }
+    };
+    await poll();
+    state.pollTimer = setInterval(poll, 3000);
+}
+
+async function requestCutover(vmName, button) {
+    if (!state.jobId) return;
+    button.disabled = true;
+    try {
+        const res = await fetch(
+            `/api/jobs/${state.jobId}/vms/${encodeURIComponent(vmName)}/cutover`,
+            { method: 'POST' }
+        );
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok || !json.ok) {
+            throw new Error(json.error || `HTTP ${res.status}`);
+        }
+        toast('已下发切换指令：停止源机后补齐末轮增量再启动目标机', 'success');
+    } catch (err) {
+        button.disabled = false;
+        toast('下发切换指令失败：' + err.message, 'error');
+    }
+}
+
+async function requestSync(vmName, button) {
+    if (!state.jobId) return;
+    button.disabled = true;
+    try {
+        const res = await fetch(
+            `/api/jobs/${state.jobId}/vms/${encodeURIComponent(vmName)}/sync`,
+            { method: 'POST' }
+        );
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok || !json.ok) {
+            throw new Error(json.error || `HTTP ${res.status}`);
+        }
+        toast('已下发同步指令：做一轮增量，源机不停机', 'success');
+    } catch (err) {
+        toast('下发同步指令失败：' + err.message, 'error');
+    } finally {
+        button.disabled = false;
+    }
+}
+
+function renderJob(job) {
+    const list = $('#vm-list');
+    list.innerHTML = '';
+    const summary = $('#job-summary');
+    summary.innerHTML = '';
+    const counts = { success: 0, failed: 0, running: 0, queued: 0 };
+    job.vms.forEach(vm => {
+        if (vm.status === 'success') counts.success++;
+        else if (vm.status === 'failed' || vm.status === 'preflight_failed') counts.failed++;
+        else if (vm.status === 'queued' || vm.status === 'awaiting_flavor') counts.queued++;
+        else counts.running++;
+    });
+    summary.appendChild(text('span', 'mono', `Job ${job.id}`));
+    summary.appendChild(text('span', 'badge ' + (job.status === 'failed' ? 'badge-danger' : 'badge-info'), jobStatusLabel(job.status)));
+    summary.appendChild(text('span', 'text-muted small', `成功 ${counts.success} · 失败 ${counts.failed} · 进行 ${counts.running} · 等待 ${counts.queued}`));
+
+    if (!job.vms.length) {
+        list.appendChild(text('div', 'empty', '暂无 VM 任务。'));
+        return;
+    }
+    job.vms.forEach(vm => {
+        const card = document.createElement('div');
+        card.className = 'vm-card';
+        const head = document.createElement('div');
+        head.className = 'vm-head';
+        const left = document.createElement('div');
+        left.appendChild(text('div', 'name', vm.name));
+        left.appendChild(text('div', 'phase', vm.phase));
+        head.appendChild(left);
+        head.appendChild(statusBadge(vm.status));
+        card.appendChild(head);
+        if (vm.error) {
+            card.appendChild(text('div', 'error-box', '失败原因：' + vm.error));
+        }
+        if (vm.status === 'success') {
+            const ok = text('div', 'success-box', '✔ 迁移成功完成');
+            card.appendChild(ok);
+        }
+        if (vm.status === 'awaiting_cutover') {
+            const bar = document.createElement('div');
+            bar.className = 'd-flex align-items-center gap-2 mt-2';
+            bar.appendChild(text(
+                'div', 'text-muted small',
+                '基线已完成，源机仍在运行。需要补数据点「同步一次」，准备停机时点「开始切换」。'
+            ));
+            const sync = document.createElement('button');
+            sync.className = 'btn btn-sm btn-outline-primary';
+            sync.textContent = '同步一次';
+            sync.title = '按需做一轮增量，不产生多余快照';
+            sync.addEventListener('click', () => requestSync(vm.name, sync));
+            const cutover = document.createElement('button');
+            cutover.className = 'btn btn-sm btn-primary';
+            cutover.textContent = '开始切换';
+            cutover.addEventListener('click', () => requestCutover(vm.name, cutover));
+            bar.appendChild(sync);
+            bar.appendChild(cutover);
+            card.appendChild(bar);
+        }
+        const details = [];
+        if (vm.source_server_id) details.push('源 server：' + vm.source_server_id);
+        if (vm.target_server_id) details.push('目标 server：' + vm.target_server_id);
+        if (vm.source_ips && vm.source_ips.length) details.push('源 IP：' + vm.source_ips.join(', '));
+        if (vm.target_ips && vm.target_ips.length) details.push('目标 IP：' + vm.target_ips.join(', '));
+        if (vm.duration_seconds != null) details.push('耗时：' + vm.duration_seconds + ' 秒');
+        if (details.length) {
+            card.appendChild(text('div', 'text-muted small mt-2', details.join('　')));
+        }
+        if (vm.created_resources && vm.created_resources.length) {
+            card.appendChild(text('div', 'text-muted small mt-2', '已创建资源：' + vm.created_resources.join('，')));
+        }
+        if (vm.status === 'failed' && (vm.volumes || []).some(v => v.mode === 'incremental')) {
+            const retry = document.createElement('button');
+            retry.className = 'btn btn-sm btn-outline-danger mt-2';
+            retry.textContent = '以全量模式重跑该 VM';
+            retry.addEventListener('click', () => {
+                toast('请在上方清单把该 VM 的迁移模式改为“全量拷贝”后重新提交', 'info');
+            });
+            card.appendChild(retry);
+        }
+        if (vm.volumes && vm.volumes.length) {
+            const table = document.createElement('table');
+            table.className = 'table table-sm mt-3';
+            const thead = document.createElement('thead');
+            thead.innerHTML = '<tr><th>源 RBD</th><th>目标 RBD</th><th>模式</th><th>状态</th><th>进度</th><th>快照清理</th><th>错误</th></tr>';
+            table.appendChild(thead);
+            const body = document.createElement('tbody');
+            vm.volumes.forEach(volume => {
+                const tr = document.createElement('tr');
+                const src = text('td', 'mono', volume.source_rbd_name);
+                const dst = text('td', 'mono', volume.target_rbd_name);
+                const st = text('td');
+                st.appendChild(statusBadge(volume.status));
+                const modeCell = text('td', '', volume.mode === 'incremental' ? '增量' : '全量');
+                const cleanupCell = text(
+                    'td',
+                    '',
+                    volume.cleanup_status === 'cleaned' ? '已清理'
+                        : volume.cleanup_status === 'pending' ? '待清理'
+                            : volume.cleanup_status === 'gone' ? '源卷已删' : '—'
+                );
+                tr.append(src, dst, modeCell, st, volumeProgressCell(volume), cleanupCell, text('td', '', volume.error || ''));
+                body.appendChild(tr);
+            });
+            table.appendChild(body);
+            card.appendChild(table);
+        }
+        list.appendChild(card);
+    });
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    $$('.step-btn').forEach(btn => btn.addEventListener('click', () => switchStep(
+        Number(btn.dataset.step)
+    )));
+    const relayOpsOpen = $('#relay-ops-open');
+    if (relayOpsOpen) relayOpsOpen.addEventListener('click', openRelayOps);
+    const relayOpsClose = $('#relay-ops-close');
+    if (relayOpsClose) relayOpsClose.addEventListener('click', closeRelayOps);
+    initRelayResourcePage();
+    initThemeToggle();
+    initSchemePicker();
+    initProfilePanel();
+    $$('.password-toggle').forEach(btn => btn.addEventListener('click', () => togglePasswordVisibility(btn)));
+    $('#load-source-projects').addEventListener('click', () => loadProjects('source', '#load-source-projects'));
+    $('#load-target-projects').addEventListener('click', () => loadProjects('target', '#load-target-projects'));
+    $('#diag-target').addEventListener('click', diagTarget);
+    $('#load-target-catalog').addEventListener('click', loadTargetCatalog);
+    $('#load-source-vms').addEventListener('click', () => loadSourceServers(true));
+    $('#source-vm-search').addEventListener('keydown', event => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            state.sourceServers = [];
+            state.sourceServersNextMarker = null;
+            loadSourceServers(true);
+        }
+    });
+    $('#parse-excel').addEventListener('click', parseExcel);
+    $('#start-migration').addEventListener('click', startMigration);
+    $('#load-jobs').addEventListener('click', loadJobList);
+    $('#global-image').addEventListener('change', () => {
+        if (!state.previewRows.length) return;
+        state.previewRows.forEach(row => { row.target_image = $('#global-image').value; });
+        $$('#preview-wrap select').forEach(select => {
+            if (select.dataset.field === 'target_image') select.value = $('#global-image').value;
+        });
+    });
+    $('#global-mode').addEventListener('change', () => {
+        if (!state.previewRows.length) return;
+        state.previewRows.forEach(row => { row.mode = $('#global-mode').value; });
+        $$('#preview-wrap select').forEach(select => {
+            if (select.dataset.field === 'mode') select.value = $('#global-mode').value;
+        });
+    });
+    loadJobList();
+});
+</script>
+</body>
+</html>

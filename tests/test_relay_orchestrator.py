@@ -1,0 +1,704 @@
+import unittest
+from unittest import mock
+
+from relay_orchestrator import CopyCancelled, RelayVolumeMover
+from relay_pool import RelayNode
+
+
+class _Sleeper:
+    """让等待逻辑在测试里立即返回，同时记录调用次数。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, seconds):
+        self.calls += 1
+
+
+class _FakeClock:
+    """可推进的假时钟，避免停滞检测依赖真实等待。"""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class _FakePool:
+    def __init__(self, nodes):
+        self._nodes = list(nodes)
+        self.released = []
+
+    def acquire(self, task_id):
+        return self._nodes.pop(0) if self._nodes else None
+
+    def release(self, node_id, *, lease_id=""):
+        self.released.append(node_id)
+
+
+class _FakeState:
+    def __init__(self):
+        self.enqueued = []
+        self.ready = set()
+        self.results = {}
+
+    def enqueue(self, task):
+        self.enqueued.append(task)
+
+    def mark_task_ready(self, task_id):
+        self.ready.add(task_id)
+
+    def task_ready(self, task_id):
+        return task_id in self.ready
+
+    def record_result(self, task_id, status, copied_bytes, digest="", error=""):
+        self.results[task_id] = {
+            "status": status,
+            "copied_bytes": copied_bytes,
+            "digest": digest,
+            "error": error,
+        }
+
+    def task_result(self, task_id):
+        return self.results.get(task_id)
+
+
+class _FakeLedger:
+    def __init__(self):
+        self.records = {}
+        self.saved = 0
+
+    def get(self, job_id, volume_id):
+        return self.records.get(f"{job_id}:{volume_id}")
+
+    def upsert(self, record):
+        self.records[record.key] = record
+        return record
+
+    def save(self):
+        self.saved += 1
+
+
+class _Volume:
+    def __init__(self, volume_id="vol-s1", size=4096):
+        self.source_volume_id = volume_id
+        self.size = size
+
+
+class RelayVolumeMoverTest(unittest.TestCase):
+    def setUp(self):
+        from relay_ledger import VolumeTaskRecord
+        from relay_volumes import SourceCopy
+
+        self.VolumeTaskRecord = VolumeTaskRecord
+        self.source_os = mock.MagicMock()
+        self.target_os = mock.MagicMock()
+        self.source_os.wait_attachment_device.return_value = "/dev/vdb"
+        self.target_os.wait_attachment_device.return_value = "/dev/vdc"
+        self.lifecycle = mock.MagicMock()
+        self.lifecycle.source_os = self.source_os
+        self.lifecycle.target_os = self.target_os
+        self.lifecycle.create_source_copy.return_value = SourceCopy(
+            snapshot_id="snap-1", derived_volume_id="vol-d1"
+        )
+        self.lifecycle.create_target_volume.return_value = "vol-t1"
+        self.source_node = RelayNode(
+            node_id="n-s", name="relay-source-0", role="source", az="az1",
+            server_id="srv-s", session_id="sess-s", data_address="10.0.0.7",
+        )
+        self.target_node = RelayNode(
+            node_id="n-t", name="relay-target-0", role="target", az="az2",
+            server_id="srv-t", session_id="sess-t", data_address="10.0.0.8",
+        )
+        self.state = _FakeState()
+        self.ledger = _FakeLedger()
+        self.mover = RelayVolumeMover(
+            source_pool=_FakePool([self.source_node]),
+            target_pool=_FakePool([self.target_node]),
+            lifecycle=self.lifecycle,
+            state=self.state,
+            ledger=self.ledger,
+            job_id="job-1",
+            sleeper=_Sleeper(),
+            # 这些用例断言"没有空闲机器"时的行为，关掉排队保持立即失败。
+            slot_wait_timeout=0,
+        )
+
+    def _auto_complete(self):
+        """模拟 agent：入队即就绪、随即返回成功结果。"""
+        for task in list(self.state.enqueued):
+            if task.get("kind") == "verify":
+                self.state.record_result(
+                    task["task_id"], "done", 4096, digest="same-digest"
+                )
+                continue
+            self.state.mark_task_ready(task["task_id"])
+            self.state.record_result(task["task_id"], "done", 4096)
+
+    def _copy_tasks(self):
+        return [t for t in self.state.enqueued if t.get("kind") != "verify"]
+
+    def _run(self, volume=None):
+        return self.mover.move(
+            volume=volume or _Volume(),
+            vm_name="vm-1",
+            index=0,
+            source_az="az1",
+            target_az="az2",
+        )
+
+    def test_move_orders_target_task_before_source(self):
+        original_enqueue = self.state.enqueue
+
+        def enqueue(task):
+            original_enqueue(task)
+            self._auto_complete()
+
+        self.state.enqueue = enqueue
+
+        self._run()
+
+        roles = [task["role"] for task in self._copy_tasks()]
+        self.assertEqual(roles, ["target", "source"])
+
+    def test_pool_exhausted_still_cleans_derived_copy_and_snapshot(self):
+        """取不到中转机槽位时，派生卷与快照也必须回收，不能留在源云里。
+
+        旧实现把清理挂在 ``source_node is not None`` 上，池满直接失败时
+        copy 已经建好却不会清理，留下 200G 派生卷 + 快照占配额。
+        """
+        self.mover.source_pool = _FakePool([])  # 源端没有可用中转机
+        self.mover.target_pool = _FakePool([self.target_node])
+
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run()
+
+        self.assertIn("中转机池没有空闲机器", str(ctx.exception))
+        self.lifecycle.cleanup_source_copy.assert_called_once()
+        args = self.lifecycle.cleanup_source_copy.call_args
+        self.assertEqual(args.args[0].derived_volume_id, "vol-d1")
+        # 没有中转机可卸载，relay_server_id 允许为空。
+        self.assertEqual(args.args[1], "")
+
+    def test_successful_move_does_not_double_clean_source_copy(self):
+        original_enqueue = self.state.enqueue
+        self.state.enqueue = lambda task: (original_enqueue(task), self._auto_complete())
+
+        self._run()
+
+        # 正常路径在 try 里清理一次，finally 不应再清一次（否则重复删卷报错刷日志）。
+        self.assertEqual(self.lifecycle.cleanup_source_copy.call_count, 1)
+
+    def test_error_reports_the_side_that_actually_failed(self):
+        """源端失败、目标端还挂在监听时，必须报源端的错误而不是 'target 失败: None'。"""
+
+        def enqueue(task):
+            self.state.enqueued.append(task)
+            if task["role"] == "target":
+                # 目标端进入监听后就一直等连接，不返回结果
+                self.state.mark_task_ready(task["task_id"])
+            else:
+                self.state.record_result(
+                    task["task_id"],
+                    "failed",
+                    0,
+                    error="FileNotFoundError: /dev/vdb",
+                )
+
+        self.state.enqueue = enqueue
+
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run()
+
+        message = str(ctx.exception)
+        self.assertIn("-s 失败", message)
+        self.assertIn("FileNotFoundError", message)
+
+    def test_target_accept_timeout_is_bounded(self):
+        original_enqueue = self.state.enqueue
+        self.state.enqueue = lambda task: (original_enqueue(task), self._auto_complete())
+
+        self._run()
+
+        target_task = self._copy_tasks()[0]
+        self.assertLessEqual(target_task["accept_timeout"], 600)
+
+    def test_transfer_length_is_bytes_not_gib(self):
+        """Cinder 的卷大小是 GiB；数据面按字节传，少乘 1024^3 会直接越界。"""
+        original_enqueue = self.state.enqueue
+        self.state.enqueue = lambda task: (original_enqueue(task), self._auto_complete())
+
+        self._run(volume=_Volume(size=1))
+
+        target_task = self._copy_tasks()[0]
+        self.assertEqual(target_task["length"], 1024 ** 3)
+
+    def test_move_records_total_bytes_for_page_progress(self):
+        """页面要显示百分比，台账必须带上总量（字节）。"""
+        original_enqueue = self.state.enqueue
+        self.state.enqueue = lambda task: (original_enqueue(task), self._auto_complete())
+
+        self._run(volume=_Volume(size=2))
+
+        record = self.ledger.get("job-1", "vol-s1")
+        self.assertEqual(record.total_bytes, 2 * 1024 ** 3)
+
+    def test_default_stall_timeout_is_five_minutes(self):
+        self.assertEqual(self.mover.stall_timeout, 300.0)
+
+    def test_transfer_without_progress_raises_stall_timeout(self):
+        """字节长时间不涨必须判定卡死，而不是等到 6 小时的 result_timeout。"""
+        clock = _FakeClock()
+        self.mover.clock = clock
+        self.mover.stall_timeout = 30.0
+
+        def sleeper(seconds):
+            clock.advance(float(seconds))
+            if clock.now > 3600.0:
+                # 没有停滞检测时这里会一直空转，用断言避免测试挂死。
+                raise AssertionError("拷贝等待超过 1 小时仍未判定停滞")
+
+        self.mover.sleeper = sleeper
+
+        def enqueue(task):
+            self.state.enqueued.append(task)
+            if task["role"] == "target":
+                self.state.mark_task_ready(task["task_id"])
+
+        self.state.enqueue = enqueue
+
+        with self.assertRaises(TimeoutError) as ctx:
+            self._run()
+
+        self.assertIn("停滞", str(ctx.exception))
+
+    def test_progress_updates_prevent_stall_detection(self):
+        """慢拷贝只要 copied_bytes 在涨就不能误判成卡死。"""
+        clock = _FakeClock()
+        self.mover.clock = clock
+        self.mover.stall_timeout = 30.0
+
+        def sleeper(seconds):
+            clock.advance(10.0)
+            record = self.ledger.get("job-1", "vol-s1")
+            record.copied_bytes = int(record.copied_bytes or 0) + 1024
+            if clock.now >= 60.0:
+                for task in self.state.enqueued:
+                    self.state.record_result(
+                        task["task_id"], "done", record.copied_bytes
+                    )
+
+        self.mover.sleeper = sleeper
+
+        def enqueue(task):
+            self.state.enqueued.append(task)
+            if task["role"] == "target":
+                self.state.mark_task_ready(task["task_id"])
+
+        self.state.enqueue = enqueue
+
+        self._run()
+
+        self.assertEqual(self.ledger.get("job-1", "vol-s1").phase, "done")
+
+    def test_stall_cancels_pending_tasks(self):
+        """判定停滞时两端任务要先撤销，否则残留 agent 会一直占住槽位。"""
+        clock = _FakeClock()
+        self.mover.clock = clock
+        self.mover.stall_timeout = 30.0
+        self.mover.copy_retries = 0
+
+        def sleeper(seconds):
+            clock.advance(float(seconds))
+            if clock.now > 3600.0:
+                raise AssertionError("拷贝等待超过 1 小时仍未判定停滞")
+
+        self.mover.sleeper = sleeper
+        cancelled = []
+        self.state.request_cancel = cancelled.append
+
+        def enqueue(task):
+            self.state.enqueued.append(task)
+            if task["role"] == "target":
+                self.state.mark_task_ready(task["task_id"])
+
+        self.state.enqueue = enqueue
+
+        with self.assertRaises(TimeoutError):
+            self._run()
+
+        task_ids = [task["task_id"] for task in self._copy_tasks()]
+        self.assertEqual(cancelled, task_ids)
+
+    def test_offset_beyond_total_skips_transfer(self):
+        """已拷完的卷重试时不能再取 length=1，否则又会越界。"""
+        record = self.VolumeTaskRecord(
+            job_id="job-1",
+            vm_id="vm-1",
+            volume_id="vol-s1",
+            copied_bytes=1024 ** 3,
+        )
+        self.ledger.upsert(record)
+        original_enqueue = self.state.enqueue
+        self.state.enqueue = lambda task: (original_enqueue(task), self._auto_complete())
+
+        self._run(volume=_Volume(size=1))
+
+        self.assertEqual(self._copy_tasks(), [])
+
+    def test_transfer_enables_sparse_when_both_agents_support_it(self):
+        self.source_node.agent_version = "1.1.0"
+        self.target_node.agent_version = "1.1.0"
+        original_enqueue = self.state.enqueue
+        self.state.enqueue = lambda task: (original_enqueue(task), self._auto_complete())
+
+        self._run()
+
+        for task in self._copy_tasks():
+            self.assertTrue(task["sparse"])
+            self.assertEqual(task["hole_mode"], "skip")
+
+    def test_transfer_falls_back_when_any_agent_is_old(self):
+        self.source_node.agent_version = "1.0.0"
+        self.target_node.agent_version = "1.1.0"
+        original_enqueue = self.state.enqueue
+        self.state.enqueue = lambda task: (original_enqueue(task), self._auto_complete())
+
+        self._run()
+
+        for task in self._copy_tasks():
+            self.assertNotIn("sparse", task)
+            self.assertNotIn("hole_mode", task)
+
+    def test_transfer_disables_sparse_when_mode_off(self):
+        self.source_node.agent_version = "1.1.0"
+        self.target_node.agent_version = "1.1.0"
+        self.mover.hole_mode = "off"
+        original_enqueue = self.state.enqueue
+        self.state.enqueue = lambda task: (original_enqueue(task), self._auto_complete())
+
+        self._run()
+
+        self.assertNotIn("sparse", self._copy_tasks()[0])
+
+    def test_sparse_decision_explains_why_it_is_disabled(self):
+        from relay_orchestrator import sparse_decision
+
+        self.assertEqual(
+            sparse_decision("1.1.0", "1.1.0", "skip"), (True, "both agents >= 1.1.0, hole_mode=skip")
+        )
+        enabled, reason = sparse_decision("1.0.0", "1.1.0", "skip")
+        self.assertFalse(enabled)
+        self.assertIn("source agent", reason)
+        enabled, reason = sparse_decision("1.1.0", "1.1.0", "off")
+        self.assertFalse(enabled)
+        self.assertIn("off", reason)
+
+    def test_transfer_passes_skipped_base_from_ledger(self):
+        record = self.VolumeTaskRecord(
+            job_id="job-1",
+            vm_id="vm-1",
+            volume_id="vol-s1",
+            skipped_bytes=4096,
+        )
+        self.ledger.upsert(record)
+        original_enqueue = self.state.enqueue
+        self.state.enqueue = lambda task: (original_enqueue(task), self._auto_complete())
+
+        self._run()
+
+        self.assertEqual(self._copy_tasks()[0]["skipped_base"], 4096)
+
+    def test_move_pins_tasks_to_the_attached_relay(self):
+        original_enqueue = self.state.enqueue
+        self.state.enqueue = lambda task: (original_enqueue(task), self._auto_complete())
+
+        self._run()
+
+        target_task, source_task = self._copy_tasks()
+        # 绑定用节点名：node_id 与注册产生的 agent_id 不同，按 id 绑定会没人领。
+        self.assertEqual(target_task["agent_name"], "relay-target-0")
+        self.assertEqual(target_task["dst_path"], "/dev/vdc")
+        self.assertEqual(source_task["agent_name"], "relay-source-0")
+        self.assertEqual(source_task["src_path"], "/dev/vdb")
+        self.assertEqual(source_task["peer_host"], "10.0.0.8")
+        self.assertEqual(source_task["peer_port"], 9200)
+        self.assertEqual(source_task["ticket"], target_task["ticket"])
+
+    def test_move_returns_target_volume_id(self):
+        original_enqueue = self.state.enqueue
+        self.state.enqueue = lambda task: (original_enqueue(task), self._auto_complete())
+
+        result = self._run()
+
+        self.assertEqual(result["target_volume_id"], "vol-t1")
+
+    def test_move_uses_per_volume_target_type_override(self):
+        original_enqueue = self.state.enqueue
+        self.state.enqueue = lambda task: (original_enqueue(task), self._auto_complete())
+        self.mover.target_volume_type = "pool-default"
+
+        self.mover.move(
+            volume=_Volume(),
+            vm_name="vm-1",
+            index=0,
+            source_az="az1",
+            target_az="az2",
+            target_volume_type="per-volume-ssd",
+        )
+
+        kwargs = self.lifecycle.create_target_volume.call_args.kwargs
+        self.assertEqual(kwargs["volume_type"], "per-volume-ssd")
+
+    def test_move_uses_per_volume_source_type_override(self):
+        original_enqueue = self.state.enqueue
+        self.state.enqueue = lambda task: (original_enqueue(task), self._auto_complete())
+        self.mover.source_volume_type = "pool-default"
+
+        self.mover.move(
+            volume=_Volume(),
+            vm_name="vm-1",
+            index=0,
+            source_az="az1",
+            target_az="az2",
+            source_volume_type="per-volume-ssd",
+        )
+
+        kwargs = self.lifecycle.create_source_copy.call_args.kwargs
+        self.assertEqual(kwargs["volume_type"], "per-volume-ssd")
+
+    def test_move_falls_back_to_pool_target_type(self):
+        original_enqueue = self.state.enqueue
+        self.state.enqueue = lambda task: (original_enqueue(task), self._auto_complete())
+        self.mover.target_volume_type = "pool-default"
+
+        self._run()
+
+        kwargs = self.lifecycle.create_target_volume.call_args.kwargs
+        self.assertEqual(kwargs["volume_type"], "pool-default")
+
+    def test_move_cleans_up_and_releases_on_success(self):
+        original_enqueue = self.state.enqueue
+        self.state.enqueue = lambda task: (original_enqueue(task), self._auto_complete())
+
+        self._run()
+
+        self.lifecycle.cleanup_source_copy.assert_called_once()
+        self.lifecycle.detach.assert_any_call(
+            role="target", server_id="srv-t", volume_id="vol-t1"
+        )
+        self.assertEqual(self.mover.source_pool.released, ["n-s"])
+        self.assertEqual(self.mover.target_pool.released, ["n-t"])
+
+    def test_move_drives_ledger_to_done(self):
+        seen = []
+        original_save = self.ledger.save
+
+        def save():
+            original_save()
+            seen.extend(record.phase for record in self.ledger.records.values())
+
+        self.ledger.save = save
+        original_enqueue = self.state.enqueue
+        self.state.enqueue = lambda task: (original_enqueue(task), self._auto_complete())
+
+        self._run()
+        self.ledger.save()
+
+        self.assertIn("copying", seen)
+        self.assertEqual(self.ledger.get("job-1", "vol-s1").phase, "done")
+
+    def test_move_marks_ledger_failed_and_cleans_up(self):
+        original_enqueue = self.state.enqueue
+
+        def enqueue(task):
+            original_enqueue(task)
+            self.state.mark_task_ready(task["task_id"])
+            self.state.record_result(task["task_id"], "failed", 0)
+
+        self.state.enqueue = enqueue
+
+        with self.assertRaises(RuntimeError):
+            self._run()
+
+        self.assertEqual(self.ledger.get("job-1", "vol-s1").phase, "failed")
+        self.lifecycle.cleanup_source_copy.assert_called_once()
+        self.assertEqual(self.mover.source_pool.released, ["n-s"])
+
+    def test_move_raises_when_pool_exhausted(self):
+        self.mover.source_pool = _FakePool([])
+
+        with self.assertRaises(RuntimeError):
+            self._run()
+
+    def test_move_verifies_both_ends_and_detects_mismatch(self):
+        def enqueue(task):
+            self.state.enqueued.append(task)
+            if task.get("kind") == "verify":
+                digest = "src" if task["role"] == "source" else "dst"
+                self.state.record_result(task["task_id"], "done", 4096, digest=digest)
+                return
+            self.state.mark_task_ready(task["task_id"])
+            self.state.record_result(task["task_id"], "done", 4096)
+
+        self.state.enqueue = enqueue
+
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run()
+
+        self.assertIn("摘要不一致", str(ctx.exception))
+
+    def test_move_verifies_and_accepts_matching_digest(self):
+        original_enqueue = self.state.enqueue
+        self.state.enqueue = lambda task: (original_enqueue(task), self._auto_complete())
+
+        self._run()
+
+        verify_tasks = [t for t in self.state.enqueued if t.get("kind") == "verify"]
+        self.assertEqual(len(verify_tasks), 2)
+        self.assertEqual({t["role"] for t in verify_tasks}, {"source", "target"})
+        self.assertEqual(self.ledger.get("job-1", "vol-s1").phase, "done")
+
+    def test_move_retries_once_and_resumes_from_recorded_offset(self):
+        original_enqueue = self.state.enqueue
+        failed_once = {"done": False}
+
+        def enqueue(task):
+            original_enqueue(task)
+            if task.get("kind") == "verify":
+                self.state.record_result(task["task_id"], "done", 4096, digest="same")
+                return
+            self.state.mark_task_ready(task["task_id"])
+            if task["role"] == "source" and not failed_once["done"]:
+                failed_once["done"] = True
+                self.state.record_result(task["task_id"], "failed", 0)
+                return
+            self.state.record_result(task["task_id"], "done", 4096)
+
+        self.state.enqueue = enqueue
+
+        self._run()
+
+        record = self.ledger.get("job-1", "vol-s1")
+        self.assertEqual(record.retry_count, 1)
+        self.assertEqual(record.phase, "done")
+        self.assertEqual(len(self._copy_tasks()), 4)
+
+    def test_move_does_not_retry_after_cancel(self):
+        original_enqueue = self.state.enqueue
+
+        def enqueue(task):
+            original_enqueue(task)
+            self.state.mark_task_ready(task["task_id"])
+            status = "cancelled" if task["role"] == "source" else "done"
+            self.state.record_result(task["task_id"], status, 0)
+
+        self.state.enqueue = enqueue
+
+        with self.assertRaises(CopyCancelled):
+            self._run()
+
+        self.assertEqual(len(self._copy_tasks()), 2)
+        self.assertEqual(self.ledger.get("job-1", "vol-s1").phase, "failed")
+
+    def test_move_resumes_from_recorded_offset(self):
+        # copied_bytes 与 offset/length 都是字节
+        record = self.VolumeTaskRecord(
+            job_id="job-1",
+            vm_id="vm-1",
+            volume_id="vol-s1",
+            copied_bytes=1024 * 1024 ** 3,
+        )
+        self.ledger.upsert(record)
+        original_enqueue = self.state.enqueue
+        self.state.enqueue = lambda task: (original_enqueue(task), self._auto_complete())
+
+        self._run(volume=_Volume(size=4096))
+
+        source_task = self._copy_tasks()[-1]
+        self.assertEqual(source_task["offset"], 1024 * 1024 ** 3)
+        self.assertEqual(source_task["length"], 3072 * 1024 ** 3)
+
+
+class PinnedDispatchTest(unittest.TestCase):
+    def setUp(self):
+        from relay_registry import RelayState
+
+        self.state = RelayState(secret=b"secret")
+
+    def _agent(self, name, role="source"):
+        return self.state.register(
+            job_id="job-1", role=role, name=name, version="1.0.0",
+            address="10.0.0.1", now=1000.0,
+        )
+
+    def test_dispatch_skips_task_pinned_to_other_agent(self):
+        agent_a = self._agent("relay-source-0")
+        agent_b = self._agent("relay-source-1")
+        self.state.enqueue(
+            {"task_id": "t-b", "role": "source", "agent_id": agent_b.agent_id}
+        )
+        self.state.enqueue(
+            {"task_id": "t-a", "role": "source", "agent_id": agent_a.agent_id}
+        )
+
+        task = self.state.dispatch(agent_a.session_id)
+
+        self.assertEqual(task["task_id"], "t-a")
+        self.assertIsNotNone(self.state.task("t-b"))
+
+    def test_dispatch_returns_unpinned_task_to_any_agent(self):
+        agent = self._agent("relay-source-0")
+        self.state.enqueue({"task_id": "t-1", "role": "source"})
+
+        self.assertEqual(self.state.dispatch(agent.session_id)["task_id"], "t-1")
+
+    def test_record_and_read_task_result(self):
+        self.assertIsNone(self.state.task_result("t-1"))
+        self.state.record_result("t-1", "done", 4096)
+        self.assertEqual(self.state.task_result("t-1")["copied_bytes"], 4096)
+
+
+class AttachmentDeviceTest(unittest.TestCase):
+    def setUp(self):
+        from openstack_utils import OpenStackUtils
+
+        self.conn = mock.MagicMock()
+        self.os_utils = OpenStackUtils(conn=self.conn)
+        self.sleeper = _Sleeper()
+
+    def test_wait_attachment_device_returns_device(self):
+        self.conn.compute.volume_attachments.return_value = [
+            mock.Mock(id="att-1", volume_id="vol-1", device="/dev/vdb")
+        ]
+
+        device = self.os_utils.wait_attachment_device(
+            "srv-1", "vol-1", sleeper=self.sleeper, timeout=1
+        )
+
+        self.assertEqual(device, "/dev/vdb")
+
+    def test_wait_attachment_device_retries_until_device_present(self):
+        self.conn.compute.volume_attachments.side_effect = [
+            [mock.Mock(id="att-1", volume_id="vol-1", device="")],
+            [mock.Mock(id="att-1", volume_id="vol-1", device="/dev/vdb")],
+        ]
+
+        device = self.os_utils.wait_attachment_device(
+            "srv-1", "vol-1", sleeper=self.sleeper, timeout=5
+        )
+
+        self.assertEqual(device, "/dev/vdb")
+        self.assertEqual(self.sleeper.calls, 1)
+
+    def test_wait_attachment_device_times_out(self):
+        self.conn.compute.volume_attachments.return_value = []
+
+        with self.assertRaises(TimeoutError):
+            self.os_utils.wait_attachment_device(
+                "srv-1", "vol-1", sleeper=self.sleeper, timeout=0
+            )

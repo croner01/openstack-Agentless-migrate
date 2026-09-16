@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openstack-vm-migration-deployment
+  namespace: migrate
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openstack-vm-migration
+  strategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: openstack-vm-migration
+    spec:
+      hostNetwork: true  # 使用本地网络
+      # 给正在运行的卷拷贝一个收尾窗口；若超过仍被 SIGKILL，
+      # 暂存镜像+rename 保证目标卷不被写坏。
+      terminationGracePeriodSeconds: 600
+      containers:
+      - name: openstack-vm-migration-container
+        image: hub.ecns.io/migration/openstack-vm-migration:v1.0.5
+        ports:
+        - containerPort: 19099
+        env:
+        - name: MIGRATION_SHUTDOWN_GRACE_SECONDS
+          value: "540"
+        - name: TZ
+          value: Asia/Shanghai
+        volumeMounts:
+        - name: uploads-volume
+          mountPath: /app/uploads
+        - name: hosts-volume
+          mountPath: /etc/hosts
+          readOnly: true
+        resources:
+          requests:
+            cpu: 1
+            memory: "1024Mi"
+          limits:
+            cpu: 8
+            memory: "16384Mi"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 19099
+          initialDelaySeconds: 15
+          periodSeconds: 20
+          timeoutSeconds: 10
+          successThreshold: 1
+          failureThreshold: 6
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 19099
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 6
+            #nodeSelector:
+            #kubernetes.io/hostname: node-1
+      volumes:
+      - name: uploads-volume
+        hostPath:
+          path: /path/to/local/uploads
+          type: DirectoryOrCreate
+      - name: hosts-volume
+        hostPath:
+          path: /etc/hosts
+          type: File    
