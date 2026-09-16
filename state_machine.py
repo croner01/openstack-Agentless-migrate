@@ -152,6 +152,12 @@ class VmTask:
     target_ips: list = field(default_factory=list)
     cutover_requested: bool = False
     sync_requested: bool = False
+    delta_rounds_done: int = 0
+    delta_rounds_max: int = 0
+    delta_last_bytes: int | None = None
+    delta_threshold_bytes: int = 0
+    delta_interval_seconds: float = 0.0
+    delta_cutover_mode: str = ""
 
     def can_start_target(self) -> bool:
         return bool(self.volumes) and all(
@@ -216,6 +222,12 @@ class VmTask:
             "target_ips": self.target_ips,
             "cutover_requested": self.cutover_requested,
             "sync_requested": self.sync_requested,
+            "delta_rounds_done": self.delta_rounds_done,
+            "delta_rounds_max": self.delta_rounds_max,
+            "delta_last_bytes": self.delta_last_bytes,
+            "delta_threshold_bytes": self.delta_threshold_bytes,
+            "delta_interval_seconds": self.delta_interval_seconds,
+            "delta_cutover_mode": self.delta_cutover_mode,
         }
 
     @classmethod
@@ -244,6 +256,16 @@ class VmTask:
             target_ips=data.get("target_ips") or [],
             cutover_requested=bool(data.get("cutover_requested")),
             sync_requested=bool(data.get("sync_requested")),
+            delta_rounds_done=int(data.get("delta_rounds_done") or 0),
+            delta_rounds_max=int(data.get("delta_rounds_max") or 0),
+            delta_last_bytes=(
+                int(data["delta_last_bytes"])
+                if data.get("delta_last_bytes") is not None
+                else None
+            ),
+            delta_threshold_bytes=int(data.get("delta_threshold_bytes") or 0),
+            delta_interval_seconds=float(data.get("delta_interval_seconds") or 0.0),
+            delta_cutover_mode=str(data.get("delta_cutover_mode") or ""),
         )
 
 

@@ -12,8 +12,10 @@ import ceph_utils
 from ceph_utils import (
     any_mon_reachable,
     CephUtils,
+    CopyStalledError,
     IncrementalSession,
     LayoutMismatchError,
+    RBD_TIMEOUT_RC,
     StageImageMissingError,
     ValidationError,
     assert_layout_matches,
@@ -175,8 +177,14 @@ class _FakeProc:
         self.stdin = _FakePipe()
         self.pid = 4321
         self.terminated = False
+        self.killed = False
 
     def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        # 看门狗按"先 kill 后 terminate"的顺序收尾，两者都要能兜住。
+        self.killed = True
         self.terminated = True
 
     def wait(self) -> int:
@@ -1107,6 +1115,118 @@ class IncrementalCopyTest(unittest.TestCase):
             logging.disable(logging.CRITICAL)
         self.assertIn("暂存卷已丢失", "\n".join(captured.output))
         self.assertNotIn("rename", self._commands(runner))
+
+
+class RbdCommandTimeoutTest(unittest.TestCase):
+    """rbd 控制命令必须带兜底超时：mon 不可达时客户端无限重连，线程会永久占着拷贝名额。"""
+
+    def setUp(self):
+        self.utils = CephUtils("s.conf", "sp", "t.conf", "tp")
+
+    def test_default_timeout_reports_etimedout_instead_of_hanging(self):
+        seen = {}
+
+        def runner(command, **kwargs):
+            seen.update(kwargs)
+            raise subprocess.TimeoutExpired(command, kwargs.get("timeout") or 0)
+
+        self.utils._runner = runner
+        with self.assertRaises(subprocess.CalledProcessError) as ctx:
+            self.utils._run(["rbd", "--conf", "t.conf", "info", "volumes/x"])
+
+        self.assertEqual(ctx.exception.returncode, RBD_TIMEOUT_RC)
+        self.assertIn("超过", ctx.exception.stderr)
+        self.assertGreater(seen["timeout"], 0)
+
+    def test_explicit_timeout_keeps_timeout_expired_semantics(self):
+        """GC 扫描靠 TimeoutExpired 降级成"下轮再试"，显式超时的语义不能变。"""
+
+        def runner(command, **kwargs):
+            raise subprocess.TimeoutExpired(command, 1)
+
+        self.utils._runner = runner
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.utils.list_target_images(timeout=1)
+
+    def test_zero_disables_the_default_limit(self):
+        seen = {}
+
+        def runner(command, **kwargs):
+            seen.update(kwargs)
+            return CompletedFake("[]")
+
+        self.utils._runner = runner
+        with mock.patch.dict(
+            os.environ, {"MIGRATION_RBD_CMD_TIMEOUT_SECONDS": "0"}
+        ):
+            self.assertEqual(self.utils.list_target_images(), [])
+
+        self.assertNotIn("timeout", seen)
+
+
+class CopyStallWatchdogTest(unittest.TestCase):
+    """拷贝停滞看门狗：没有它，不可达的 Ceph 会让名额再也放不出来。"""
+
+    def setUp(self):
+        self.utils = CephUtils("s.conf", "sp", "t.conf", "tp")
+        self.export_cmd = ["rbd", "--conf", "s.conf", "export", "sp/x", "-"]
+        self.import_cmd = ["rbd", "--conf", "t.conf", "import", "-", "tp/x"]
+
+    def _run(self, *, exporter, importer, pump, stall_timeout):
+        def fake_popen(command, **kwargs):
+            stderr_file = kwargs.get("stderr")
+            proc = importer if "import" in command else exporter
+            if stderr_file is not None and proc.stderr_text:
+                stderr_file.write(proc.stderr_text)
+                stderr_file.flush()
+            return proc
+
+        with mock.patch("ceph_utils.subprocess.Popen", side_effect=fake_popen), \
+                mock.patch("ceph_utils.pump_stream", side_effect=pump):
+            return self.utils._export_import(
+                self.export_cmd,
+                self.import_cmd,
+                stall_timeout=stall_timeout,
+            )
+
+    def test_stalled_pipeline_kills_both_ends_and_reports_stall(self):
+        exporter = _FakeProc(-9, stdout=_FakePipe(b""))
+        importer = _FakeProc(-9)
+
+        def pump(*_args, **_kwargs):
+            # 模拟"管道建立成功但一个字节都不来"：等到看门狗动手为止。
+            deadline = time.monotonic() + 10
+            while not exporter.terminated and time.monotonic() < deadline:
+                time.sleep(0.01)
+            return 0
+
+        with self.assertRaises(CopyStalledError) as ctx:
+            self._run(
+                exporter=exporter,
+                importer=importer,
+                pump=pump,
+                stall_timeout=0.2,
+            )
+
+        self.assertIn("拷贝停滞", str(ctx.exception))
+        self.assertTrue(exporter.killed)
+        self.assertTrue(importer.killed)
+        # 继承 CalledProcessError，上游按 rbd 失败处理并释放拷贝名额。
+        self.assertIsInstance(ctx.exception, subprocess.CalledProcessError)
+
+    def test_zero_stall_timeout_disables_watchdog(self):
+        exporter = _FakeProc(0, stdout=_FakePipe(b""))
+        importer = _FakeProc(0)
+
+        copied = self._run(
+            exporter=exporter,
+            importer=importer,
+            pump=lambda *_args, **_kwargs: 7,
+            stall_timeout=0,
+        )
+
+        self.assertEqual(copied, 7)
+        self.assertFalse(exporter.killed)
 
 
 if __name__ == "__main__":

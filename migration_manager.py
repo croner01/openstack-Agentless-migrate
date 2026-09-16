@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 
-from ceph_utils import COPY_GATE, StageImageMissingError
+from ceph_utils import COPY_GATE, CopyStalledError, StageImageMissingError
 from config import default_vm_pass
 from migration_planner import (
     match_flavor,
@@ -650,11 +650,22 @@ class MigrationManager:
                     )
                     self._persist()
 
-                self.copy_gate.acquire(can_proceed=self._can_proceed)
+                self.copy_gate.acquire(
+                    can_proceed=self._can_proceed,
+                    owner=f"{vm.name}/{volume.source_rbd_name}",
+                )
                 try:
                     ok = mover.finish(
                         volume, on_progress, rate_limit_bytes_per_sec
                     )
+                except CopyStalledError as exc:
+                    # 停滞是集群侧问题，重试同一个卷没有意义：先把卷标失败，再把
+                    # 原因抛给 migrate_vm，让 VM 错误文案带上真实根因（而不是只
+                    # 留一个"RBD 替换失败"），名额仍由下面的 finally 释放。
+                    volume.status = VolumeStatus.FAILED
+                    volume.error = str(exc)
+                    self._persist()
+                    raise
                 finally:
                     self.copy_gate.release()
                 if ok:
@@ -733,6 +744,12 @@ class MigrationManager:
         rate_limit_bytes_per_sec = (
             max(0.0, float(options.get("rate_limit_mb_s") or 0.0)) * 1024 * 1024
         )
+        vm.delta_rounds_max = int(options.get("delta_rounds") or 0)
+        vm.delta_threshold_bytes = int(
+            max(0.0, float(options.get("delta_threshold_mb") or 0.0)) * 1024 * 1024
+        )
+        vm.delta_cutover_mode = str(options.get("cutover_mode") or "auto")
+        vm.delta_interval_seconds = max(0.0, float(options.get("delta_interval_seconds") or 0.0))
         # 阶段一：先把"所有盘"各做一次基像全备。原来的实现是"卷 1 全备 + N 轮
         # 增量 → 卷 2 全备 + N 轮增量"，后面的盘要等前面的盘把所有轮次跑完才
         # 开始，既拖长整体窗口，又让后开始的盘在切换时背着巨大的增量。
@@ -762,7 +779,10 @@ class MigrationManager:
         """阶段一：所有卷的基像全备（受 volume_concurrency 与拷贝门控约束）。"""
 
         def seed(volume: VolumeTask) -> None:
-            self.copy_gate.acquire(can_proceed=self._can_proceed)
+            self.copy_gate.acquire(
+                can_proceed=self._can_proceed,
+                owner=f"{vm.name}/{volume.source_rbd_name}",
+            )
             try:
                 self._seed_volume(
                     vm, volume, rate_limit_bytes_per_sec=rate_limit_bytes_per_sec
@@ -851,7 +871,10 @@ class MigrationManager:
                 # 否则进度条会一边走一边挂着"已就绪"的徽标。
                 volume.status = VolumeStatus.COPYING
                 self._persist()
-                self.copy_gate.acquire(can_proceed=self._can_proceed)
+                self.copy_gate.acquire(
+                    can_proceed=self._can_proceed,
+                    owner=f"{vm.name}/{volume.source_rbd_name}",
+                )
                 try:
                     copied = self._sync_round_with_reseed(
                         vm,
@@ -865,7 +888,11 @@ class MigrationManager:
                 self._mark_volume_ready(volume)
 
             self._run_volume_workers(sync, list(vm.volumes), max_workers)
-            return max(copied_by_volume.values()) if copied_by_volume else 0
+            largest = max(copied_by_volume.values()) if copied_by_volume else 0
+            # 供作业详情展示「已同步 N 轮 / 最近一轮增量」；手动同步同样计数。
+            vm.delta_rounds_done += 1
+            vm.delta_last_bytes = largest
+            return largest
 
         if cutover_mode == "manual":
             self._await_manual_actions(vm, run_round)

@@ -1,3 +1,5 @@
+import threading
+import time
 import unittest
 
 from ceph_utils import (
@@ -78,6 +80,52 @@ class CopyGateTest(unittest.TestCase):
         self.assertTrue(gate.try_acquire())
         self.assertTrue(gate.try_acquire())
         self.assertFalse(gate.try_acquire())
+
+    def test_holders_track_owner_and_release(self):
+        gate = CopyGate(max_active_copies=2, memory_provider=self.memory)
+        self.assertTrue(gate.try_acquire("vm-a/volume-1"))
+
+        holders = gate.holders()
+        self.assertEqual(len(holders), 1)
+        self.assertEqual(holders[0][0], "vm-a/volume-1")
+        self.assertGreaterEqual(holders[0][1], 0.0)
+        self.assertIn("vm-a/volume-1", gate.holder_summary())
+
+        gate.release()
+        self.assertEqual(gate.holders(), [])
+        self.assertEqual(gate.holder_summary(), "无")
+
+    def test_waiting_log_names_who_holds_the_slot(self):
+        """排队日志必须能回答"名额被谁占着"，否则现场只能靠猜。"""
+        gate = CopyGate(
+            max_active_copies=1,
+            memory_provider=self.memory,
+            poll_interval_seconds=0.01,
+            log_interval_seconds=0.0,
+        )
+        gate.acquire(owner="vm-a/volume-1")
+        finished = threading.Event()
+
+        def waiter():
+            gate.acquire(owner="vm-b/volume-2")
+            gate.release()
+            finished.set()
+
+        worker = threading.Thread(target=waiter)
+        with self.assertLogs(level="INFO") as captured:
+            worker.start()
+            time.sleep(0.2)
+            gate.release()
+            worker.join(2.0)
+
+        self.assertTrue(finished.is_set())
+        self.assertTrue(
+            any(
+                "等待 RBD 拷贝名额" in line and "vm-a/volume-1" in line
+                for line in captured.output
+            ),
+            captured.output,
+        )
 
 
 if __name__ == "__main__":

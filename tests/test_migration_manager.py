@@ -8,7 +8,7 @@ from state_machine import (
     VmStatus,
     VmTask,
 )
-from ceph_utils import StageImageMissingError
+from ceph_utils import CopyGate, CopyStalledError, StageImageMissingError
 from migration_manager import (
     MAX_BASELINE_RESEEDS,
     FullVolumeMover,
@@ -45,6 +45,43 @@ class StopSignalTest(unittest.TestCase):
             manager._copy_volumes(vm, max_workers=1)
         self.assertEqual(vm.volumes[0].status, VolumeStatus.FAILED)
         self.assertIn("停机信号中断", vm.volumes[0].error)
+
+
+class CopyStallSlotReleaseTest(unittest.TestCase):
+    """拷贝停滞必须释放名额并把卷标失败，否则后续任务永远排在队里。"""
+
+    def test_stall_releases_gate_slot_and_marks_volume_failed(self):
+        gate = CopyGate(max_active_copies=1, memory_provider=lambda: (0, None))
+        ceph_utils = mock.Mock()
+
+        def stalled(*_args, **_kwargs):
+            raise CopyStalledError(
+                110,
+                ["rbd", "--conf", "s.conf", "export", "sp/x", "-"],
+                stderr="拷贝停滞超过 300.0s：期间没有任何字节流动",
+            )
+
+        ceph_utils.replace_rbd_data.side_effect = stalled
+        manager = MigrationManager(
+            None, None, ceph_utils=ceph_utils, copy_gate=gate
+        )
+        vm = VmTask(name="vm1", target_az="az1")
+        vm.volumes = [
+            VolumeTask(
+                source_volume_id="s1",
+                source_rbd_name="volume-s1",
+                target_volume_id="t1",
+                target_rbd_name="volume-t1",
+            )
+        ]
+
+        with self.assertRaises(CopyStalledError):
+            manager._copy_volumes(vm, max_workers=1)
+
+        self.assertEqual(gate.active_copies, 0)
+        self.assertEqual(gate.holders(), [])
+        self.assertEqual(vm.volumes[0].status, VolumeStatus.FAILED)
+        self.assertIn("拷贝停滞", vm.volumes[0].error)
 
 
 class CopyProgressTest(unittest.TestCase):
@@ -709,6 +746,80 @@ class PrecopyTest(unittest.TestCase):
         )
 
         self.assertIn("等待下一轮（60s）", labels)
+
+    def test_precopy_records_delta_parameters_for_detail_view(self):
+        """作业详情要能显示轮次上限/阈值/间隔/切换方式，必须在这里落库。"""
+        sessions = {"volume-s1": mock.Mock(layout={})}
+        ceph = self._ceph_with_sessions(sessions)
+        manager = MigrationManager(source_os=None, target_os=None, ceph_utils=ceph)
+        manager._job_id = "j1"
+        vm = self._vm_with_volumes(1)
+
+        manager._precopy_volumes(
+            vm,
+            {
+                "job_id": "j1",
+                "delta_rounds": 1,
+                "delta_threshold_mb": 256,
+                "delta_interval_seconds": 30,
+                "cutover_mode": "auto",
+            },
+        )
+
+        self.assertEqual(vm.delta_rounds_max, 1)
+        self.assertEqual(vm.delta_threshold_bytes, 256 * 1024 * 1024)
+        self.assertEqual(vm.delta_interval_seconds, 30.0)
+        self.assertEqual(vm.delta_cutover_mode, "auto")
+        self.assertEqual(vm.delta_rounds_done, 1)
+        self.assertEqual(vm.delta_last_bytes, 1024)
+
+    def test_converged_round_records_last_increment(self):
+        """本轮增量小于阈值 → 提前收敛，详情里要能看到这轮的增量字节数。"""
+        sessions = {"volume-s1": mock.Mock(layout={})}
+        ceph = self._ceph_with_sessions(sessions)
+        ceph.sync_volume_round.return_value = 1024
+        manager = MigrationManager(source_os=None, target_os=None, ceph_utils=ceph)
+        manager._job_id = "j1"
+        vm = self._vm_with_volumes(1)
+
+        manager._precopy_volumes(
+            vm, {"job_id": "j1", "delta_rounds": 5, "delta_threshold_mb": 512}
+        )
+
+        self.assertEqual(vm.delta_rounds_done, 1)
+        self.assertEqual(vm.delta_last_bytes, 1024)
+        self.assertEqual(vm.delta_rounds_max, 5)
+
+    def test_manual_sync_counts_rounds_for_detail_view(self):
+        """手动「同步一次」也要计入轮次，详情才不会一直显示"尚未开始"。"""
+        session = mock.Mock(layout={})
+        ceph = mock.Mock()
+        ceph.seed_volume.side_effect = lambda source, target, job, **kw: session
+        state = {"cutover": False}
+        vm = self._vm_with_volumes(1)
+
+        def sync(sess, **kwargs):
+            state["cutover"] = True
+            return 2048
+
+        ceph.sync_volume_round.side_effect = sync
+        manager = MigrationManager(
+            source_os=None,
+            target_os=None,
+            ceph_utils=ceph,
+            cutover_requested=lambda: state["cutover"],
+            sync_requested=lambda: True,
+        )
+        manager._job_id = "j1"
+        vm.sync_requested = True
+
+        manager._precopy_volumes(
+            vm, {"job_id": "j1", "delta_rounds": 9, "cutover_mode": "manual"}
+        )
+
+        self.assertEqual(vm.delta_rounds_done, 1)
+        self.assertEqual(vm.delta_last_bytes, 2048)
+        self.assertEqual(vm.delta_cutover_mode, "manual")
 
 
 class StageImageReseedTest(unittest.TestCase):

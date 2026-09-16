@@ -70,6 +70,34 @@ class VmTaskTest(unittest.TestCase):
         self.assertEqual(restored.throughput_mb_s, 11.8)
         self.assertEqual(restored.progress_label, "增量 2/3")
 
+    def test_delta_round_fields_survive_dict_round_trip(self):
+        vm = VmTask(name="vm1", target_az="az1", mode=MigrationMode.INCREMENTAL)
+        vm.delta_rounds_done = 2
+        vm.delta_rounds_max = 3
+        vm.delta_last_bytes = 4096
+        vm.delta_threshold_bytes = 512 * 1024 * 1024
+        vm.delta_interval_seconds = 60.0
+        vm.delta_cutover_mode = "auto"
+
+        restored = VmTask.from_dict(vm.to_dict())
+
+        self.assertEqual(restored.delta_rounds_done, 2)
+        self.assertEqual(restored.delta_rounds_max, 3)
+        self.assertEqual(restored.delta_last_bytes, 4096)
+        self.assertEqual(restored.delta_threshold_bytes, 512 * 1024 * 1024)
+        self.assertEqual(restored.delta_interval_seconds, 60.0)
+        self.assertEqual(restored.delta_cutover_mode, "auto")
+
+    def test_delta_fields_default_for_legacy_payload(self):
+        restored = VmTask.from_dict({"name": "vm1", "target_az": "az1"})
+
+        self.assertEqual(restored.delta_rounds_done, 0)
+        self.assertEqual(restored.delta_rounds_max, 0)
+        self.assertIsNone(restored.delta_last_bytes)
+        self.assertEqual(restored.delta_threshold_bytes, 0)
+        self.assertEqual(restored.delta_interval_seconds, 0.0)
+        self.assertEqual(restored.delta_cutover_mode, "")
+
 
 class MigrationJobTest(unittest.TestCase):
     def test_job_completed_when_all_vms_terminal(self):

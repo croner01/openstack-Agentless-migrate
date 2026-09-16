@@ -86,6 +86,77 @@ class EnvironmentProfileApiTest(unittest.TestCase):
         self.assertEqual(auth["password"], "s3cret")
         self.assertEqual(auth["project_name"], "admin")
 
+    def test_json_auth_payload_falls_back_to_profile_password(self):
+        """验证连接/加载目录这些 JSON 接口也要能沿用档案密码（表单不回显）。"""
+        profile = self._seed_profile()
+        auth_args, error = app_module._auth_args_from_request_payload(
+            {
+                "profile_id": profile["profile_id"],
+                "side": "source",
+                "auth_url": "",
+                "username": "",
+                "password": "",
+            }
+        )
+        self.assertIsNone(error)
+        self.assertEqual(auth_args["auth_url"], "http://src:5000/v3")
+        self.assertEqual(auth_args["password"], "s3cret")
+        self.assertEqual(auth_args["project_name"], "admin")
+
+    def test_json_auth_payload_form_value_overrides_profile(self):
+        profile = self._seed_profile()
+        auth_args, error = app_module._auth_args_from_request_payload(
+            {
+                "profile_id": profile["profile_id"],
+                "side": "target",
+                "username": "override",
+                "password": "",
+            }
+        )
+        self.assertIsNone(error)
+        self.assertEqual(auth_args["username"], "override")
+        self.assertEqual(auth_args["password"], "t3cret")
+        self.assertEqual(auth_args["project_id"], "pid-1")
+
+    def test_json_auth_payload_unknown_profile_rejected(self):
+        auth_args, error = app_module._auth_args_from_request_payload(
+            {"profile_id": "nope", "side": "source"}
+        )
+        self.assertEqual(auth_args, {})
+        self.assertEqual(error, "环境档案不存在：nope")
+
+    def test_json_auth_payload_without_profile_keeps_form_values(self):
+        auth_args, error = app_module._auth_args_from_request_payload(
+            {"auth_url": "http://x", "username": "u", "password": "p"}
+        )
+        self.assertIsNone(error)
+        self.assertEqual(auth_args["password"], "p")
+        self.assertEqual(auth_args["auth_url"], "http://x")
+
+    def test_projects_endpoint_uses_profile_password(self):
+        profile = self._seed_profile()
+        with mock.patch.object(
+            app_module.OpenStackUtils,
+            "list_accessible_projects",
+            return_value={"projects": [], "summary": {}},
+        ) as mocked_list, mock.patch.object(
+            app_module.OpenStackUtils,
+            "accessible_project_diagnostics",
+            return_value={},
+        ):
+            res = self.client.post(
+                "/api/projects",
+                json={
+                    "profile_id": profile["profile_id"],
+                    "side": "source",
+                    "auth_url": "",
+                    "username": "",
+                    "password": "",
+                },
+            )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(mocked_list.call_args[0][0]["password"], "s3cret")
+
     def test_form_value_overrides_profile(self):
         profile = self._seed_profile()
         store = app_module._environment_profile_store()

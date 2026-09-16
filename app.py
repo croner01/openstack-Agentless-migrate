@@ -2,6 +2,7 @@ import json
 import hmac
 import logging
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -12,9 +13,18 @@ import pandas as pd
 from flask import Flask, jsonify, render_template, request
 from werkzeug.exceptions import RequestEntityTooLarge
 
-from ceph_utils import CephUtils
+from ceph_utils import (
+    COPY_GATE,
+    MiB,
+    MON_PROBE_TIMEOUT_SECONDS,
+    CephUtils,
+    any_mon_reachable,
+    copy_stall_timeout_seconds,
+    parse_mon_endpoints,
+    rbd_cmd_timeout_seconds,
+)
 from config import LOG_FILE, UPLOAD_FOLDER, default_vm_pass
-from env_utils import env_float, env_int
+from env_utils import env_float, env_int, env_str
 from environment_profiles import EnvironmentProfile, EnvironmentProfileStore
 from excel_parser import parse_mode, parse_rows, parse_selected_rows
 from graceful_shutdown import ShutdownCoordinator
@@ -543,20 +553,51 @@ def prepare_relay_pool(
     )
 
 
-def _auth_args_from_payload(payload: dict[str, Any]) -> dict[str, str]:
+def _auth_args_from_payload(
+    payload: dict[str, Any], fallback: dict[str, str] | None = None
+) -> dict[str, str]:
+    """JSON 载荷 → auth 参数；显式留空视为"沿用档案"（与 _auth_args 同语义）。"""
+    fallback = fallback or {}
+
+    def pick(key: str) -> str:
+        value = payload.get(key)
+        if value is None or value == "":
+            return fallback.get(key, "")
+        return value
+
     base = {
-        "auth_url": payload.get("auth_url"),
-        "username": payload.get("username"),
-        "password": payload.get("password"),
-        "user_domain_name": payload.get("user_domain_name"),
+        "auth_url": pick("auth_url"),
+        "username": pick("username"),
+        "password": pick("password"),
+        "user_domain_name": pick("user_domain_name"),
     }
-    project_id = payload.get("project_id")
+    project_id = pick("project_id")
     if project_id:
         base["project_id"] = project_id
     else:
-        base["project_name"] = payload.get("project_name")
-        base["project_domain_name"] = payload.get("project_domain_name")
+        base["project_name"] = pick("project_name")
+        base["project_domain_name"] = pick("project_domain_name")
     return {key: value for key, value in base.items() if value}
+
+
+def _auth_args_from_request_payload(
+    payload: dict[str, Any],
+) -> tuple[dict[str, str], str | None]:
+    """带环境档案兜底的 JSON 鉴权解析。
+
+    档案里的密码不回显到表单，所以前端只回传 profile_id + side，这里补 password。
+    返回 (auth_args, error_message)；错误由调用方转成 400 响应。
+    """
+    profile_id = str(payload.get("profile_id") or "").strip()
+    side = str(payload.get("side") or "").strip().lower()
+    fallback: dict[str, str] = {}
+    if profile_id:
+        profile = _environment_profile_store().get(profile_id)
+        if profile is None:
+            return {}, f"环境档案不存在：{profile_id}"
+        if side in ("source", "target"):
+            fallback = _profile_auth(profile, side)
+    return _auth_args_from_payload(payload, fallback), None
 
 
 def _positive_int(value: Any, default: int = 1, maximum: int = 20) -> int:
@@ -666,6 +707,51 @@ def _json_form_field(raw: str | None, expected: type, label: str):
     if not isinstance(value, expected):
         raise ValueError(f"{label} 必须是{'数组' if expected is list else '对象'}")
     return value
+
+
+#: mon 端口探测的总预算：mon 列表再长也不能把提交请求拖成十几秒。
+CEPH_PREFLIGHT_BUDGET_SECONDS = 6.0
+
+
+def ceph_preflight_enabled() -> bool:
+    """提交前的 mon 可达性探测开关，``MIGRATION_CEPH_PREFLIGHT=off`` 可关闭。"""
+    return (env_str("MIGRATION_CEPH_PREFLIGHT", "on") or "on").lower() not in (
+        "off",
+        "0",
+        "false",
+        "no",
+    )
+
+
+def _ceph_conf_reachability_error(*conf_paths: str) -> str:
+    """提交前探一次 mon 端口；可达或解析不出 mon 时返回空串。
+
+    线上事故：目标 conf 的 mon_host 填成了一个没有 ceph 服务的地址，`rbd info`
+    既不报错也不返回（客户端无限重连），线程永久占着拷贝名额，之后所有迁移
+    任务都在排队。这里先把"根本连不上"的 conf 拦下来，比事后清场便宜得多。
+    解析不出 mon（自定义写法、DNS-SD）时一律放行，不能因为"看不懂配置"就把
+    正常提交挡回去。
+    """
+    if not ceph_preflight_enabled():
+        return ""
+    for label, path in zip(("源", "目标"), conf_paths):
+        if not path:
+            continue
+        endpoints = parse_mon_endpoints(path)
+        if not endpoints:
+            continue
+        if not any_mon_reachable(
+            endpoints,
+            timeout=MON_PROBE_TIMEOUT_SECONDS,
+            budget_seconds=CEPH_PREFLIGHT_BUDGET_SECONDS,
+        ):
+            return (
+                f"{label} Ceph 不可达：mon "
+                + "、".join(f"{host}:{port}" for host, port in endpoints)
+                + " 均无法建立连接，请检查 conf 里的 mon_host 是否写错、"
+                "集群是否在线（确认无误可用 MIGRATION_CEPH_PREFLIGHT=off 跳过校验）"
+            )
+    return ""
 
 
 def _create_job_and_files(
@@ -864,6 +950,16 @@ def api_migrate():
             profile=profile,
             store=profile_store,
         )
+        reachability_error = _ceph_conf_reachability_error(
+            source_conf_path, target_conf_path
+        )
+        if reachability_error:
+            # 校验没过就不该留下空作业目录：失败的请求不该占空间。
+            shutil.rmtree(_job_dir, ignore_errors=True)
+            logging.warning(
+                "[MIGRATION] 提交被 Ceph 可达性校验拦下: %s", reachability_error
+            )
+            return jsonify({"ok": False, "error": reachability_error}), 400
         source_auth = _auth_args("source", _profile_auth(profile, "source"))
         target_auth = _auth_args("target", _profile_auth(profile, "target"))
 
@@ -1162,7 +1258,9 @@ def api_projects():
     """List projects the given account can access (name -> UUID resolver)."""
     try:
         payload = request.get_json(force=True)
-        auth_args = _auth_args_from_payload(payload)
+        auth_args, profile_error = _auth_args_from_request_payload(payload)
+        if profile_error:
+            return jsonify({"ok": False, "error": profile_error}), 400
         result = OpenStackUtils.list_accessible_projects(auth_args)
         scope = OpenStackUtils.accessible_project_diagnostics(auth_args)
         logging.info(
@@ -1190,7 +1288,9 @@ def api_diag():
     """Diagnose auth scope / quota before starting a migration."""
     try:
         payload = request.get_json(force=True)
-        auth_args = _auth_args_from_payload(payload)
+        auth_args, profile_error = _auth_args_from_request_payload(payload)
+        if profile_error:
+            return jsonify({"ok": False, "error": profile_error}), 400
         target_os = OpenStackUtils(auth_args)
         info = target_os.diagnostic_info()
 
@@ -1249,7 +1349,9 @@ def api_catalog():
     """Return target images/flavors/networks for UI selection."""
     try:
         payload = request.get_json(force=True)
-        auth_args = _auth_args_from_payload(payload)
+        auth_args, profile_error = _auth_args_from_request_payload(payload)
+        if profile_error:
+            return jsonify({"ok": False, "error": profile_error}), 400
         target_os = OpenStackUtils(auth_args)
         images = [
             {"id": image.id, "name": image.name}
@@ -1310,7 +1412,9 @@ def api_source_vms():
     """List source-project VMs for the checklist picker."""
     try:
         payload = request.get_json(force=True)
-        auth_args = _auth_args_from_payload(payload)
+        auth_args, profile_error = _auth_args_from_request_payload(payload)
+        if profile_error:
+            return jsonify({"ok": False, "error": profile_error}), 400
         source_os = OpenStackUtils(auth_args)
         search = str(payload.get("search") or "").strip()
         try:
@@ -1359,7 +1463,9 @@ def api_source_vm_networks():
     """Return source fixed IP / subnet info per VM for the checklist preview."""
     try:
         payload = request.get_json(force=True)
-        auth_args = _auth_args_from_payload(payload)
+        auth_args, profile_error = _auth_args_from_request_payload(payload)
+        if profile_error:
+            return jsonify({"ok": False, "error": profile_error}), 400
         vm_names = payload.get("vm_names") or []
         server_ids = payload.get("server_ids") or []
         if not isinstance(vm_names, list) or not vm_names:
@@ -1422,6 +1528,39 @@ def healthz():
             }
         ),
         200,
+    )
+
+
+@app.get("/api/runtime")
+def api_runtime():
+    """只读运行参数：设置页据此核对并发/超时等生效值，省掉上机器查环境变量。
+
+    只回传调优数值与当前名额占用，不含任何凭据。
+    """
+    return jsonify(
+        {
+            "ok": True,
+            "runtime": {
+                "diag_version": DIAG_VERSION,
+                "stopping": shutdown_coordinator.stopping,
+                "api_token_enabled": bool(API_TOKEN),
+                "rbd_copy_concurrency": COPY_GATE.max_active_copies,
+                "rbd_copy_active": COPY_GATE.active_copies,
+                "copy_holders": [
+                    {"owner": owner, "seconds": round(seconds)}
+                    for owner, seconds in COPY_GATE.holders()
+                ],
+                "memory_high_water": COPY_GATE.high_water,
+                "copy_reserve_mb": int(COPY_GATE.reserve_bytes / MiB),
+                "rbd_cmd_timeout_seconds": rbd_cmd_timeout_seconds(),
+                "copy_stall_timeout_seconds": copy_stall_timeout_seconds(),
+                "max_upload_mb": env_int("MIGRATION_MAX_UPLOAD_MB", 20, minimum=1),
+                "upload_retention_days": env_int(
+                    "MIGRATION_UPLOAD_RETENTION_DAYS", 7, minimum=1
+                ),
+                "ceph_preflight": ceph_preflight_enabled(),
+            },
+        }
     )
 
 

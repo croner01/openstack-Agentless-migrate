@@ -123,15 +123,130 @@ def parse_mon_endpoints(source: str) -> list[tuple[str, int]]:
 def any_mon_reachable(
     endpoints: list[tuple[str, int]],
     timeout: float = MON_PROBE_TIMEOUT_SECONDS,
+    budget_seconds: float | None = None,
 ) -> bool:
-    """任一 mon 能建立 TCP 连接即认为集群可达。"""
+    """任一 mon 能建立 TCP 连接即认为集群可达。
+
+    `budget_seconds` 限制整轮探测的总耗时：mon 列表很长时逐个等到超时会把
+    提交请求拖成十几秒，超预算即按"不可达"处理。
+    """
+    deadline = (
+        None
+        if not budget_seconds or budget_seconds <= 0
+        else time.monotonic() + budget_seconds
+    )
     for host, port in endpoints:
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
         try:
             with socket.create_connection((host, port), timeout=timeout):
                 return True
         except OSError:
             continue
     return False
+
+
+#: 单条 rbd 控制命令（info/ls/snap/rm）的默认超时。mon 不可达时 ceph 客户端
+#: 不报错而是无限重连（线上实测 20 分钟以上仍无输出），线程会一直握着拷贝
+#: 名额，后面的任务全部排队。0 = 不限制。
+RBD_CMD_TIMEOUT_SECONDS = 120.0
+
+#: 拷贝管道允许的"零字节"时长：超过即认为这条管道已经卡死。
+COPY_STALL_TIMEOUT_SECONDS = 300.0
+
+#: 超时统一按 Ceph 的 ETIMEDOUT(110) 上报，和 rbd 自己的超时退出码对齐。
+RBD_TIMEOUT_RC = 110
+
+
+def rbd_cmd_timeout_seconds() -> float:
+    """rbd 控制命令的默认超时，可用 MIGRATION_RBD_CMD_TIMEOUT_SECONDS 调整。"""
+    return env_float(
+        "MIGRATION_RBD_CMD_TIMEOUT_SECONDS",
+        RBD_CMD_TIMEOUT_SECONDS,
+        minimum=0.0,
+    )
+
+
+def copy_stall_timeout_seconds() -> float:
+    """拷贝停滞判定时长，MIGRATION_COPY_STALL_SECONDS 调整，0 = 关闭看门狗。"""
+    return env_float(
+        "MIGRATION_COPY_STALL_SECONDS",
+        COPY_STALL_TIMEOUT_SECONDS,
+        minimum=0.0,
+    )
+
+
+def describe_timeout(command, seconds: float) -> str:
+    """超时命令的可读描述，塞进 CalledProcessError.stderr 一起落日志。"""
+    return (
+        f"rbd 命令超过 {seconds:.0f}s 未返回（mon/OSD 不可达或集群不可用）: "
+        + " ".join(shlex.quote(str(part)) for part in command)
+    )
+
+
+def _terminate_process(proc, *, force: bool = False) -> None:
+    """尽力结束子进程；kill/terminate 缺失或报错都静默跳过。"""
+    for name in (("kill", "terminate") if force else ("terminate", "kill")):
+        action = getattr(proc, name, None)
+        if action is None:
+            continue
+        try:
+            action()
+        except OSError:
+            pass
+        return
+
+
+class _CopyWatchdog:
+    """拷贝管道停滞看门狗：超过 limit 秒没有字节流动就杀掉两端子进程。
+
+    没有它时，mon/OSD 不可达会让 `rbd export` 一直阻塞（客户端无限重连），
+    线程握着拷贝名额不放，整个服务的迁移任务全部排队——线上就是这么被卡住的。
+    """
+
+    def __init__(self, limit: float, processes, probe_interval: float = 1.0):
+        self.limit = limit
+        self._processes = tuple(processes)
+        self._probe_interval = max(0.05, min(probe_interval, limit / 4 or 1.0))
+        self._last_progress = time.monotonic()
+        self._stalled = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def stalled(self) -> bool:
+        return self._stalled.is_set()
+
+    def touch(self) -> None:
+        """收到一个数据块就刷新存活时间。"""
+        self._last_progress = time.monotonic()
+
+    def start(self) -> "_CopyWatchdog":
+        if self.limit and self.limit > 0:
+            self._thread = threading.Thread(
+                target=self._run, name="copy-stall-watchdog", daemon=True
+            )
+            self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._probe_interval):
+            if time.monotonic() - self._last_progress < self.limit:
+                continue
+            self._stalled.set()
+            logging.error(
+                "[MIGRATION] 拷贝停滞：%.1fs 内没有任何字节流动，终止 rbd "
+                "export/import（通常是源/目标 Ceph 的 mon/OSD 不可达）",
+                self.limit,
+            )
+            for proc in self._processes:
+                _terminate_process(proc, force=True)
+            return
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
 
 
 class LayoutMismatchError(ValueError):
@@ -149,6 +264,20 @@ class StageImageMissingError(ValueError):
     说明它被外部清理（后台 GC 误回收、人工 `rbd rm`），此时唯一正确的补救是
     对该卷重做一次基线全备。继承 ValueError 是为了兼容调用方原有的捕获逻辑。
     """
+
+
+class CopyStalledError(subprocess.CalledProcessError):
+    """拷贝管道长时间没有任何字节流动（mon/OSD 不可达或对端卡死）。
+
+    刻意继承 `CalledProcessError`：上游到处按 rbd 退出码判定失败原因
+    （ENOENT=2 / EBUSY=16 / ETIMEDOUT=110），复用它才能让停滞走同一条失败
+    路径——卷被标失败、拷贝名额在 `finally` 里释放，而不是线程永久挂住。
+    """
+
+    def __str__(self) -> str:
+        # 上游用 str(exc) 直接落前端错误文案，默认的 "returned non-zero exit
+        # status 110" 看不出根因，这里换成带 mon/OSD 提示的说明。
+        return self.stderr or super().__str__()
 
 
 def _normalize_features(raw: Any) -> list[str]:
@@ -368,6 +497,10 @@ class CephUtils:
         `timeout` 只给"读扫描"这类随时可以重来的调用使用：超时抛
         `subprocess.TimeoutExpired`，由调用方降级成"下轮再试"，避免一次
         GC 扫描把整轮清扫拖成几十分钟的陈旧视图。
+
+        调用方没给超时时套用 `MIGRATION_RBD_CMD_TIMEOUT_SECONDS`：没有兜底
+        超时，一个不可达的 mon 就能让 `rbd info` 无限重连并永久占住拷贝名额，
+        超时按 rbd 自己的 ETIMEDOUT(rc=110) 上报，走既有失败路径。
         """
         kwargs = {
             "check": True,
@@ -377,9 +510,21 @@ class CephUtils:
         }
         if shell:
             kwargs["shell"] = True
-        if timeout is not None:
-            kwargs["timeout"] = timeout
-        result = self._runner(command, **kwargs)
+        default_timeout = timeout is None
+        limit = rbd_cmd_timeout_seconds() if default_timeout else timeout
+        if limit and limit > 0:
+            kwargs["timeout"] = limit
+        try:
+            result = self._runner(command, **kwargs)
+        except subprocess.TimeoutExpired as exc:
+            if not default_timeout:
+                raise
+            raise subprocess.CalledProcessError(
+                RBD_TIMEOUT_RC,
+                command,
+                output="",
+                stderr=describe_timeout(command, limit),
+            ) from exc
         if capture:
             return result.stdout
         return result
@@ -395,6 +540,7 @@ class CephUtils:
         total_bytes: Optional[int] = None,
         progress_cb: Optional[ProgressCallback] = None,
         rate_limit_bytes_per_sec: Optional[float] = None,
+        stall_timeout: float | None = None,
     ) -> None:
         """Stream rbd export -> rbd import without a shell pipeline.
 
@@ -403,7 +549,15 @@ class CephUtils:
         commands' stderr for diagnosis. Bytes are forwarded through a small
         in-memory pump so we can report progress and enforce a rate limit
         without writing a temporary export file.
+
+        `stall_timeout` 秒内没有任何字节流动就杀掉两端并抛 `CopyStalledError`：
+        没有这道闸，Ceph 不可达时管道会永久阻塞，拷贝名额再也放不出来。
         """
+        limit = (
+            copy_stall_timeout_seconds()
+            if stall_timeout is None
+            else stall_timeout
+        )
         with tempfile.TemporaryDirectory(
             prefix="mig-rbd-"
         ) as tmp_dir:
@@ -424,6 +578,7 @@ class CephUtils:
                     stderr=export_err_file,
                 )
                 last_memory_log = [0.0]
+                watchdog = _CopyWatchdog(limit, (exporter, importer)).start()
 
                 def wrapped_progress(
                     copied: int,
@@ -431,6 +586,7 @@ class CephUtils:
                     bytes_per_sec: float,
                 ) -> None:
                     now = time.time()
+                    watchdog.touch()
                     if now - last_memory_log[0] >= 10:
                         last_memory_log[0] = now
                         logging.info(
@@ -464,19 +620,14 @@ class CephUtils:
                         "[MIGRATION] rbd import 提前退出，终止 rbd export"
                         "（export 的 rc=-15 由本进程终止造成，根因见 import stderr）"
                     )
-                    try:
-                        exporter.terminate()
-                    except OSError:
-                        pass
+                    _terminate_process(exporter)
                 except Exception:
                     # 回调/转发异常：尽快终止两端，避免残留孤儿进程。
                     for proc in (exporter, importer):
-                        try:
-                            proc.terminate()
-                        except OSError:
-                            pass
+                        _terminate_process(proc)
                     raise
                 finally:
+                    watchdog.close()
                     try:
                         if exporter.stdout:
                             exporter.stdout.close()
@@ -503,6 +654,19 @@ class CephUtils:
                     importer_exited_early,
                     export_err.strip(),
                     import_err.strip(),
+                )
+            if watchdog.stalled:
+                # 停滞是根因，退出码只是我们 kill 出来的 -9/-15，先报它。
+                raise CopyStalledError(
+                    RBD_TIMEOUT_RC,
+                    export_cmd,
+                    output="",
+                    stderr=(
+                        f"拷贝停滞超过 {limit:.1f}s：期间 export->import 没有任何"
+                        f"字节流动，已终止两端（通常是源/目标 Ceph 的 mon/OSD "
+                        f"不可达）。export_stderr={export_err.strip()[:200] or '<空>'} "
+                        f"import_stderr={import_err.strip()[:200] or '<空>'}"
+                    ),
                 )
             # import 先退出时 export 的 rc 必然来自上面的 terminate()，先报 import
             # 才拿得到真实原因；反之 export 先失败会让 import 读到截断的流，
@@ -981,6 +1145,18 @@ class CephUtils:
             return True
         except ValidationError:
             raise
+        except CopyStalledError:
+            # 停滞不是"这个卷坏了"而是集群不可达：清理暂存镜像后把真实原因抛上去，
+            # 否则前端只会看到"RBD 替换失败"，看不出根因。
+            try:
+                self._discard_stage_image(stage_name)
+            except Exception:  # noqa: BLE001 - 清理失败不能掩盖停滞根因
+                logging.warning(
+                    "[MIGRATION] 停滞清理暂存镜像失败 %s/%s",
+                    self.target_pool,
+                    stage_name,
+                )
+            raise
         except (subprocess.CalledProcessError, OSError) as exc:
             stderr_tail = getattr(exc, "stderr", "") or ""
             if isinstance(stderr_tail, bytes):
@@ -1378,6 +1554,8 @@ class CopyGate:
         self._log_interval_seconds = log_interval_seconds
         self._lock = threading.Lock()
         self._active_copies = 0
+        # 线程 ident -> (描述, 拿到的时刻)，用来回答"名额到底被谁占着"。
+        self._holders: dict[int, tuple[str, float]] = {}
         logging.info(
             "[MIGRATION] 拷贝内存门控: max_active=%s high_water=%.0f%% "
             "reserve=%sMiB",
@@ -1391,7 +1569,24 @@ class CopyGate:
         with self._lock:
             return self._active_copies
 
-    def try_acquire(self) -> bool:
+    def holders(self) -> list[tuple[str, float]]:
+        """当前占用名额的 (描述, 已持有秒数)，按持有时长倒序。"""
+        with self._lock:
+            now = time.monotonic()
+            entries = [
+                (owner or "未知", now - since)
+                for owner, since in self._holders.values()
+            ]
+        return sorted(entries, key=lambda item: item[1], reverse=True)
+
+    def holder_summary(self) -> str:
+        """一行描述占用者，直接拼进排队日志。"""
+        entries = self.holders()
+        if not entries:
+            return "无"
+        return "、".join(f"{owner}({seconds:.0f}s)" for owner, seconds in entries)
+
+    def try_acquire(self, owner: str = "") -> bool:
         """Try to claim one copy slot without waiting."""
         with self._lock:
             if self._active_copies >= self.max_active_copies:
@@ -1402,16 +1597,19 @@ class CopyGate:
                 if current + self.reserve_bytes > usable:
                     return False
             self._active_copies += 1
+            if owner:
+                self._holders[threading.get_ident()] = (owner, time.monotonic())
             return True
 
     def acquire(
         self,
         can_proceed: Optional[Callable[[], bool]] = None,
+        owner: str = "",
     ) -> None:
         """Wait until a slot is available; raises on a stop signal."""
         started = time.monotonic()
         next_log = 0.0
-        while not self.try_acquire():
+        while not self.try_acquire(owner):
             if can_proceed and not can_proceed():
                 raise RuntimeError("迁移被停机信号中断，未获得拷贝并发名额")
             time.sleep(self._poll_interval_seconds)
@@ -1422,16 +1620,19 @@ class CopyGate:
                 limit_text = f"{limit / MiB:.0f}MiB" if limit else "未限制"
                 logging.info(
                     "[MIGRATION] 等待 RBD 拷贝名额/内存余量: "
-                    "active=%s current=%sMiB limit=%s 已等待 %.0fs",
+                    "active=%s/%s current=%sMiB limit=%s 已等待 %.0fs 占用中: %s",
                     self._active_copies,
+                    self.max_active_copies,
                     int(current / MiB),
                     limit_text,
                     now - started,
+                    self.holder_summary(),
                 )
 
     def release(self) -> None:
         with self._lock:
             self._active_copies = max(0, self._active_copies - 1)
+            self._holders.pop(threading.get_ident(), None)
 
 
 # 所有 MigrationManager 实例默认共享同一个门控实例。
