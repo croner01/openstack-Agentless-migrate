@@ -56,6 +56,8 @@
 迁移清单为每台 VM 独立选择目标 AZ、镜像、Flavor，以及每个源网卡对应的
 目标网络/子网与目标 IP（留空自动分配/复用源 IP）；不再提供全局网络映射。
 目标 AZ/镜像/Flavor 均来自目标环境真实数据（AZ 为下拉选择）。
+Cinder 与 Nova 的可用区是两套命名空间：页面选的 AZ 只用于 Nova 建机，
+所有云硬盘（数据盘、派生卷、中转机启动卷）统一落在 Cinder 的 `default-az`。
 RBD 卷拷贝支持按单卷限速（MiB/s，0 不限），页面与日志实时显示进度百分比
 和吞吐。
 
@@ -211,6 +213,8 @@ python repro_create.py --auth-url <目标keystone> --username admin \
   --image <目标镜像ID> --flavor <目标flavor ID> \
   --network <网络ID> --subnet <子网ID> --az <AZ> --volume-type <卷类型，与页面一致>
 ```
+
+其中 `--az` 只作用于 BFV 建机（Nova），数据卷固定建在 Cinder 的 `default-az`。
 
 服务代码打包在镜像里（Deployment `openstack-vm-migration-deployment` 只挂
 `/app/uploads`），更新后需要重新构建镜像、推送并滚动重启。镜像同时支持

@@ -36,6 +36,14 @@ def volume_ready_timeout_default() -> int:
     return env_int("MIGRATION_VOLUME_READY_TIMEOUT", 1800, minimum=1)
 
 
+#: Cinder 卷可用区（与 Nova 的 AZ 是两套独立命名空间）。
+#:
+#: 页面上的「目标 AZ」/中转机 AZ 来自 Nova（``compute.availability_zones()``），
+#: 直接透传给 Cinder 建卷会报 ``Availability zone 'xxx' is invalid``。这套环境
+#: Cinder 侧固定为 ``default-az``，所有建卷统一走这里，不再接受调用方的 Nova AZ。
+CINDER_VOLUME_AZ = "default-az"
+
+
 #: Cinder 因卷仍被实例占用而拒绝删除时的报错特征。
 _ATTACHMENT_BUSY_MARKERS = (
     "must not be attached",
@@ -644,19 +652,20 @@ class OpenStackUtils:
         name: str,
         size: int,
         volume_type: str | None = None,
-        availability_zone: str | None = None,
     ):
-        kwargs = {"name": name, "size": size}
+        kwargs = {
+            "name": name,
+            "size": size,
+            "availability_zone": CINDER_VOLUME_AZ,
+        }
         if volume_type:
             kwargs["volume_type"] = volume_type
-        if availability_zone:
-            kwargs["availability_zone"] = availability_zone
         logging.info(
             "[MIGRATION] 创建空白卷 name=%s size=%s type=%s az=%s (conn scope=%s)",
             name,
             size,
             volume_type,
-            availability_zone,
+            CINDER_VOLUME_AZ,
             self._scope_hint(),
         )
         try:
@@ -689,7 +698,6 @@ class OpenStackUtils:
         image_id: str,
         size: int,
         volume_type: str,
-        availability_zone: str | None = None,
     ):
         """用镜像生成一块可启动云硬盘（中转机系统盘）。"""
         kwargs: dict[str, Any] = {
@@ -697,16 +705,15 @@ class OpenStackUtils:
             "size": int(size),
             "image_id": image_id,
             "volume_type": volume_type,
+            "availability_zone": CINDER_VOLUME_AZ,
         }
-        if availability_zone:
-            kwargs["availability_zone"] = availability_zone
         logging.info(
             "[MIGRATION] 创建中转机启动卷 name=%s size=%s type=%s image=%s az=%s",
             name,
             size,
             volume_type,
             image_id,
-            availability_zone,
+            CINDER_VOLUME_AZ,
         )
         volume = self.conn.block_storage.create_volume(**kwargs)
         logging.info(
@@ -899,7 +906,6 @@ class OpenStackUtils:
                 image_id=image_id,
                 size=size,
                 volume_type=volume_type,
-                availability_zone=availability_zone,
             )
             volume_id = str(getattr(volume, "id", "") or "")
             self.wait_volume_status(
@@ -1033,17 +1039,15 @@ class OpenStackUtils:
         snapshot_id: str,
         size: int,
         volume_type: str | None = None,
-        availability_zone: str | None = None,
     ):
         kwargs: dict[str, Any] = {
             "name": name,
             "snapshot_id": snapshot_id,
             "size": size,
+            "availability_zone": CINDER_VOLUME_AZ,
         }
         if volume_type:
             kwargs["volume_type"] = volume_type
-        if availability_zone:
-            kwargs["availability_zone"] = availability_zone
         return self.conn.block_storage.create_volume(**kwargs)
 
     def attach_volume(self, server_id: str, volume_id: str) -> str:

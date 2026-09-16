@@ -64,7 +64,6 @@ def main() -> None:
         name=f"{args.name}-data",
         size=args.size,
         volume_type=args.volume_type,
-        availability_zone=args.az,
     )
     print(f"数据卷创建成功 volume_id={data_volume.id}")
     os_utils.wait_volume_status(data_volume.id)

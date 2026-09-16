@@ -56,7 +56,6 @@ class VolumeLifecycle:
         volume_id: str,
         vm_name: str,
         index: int,
-        az: str,
         size: int = 0,
         volume_type: str | None = None,
     ) -> SourceCopy:
@@ -71,7 +70,6 @@ class VolumeLifecycle:
                 snapshot_id=snapshot.id,
                 size=size,
                 volume_type=resolved_type,
-                availability_zone=az,
             )
         except Exception as exc:  # noqa: BLE001 - 配额类错误给出可操作提示
             _raise_quota_hint(
@@ -91,7 +89,6 @@ class VolumeLifecycle:
         *,
         name: str,
         size: int,
-        az: str,
         volume_type: str | None = None,
     ) -> str:
         """在目标云建空白卷，内容由中转机全量拷贝写入。"""
@@ -100,7 +97,6 @@ class VolumeLifecycle:
                 name=name,
                 size=size,
                 volume_type=volume_type,
-                availability_zone=az,
             )
         except Exception as exc:  # noqa: BLE001 - 配额类错误给出可操作提示
             _raise_quota_hint(exc, side="目标", size=size, volume_type=volume_type or "")

@@ -136,8 +136,6 @@ class RelayVolumeMover:
         volume: Any,
         vm_name: str,
         index: int,
-        source_az: str,
-        target_az: str,
         source_volume_type: str | None = None,
         target_volume_type: str | None = None,
     ) -> dict[str, Any]:
@@ -156,7 +154,6 @@ class RelayVolumeMover:
                 volume_id=volume.source_volume_id,
                 vm_name=vm_name,
                 index=index,
-                az=source_az,
                 size=int(volume.size or 0),
                 volume_type=source_volume_type or self.source_volume_type or None,
             )
@@ -169,7 +166,6 @@ class RelayVolumeMover:
             target_volume_id = self.lifecycle.create_target_volume(
                 name=f"{vm_name}-vol-{index}",
                 size=int(volume.size or 0),
-                az=target_az,
                 volume_type=target_volume_type or self.target_volume_type or None,
             )
             self._save(

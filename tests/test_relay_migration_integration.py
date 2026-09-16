@@ -142,8 +142,6 @@ class RelayMigrationIntegrationTest(unittest.TestCase):
                 ),
                 vm_name="vm-1",
                 index=0,
-                source_az="az1",
-                target_az="az2",
             )
         finally:
             stop.set()

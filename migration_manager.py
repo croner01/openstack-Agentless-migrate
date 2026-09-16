@@ -177,7 +177,6 @@ class MigrationManager:
                 name=f"{vm.name}-{source_data.get('name') or source_data['volume_id']}-mig",
                 size=source_data["size"],
                 volume_type=options.get("target_volume_type"),
-                availability_zone=vm.target_az,
             )
             self.target_os.wait_volume_status(target_volume.id)
             target_data_volume_ids.append(target_volume.id)
@@ -345,8 +344,6 @@ class MigrationManager:
                 ),
                 vm_name=vm.name,
                 index=index,
-                source_az=str(options.get("source_az") or vm.target_az),
-                target_az=vm.target_az,
                 source_volume_type=str(override.get("source") or "").strip() or None,
                 target_volume_type=str(override.get("target") or "").strip() or None,
             )

@@ -20,7 +20,6 @@ class VolumeLifecycleTest(unittest.TestCase):
             volume_id="vol-s1",
             vm_name="vm-1",
             index=0,
-            az="az1",
             size=40,
         )
 
@@ -32,11 +31,12 @@ class VolumeLifecycleTest(unittest.TestCase):
         clone_kwargs = self.source_os.create_volume_from_snapshot.call_args.kwargs
         self.assertEqual(clone_kwargs["snapshot_id"], "snap-1")
         self.assertEqual(clone_kwargs["size"], 40)
-        self.assertEqual(clone_kwargs["availability_zone"], "az1")
+        # Cinder 的 AZ 由 OpenStackUtils 统一固定，lifecycle 不再透传 Nova AZ。
+        self.assertNotIn("availability_zone", clone_kwargs)
 
     def test_create_source_copy_waits_for_both_resources(self):
         self.lifecycle.create_source_copy(
-            volume_id="vol-s1", vm_name="vm-1", index=0, az="az1", size=40
+            volume_id="vol-s1", vm_name="vm-1", index=0, size=40
         )
 
         self.source_os.wait_snapshot_status.assert_called_once_with("snap-1")
@@ -117,7 +117,7 @@ class VolumeLifecycleTest(unittest.TestCase):
 
     def test_cleanup_source_copy_detaches_then_deletes(self):
         copy = self.lifecycle.create_source_copy(
-            volume_id="vol-s1", vm_name="vm-1", index=0, az="az1", size=40
+            volume_id="vol-s1", vm_name="vm-1", index=0, size=40
         )
         self.source_os.find_volume_attachment.return_value = "att-1"
 
@@ -129,7 +129,7 @@ class VolumeLifecycleTest(unittest.TestCase):
 
     def test_cleanup_is_best_effort(self):
         copy = self.lifecycle.create_source_copy(
-            volume_id="vol-s1", vm_name="vm-1", index=0, az="az1", size=40
+            volume_id="vol-s1", vm_name="vm-1", index=0, size=40
         )
         self.source_os.delete_volume.side_effect = RuntimeError("boom")
 
@@ -143,7 +143,6 @@ class VolumeLifecycleTest(unittest.TestCase):
         volume_id = self.lifecycle.create_target_volume(
             name="vm-1-vol-0",
             size=40,
-            az="az1",
             volume_type="ssd",
         )
 
@@ -152,7 +151,6 @@ class VolumeLifecycleTest(unittest.TestCase):
             name="vm-1-vol-0",
             size=40,
             volume_type="ssd",
-            availability_zone="az1",
         )
         self.target_os.wait_volume_status.assert_called_with("vol-t1")
 
@@ -160,7 +158,7 @@ class VolumeLifecycleTest(unittest.TestCase):
         self.target_os.create_blank_volume.return_value = mock.Mock(id="vol-t1")
 
         self.lifecycle.create_target_volume(
-            name="vm-1-vol-0", size=200, az="az1", volume_type="ssd"
+            name="vm-1-vol-0", size=200, volume_type="ssd"
         )
 
         kwargs = self.target_os.create_blank_volume.call_args.kwargs
@@ -168,7 +166,7 @@ class VolumeLifecycleTest(unittest.TestCase):
 
     def test_source_copy_passes_volume_type(self):
         self.lifecycle.create_source_copy(
-            volume_id="vol-s1", vm_name="vm-1", index=0, az="az1",
+            volume_id="vol-s1", vm_name="vm-1", index=0,
             size=40, volume_type="src-ssd",
         )
 
@@ -179,7 +177,7 @@ class VolumeLifecycleTest(unittest.TestCase):
         self.source_os.get_volume.return_value = mock.Mock(volume_type="legacy-ssd")
 
         self.lifecycle.create_source_copy(
-            volume_id="vol-s1", vm_name="vm-1", index=0, az="az1", size=200
+            volume_id="vol-s1", vm_name="vm-1", index=0, size=200
         )
 
         kwargs = self.source_os.create_volume_from_snapshot.call_args.kwargs
@@ -189,7 +187,7 @@ class VolumeLifecycleTest(unittest.TestCase):
         self.source_os.get_volume.return_value = mock.Mock(volume_type="legacy-ssd")
 
         self.lifecycle.create_source_copy(
-            volume_id="vol-s1", vm_name="vm-1", index=0, az="az1",
+            volume_id="vol-s1", vm_name="vm-1", index=0,
             size=200, volume_type="override-type",
         )
 
@@ -200,7 +198,7 @@ class VolumeLifecycleTest(unittest.TestCase):
         self.source_os.get_volume.side_effect = RuntimeError("no volume api")
 
         self.lifecycle.create_source_copy(
-            volume_id="vol-s1", vm_name="vm-1", index=0, az="az1", size=200
+            volume_id="vol-s1", vm_name="vm-1", index=0, size=200
         )
 
         kwargs = self.source_os.create_volume_from_snapshot.call_args.kwargs
@@ -214,7 +212,7 @@ class VolumeLifecycleTest(unittest.TestCase):
 
         with self.assertRaises(RuntimeError) as ctx:
             self.lifecycle.create_target_volume(
-                name="vm-1-vol-0", size=200, az="az1"
+                name="vm-1-vol-0", size=200
             )
 
         message = str(ctx.exception)
@@ -227,7 +225,7 @@ class VolumeLifecycleTest(unittest.TestCase):
 
         with self.assertRaises(RuntimeError) as ctx:
             self.lifecycle.create_target_volume(
-                name="vm-1-vol-0", size=200, az="az1"
+                name="vm-1-vol-0", size=200
             )
 
         self.assertEqual(str(ctx.exception), "disk full")

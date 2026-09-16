@@ -2,7 +2,7 @@ import base64
 import unittest
 from unittest import mock
 
-from openstack_utils import OpenStackUtils
+from openstack_utils import CINDER_VOLUME_AZ, OpenStackUtils
 
 
 class RelayPrimitivesTest(unittest.TestCase):
@@ -113,23 +113,29 @@ class RelayPrimitivesTest(unittest.TestCase):
             snapshot_id="snap-1",
             size=40,
             volume_type="ssd",
-            availability_zone="az1",
         )
 
         kwargs = self.conn.block_storage.create_volume.call_args.kwargs
         self.assertEqual(kwargs["snapshot_id"], "snap-1")
         self.assertEqual(kwargs["size"], 40)
         self.assertEqual(kwargs["volume_type"], "ssd")
-        self.assertEqual(kwargs["availability_zone"], "az1")
+        # Cinder 与 Nova 的 AZ 是两套命名空间，派生卷固定落在 Cinder 的默认 AZ。
+        self.assertEqual(kwargs["availability_zone"], CINDER_VOLUME_AZ)
 
-    def test_create_volume_from_snapshot_omits_empty_optionals(self):
+    def test_create_volume_from_snapshot_omits_empty_volume_type(self):
         self.os_utils.create_volume_from_snapshot(
             name="derived-1", snapshot_id="snap-1", size=40
         )
 
         kwargs = self.conn.block_storage.create_volume.call_args.kwargs
         self.assertNotIn("volume_type", kwargs)
-        self.assertNotIn("availability_zone", kwargs)
+        self.assertEqual(kwargs["availability_zone"], CINDER_VOLUME_AZ)
+
+    def test_create_blank_volume_always_uses_cinder_az(self):
+        self.os_utils.create_blank_volume(name="blank-1", size=10, volume_type="ssd")
+
+        kwargs = self.conn.block_storage.create_volume.call_args.kwargs
+        self.assertEqual(kwargs["availability_zone"], CINDER_VOLUME_AZ)
 
     def test_attach_volume_returns_attachment_id(self):
         self.conn.compute.create_volume_attachment.return_value = mock.Mock(id="att-1")

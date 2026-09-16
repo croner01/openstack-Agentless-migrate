@@ -147,8 +147,6 @@ class RelayVolumeMoverTest(unittest.TestCase):
             volume=volume or _Volume(),
             vm_name="vm-1",
             index=0,
-            source_az="az1",
-            target_az="az2",
         )
 
     def test_move_orders_target_task_before_source(self):
@@ -446,8 +444,6 @@ class RelayVolumeMoverTest(unittest.TestCase):
             volume=_Volume(),
             vm_name="vm-1",
             index=0,
-            source_az="az1",
-            target_az="az2",
             target_volume_type="per-volume-ssd",
         )
 
@@ -463,8 +459,6 @@ class RelayVolumeMoverTest(unittest.TestCase):
             volume=_Volume(),
             vm_name="vm-1",
             index=0,
-            source_az="az1",
-            target_az="az2",
             source_volume_type="per-volume-ssd",
         )
 

@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-from openstack_utils import OpenStackUtils, relay_boot_volume_size
+from openstack_utils import CINDER_VOLUME_AZ, OpenStackUtils, relay_boot_volume_size
 from openstack_utils import volume_ready_timeout_default
 from relay_runtime import parse_relay_options
 
@@ -73,6 +73,8 @@ class RelayServerBootVolumeTest(unittest.TestCase):
         self.assertEqual(volume["size"], 20)
         self.assertEqual(volume["image_id"], "img-1")
         self.assertEqual(volume["volume_type"], "vt-1")
+        # 启动卷按 Cinder 的 AZ 落盘，不能把 Nova 的「nova」透传过去。
+        self.assertEqual(volume["availability_zone"], CINDER_VOLUME_AZ)
 
         server = self.conn.compute.create_server.call_args.kwargs
         self.assertNotIn("image_id", server)

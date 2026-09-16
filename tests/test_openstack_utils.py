@@ -2,7 +2,7 @@ import unittest
 from unittest import mock
 from types import SimpleNamespace
 
-from openstack_utils import OpenStackUtils
+from openstack_utils import CINDER_VOLUME_AZ, OpenStackUtils
 
 
 class _NotFound(Exception):
@@ -174,7 +174,7 @@ class CreateBfvServerPasswordTest(unittest.TestCase):
         volume = utils.create_blank_volume("blank-1", 10)
         self.assertEqual(volume.id, "volume-1")
         conn.block_storage.create_volume.assert_called_once_with(
-            name="blank-1", size=10
+            name="blank-1", size=10, availability_zone=CINDER_VOLUME_AZ
         )
 
 
