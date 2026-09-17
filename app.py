@@ -328,10 +328,12 @@ def sweep_relay_resources(*, now: float | None = None) -> list[str]:
 
     资源层未就绪（缺主密钥）时直接返回，不访问任何云。
     """
-    if not RELAY_RESOURCES.ready:
-        return []
     current = time.time() if now is None else now
-    results: list[str] = []
+    # 租约回收只读本地台账、不碰云，所以放在 ready 判断之前：它正是"重启后
+    # 节点删不掉"的兜底，缺主密钥时也不该被跳过。
+    results: list[str] = reap_relay_leases(now=current)
+    if not RELAY_RESOURCES.ready:
+        return results
 
     for agent_id in RELAY_STATE.sweep(now=current):
         agent = RELAY_STATE.by_id(agent_id)
@@ -398,6 +400,51 @@ def sweep_relay_resources(*, now: float | None = None) -> list[str]:
 
 def relay_rebuild_seconds() -> float:
     return env_float("MIGRATION_RELAY_REBUILD_SECONDS", 600.0, minimum=1.0)
+
+
+def relay_lease_grace_seconds() -> float:
+    """残留租约的宽限窗口：让刚收尾的作业自己释放，避免和 finish() 抢。"""
+    return env_float("MIGRATION_RELAY_LEASE_GRACE_SECONDS", 300.0, minimum=0.0)
+
+
+def reap_relay_leases(*, now: float | None = None) -> list[str]:
+    """回收"作业已经不在跑"的槽位租约，解开被残留槽位卡住的常驻节点。
+
+    常驻节点的槽位计数完全由租约推导，而租约只有 ``RelayRuntime.finish()``
+    会释放：平台重启会把未完成作业判失败、运行时就没了，残留的 active 记录
+    会让节点永远 busy——既调度不出去，删也删不掉（DELETE 直接 409）。
+    """
+    current = time.time() if now is None else now
+    grace = relay_lease_grace_seconds()
+    stale: set[str] = set()
+    for lease in RELAY_LEASES.all():
+        if not lease.active:
+            continue
+        if current - float(lease.acquired_at or 0.0) < grace:
+            continue
+        job = job_manager.get(lease.job_id)
+        if job is not None and job.status == JobStatus.RUNNING:
+            continue
+        stale.add(lease.job_id)
+
+    results: list[str] = []
+    for job_id in sorted(stale):
+        scheduler = RELAY_RESOURCES.scheduler
+        if scheduler is not None:
+            # 复用调度器的释放逻辑：按租约台账回算 slots_used/state 并落盘。
+            released = scheduler.release_job(job_id)
+        else:
+            released = len(RELAY_LEASES.release_job(job_id, now=current))
+            if released:
+                RELAY_LEASES.save()
+        if released:
+            logging.warning(
+                "[MIGRATION] 回收残留中转机槽位租约 job=%s count=%s（作业已不在运行）",
+                job_id,
+                released,
+            )
+            results.append(f"lease-reap:{job_id}")
+    return results
 
 
 def relay_hole_mode_override(
