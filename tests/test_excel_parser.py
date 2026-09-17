@@ -1,6 +1,6 @@
 import unittest
 
-from excel_parser import parse_rows, parse_selected_rows
+from excel_parser import parse_rows, parse_selected_rows, parse_start_target
 
 
 class ExcelParserTest(unittest.TestCase):
@@ -65,6 +65,57 @@ class SelectedRowsTest(unittest.TestCase):
             parse_selected_rows(
                 [{"server_id": "", "vm_name": "web-1", "target_az": "az1"}]
             )
+
+
+class StartTargetParsingTest(unittest.TestCase):
+    """「迁移后是否开机」是可选项：缺列、留空都按开机处理，避免老 Excel 失效。"""
+
+    def test_truthy_literals(self):
+        for raw in (None, "", "  ", True, 1, "1", "true", "True", "yes", "y",
+                    "是", "开机"):
+            with self.subTest(raw=raw):
+                self.assertTrue(parse_start_target(raw))
+
+    def test_falsy_literals(self):
+        for raw in (False, 0, "0", "false", "False", "no", "n", "否", "不开机",
+                    "不开机\n"):
+            with self.subTest(raw=raw):
+                self.assertFalse(parse_start_target(raw))
+
+    def test_rejects_unknown_literal(self):
+        with self.assertRaisesRegex(ValueError, "开机"):
+            parse_start_target("maybe")
+
+    def test_rows_default_to_boot_when_column_missing(self):
+        rows = parse_rows([{"vm_name": "vm-a", "target_az": "az1"}])
+
+        self.assertTrue(rows[0].start_target)
+
+    def test_rows_honour_optional_column(self):
+        rows = parse_rows([
+            {"vm_name": "vm-a", "target_az": "az1", "start_target": "否"},
+            {"vm_name": "vm-b", "target_az": "az1", "start_target": ""},
+        ])
+
+        self.assertFalse(rows[0].start_target)
+        self.assertTrue(rows[1].start_target)
+
+    def test_rows_report_row_number_on_bad_value(self):
+        with self.assertRaisesRegex(ValueError, "第 3 行"):
+            parse_rows([
+                {"vm_name": "vm-a", "target_az": "az1", "start_target": "开机"},
+                {"vm_name": "vm-b", "target_az": "az1", "start_target": "也许"},
+            ])
+
+    def test_selected_rows_honour_flag(self):
+        rows = parse_selected_rows([
+            {"server_id": "s1", "vm_name": "vm1", "target_az": "az1",
+             "start_target": False},
+            {"server_id": "s2", "vm_name": "vm2", "target_az": "az1"},
+        ])
+
+        self.assertFalse(rows[0].start_target)
+        self.assertTrue(rows[1].start_target)
 
 
 class MigrationModeParsingTest(unittest.TestCase):

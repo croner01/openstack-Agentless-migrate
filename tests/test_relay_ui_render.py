@@ -45,15 +45,16 @@ class RelayPageRenderTest(unittest.TestCase):
         self.assertIn('name="cutover_mode"', html)
         self.assertIn("awaiting_cutover", html)
         self.assertIn("开始切换", html)
-        self.assertIn("requestCutover", html)
+        self.assertIn("openCutoverConfirm", html)
 
     def test_step1_has_data_channel_select(self):
         self.assertIn('id="data-channel"', self._html())
 
-    def test_step1_has_relay_pool_panel(self):
+    def test_wizard_has_relay_section_with_platform_fields(self):
+        """选中「中转机」方案后，回连地址/目录/预检这些必填项必须能填。"""
         html = self._html()
 
-        self.assertIn('id="relay-pool-panel"', html)
+        self.assertIn('id="wiz-relay-sec"', html)
         self.assertIn('name="relay_platform_url"', html)
         self.assertIn('id="relay-preflight"', html)
         self.assertIn('id="load-relay-catalog"', html)
@@ -116,35 +117,40 @@ class RelayPageRenderTest(unittest.TestCase):
         self.assertIn('name="relay_${prefix}_volume_type"', html)
         self.assertIn("使用 __DEFAULT__", html)
 
-    def test_step3_has_rebuild_and_ledger_counters(self):
+    def test_relay_detail_has_ledger_counters(self):
+        """中转机页签要摆出台账计数，否则不知道有没有残留卷。"""
         html = self._html()
 
-        self.assertIn("relay-rebuild", html)
+        self.assertIn('id="relay-counters"', html)
         self.assertIn("在途卷", html)
+        self.assertIn("已清理", html)
 
     def test_step2_card_shows_target_volume_hint(self):
-        self.assertIn("按源盘容量向上取整到 GiB", self._html())
+        """目标卷类型留空即用目标默认；逐卷可覆盖，不能让用户以为必须手填。"""
+        html = self._html()
+
+        self.assertIn('name="target_volume_type"', html)
+        self.assertIn("留空使用目标默认", html)
+        self.assertIn("目标卷类型（逐卷，可选）", html)
+        self.assertIn("继承源卷类型", html)
 
     def test_job_list_has_cancel_and_delete(self):
         html = self._html()
 
-        self.assertIn("async function cancelJob", html)
-        self.assertIn("async function deleteJob", html)
-        self.assertIn("/cancel`, { method: 'POST' }", html)
+        self.assertIn("function cancelJob", html)
+        self.assertIn("function openJobDeleteConfirm", html)
+        self.assertIn("'/cancel', { method: 'POST' }", html)
         self.assertIn("method: 'DELETE'", html)
         self.assertIn("cancelled: '已取消'", html)
+
+    # 说明：原先的「中转机运维页」是被有意移除的复杂页面（需求改为只保留
+    # 清理/扩容的极简资源页），针对它的表单/凭据预填/环境摘要/节点提示等断言
+    # 已随页面一并删除；相关后端能力仍由 tests/test_relay_admin_api.py 覆盖。
 
     def test_relay_resource_page_markup_exists(self):
         html = self._html()
 
-        for element_id in (
-            "relay-resource-page",
-            "relay-pool-summary",
-            "relay-node-grid",
-            "relay-tenant-credentials",
-            "relay-scale-form",
-            "relay-node-password-modal",
-        ):
+        for element_id in ("view-relay", "relay-res-body", "relay-res-refresh"):
             self.assertIn(f'id="{element_id}"', html)
 
     def test_wizard_step1_references_existing_pool(self):
@@ -164,32 +170,12 @@ class RelayPageRenderTest(unittest.TestCase):
         ):
             self.assertIn(f'name="{field}"', html)
 
-    def test_resource_page_is_marked_optional_ops_view(self):
-        html = self._html()
-
-        self.assertIn("日常迁移不需要来这一页", html)
-        self.assertIn("中转机资源（运维）", html)
-        self.assertIn("自动加密保存该租户凭据", html)
-
-    def test_resource_page_has_pool_profile_fields(self):
-        html = self._html()
-
-        for field in (
-            "pp_slots_per_node",
-            "pp_max_nodes",
-            "pp_min_nodes",
-            "pp_idle_hours",
-            "cred_auth_url",
-        ):
-            self.assertIn(f'name="{field}"', html)
-
     def test_step2_has_per_volume_type_selector(self):
         html = self._html()
 
-        self.assertIn("volume-section", html)
-        self.assertIn("volumeOverrides", html)
+        self.assertIn("_volumeOverrides", html)
         self.assertIn("volume_overrides", html)
-        self.assertIn("目标卷类型（逐卷）", html)
+        self.assertIn("目标卷类型（逐卷，可选）", html)
         self.assertIn("volume-source-type", html)
         self.assertIn("volume-target-type", html)
         self.assertIn("继承源卷类型", html)
@@ -201,16 +187,18 @@ class RelayPageRenderTest(unittest.TestCase):
         self.assertEqual(html.count("classList.contains('volume-row')"), 2)
 
     def test_platform_url_defaults_to_current_host(self):
+        """回连平台地址默认填当前访问地址，省得用户手敲。"""
         html = self._html()
 
-        self.assertIn('name="relay_platform_url" value="http://localhost/"', html)
+        self.assertIn("$('#relay-platform-url').value = location.origin + '/'", html)
 
-    def test_step3_has_relay_pool_view(self):
+    def test_job_detail_has_relay_tab(self):
+        """作业详情的「中转机」页签要能对账并展示进度与台账。"""
         html = self._html()
 
-        self.assertIn('id="relay-pool-view"', html)
-        self.assertIn('id="relay-pool-grid"', html)
+        self.assertIn('id="jobtab-relay"', html)
         self.assertIn('id="relay-reconcile"', html)
+        self.assertIn('id="relay-counters"', html)
 
     def test_step3_renders_relay_volume_progress(self):
         """中转机通道不看 vm.volumes，进度必须单独渲染，否则一直只显示"拷贝中"。"""
@@ -226,13 +214,16 @@ class RelayPageRenderTest(unittest.TestCase):
     def test_relay_css_is_present(self):
         html = self._html()
 
-        self.assertIn(".relay-pool-grid", html)
-        self.assertIn('.relay-node[data-state="busy"]', html)
+        self.assertIn(".res-pool {", html)
+        self.assertIn(".res-head {", html)
+        self.assertIn(".res-node {", html)
 
     def test_per_vm_channel_select_is_built_in_js(self):
+        """逐 VM 通道覆盖是方案默认之外的手动出口，必须真实提交。"""
         html = self._html()
 
-        self.assertIn("channelSelect.dataset.role = 'data-channel'", html)
+        self.assertIn("channelSel.dataset.field = 'data_channel'", html)
+        self.assertIn("new Option('跟随方案', '')", html)
         self.assertIn("data.append('data_channel'", html)
 
     def test_relay_endpoints_are_registered(self):
@@ -246,42 +237,40 @@ class RelayPageRenderTest(unittest.TestCase):
     def test_scheme_picker_exists_with_three_schemes(self):
         html = self._html()
 
-        self.assertIn('id="scheme-picker"', html)
+        self.assertIn('class="scheme-cards"', html)
         for scheme in ("rbd_full", "rbd_incremental", "relay_full"):
             self.assertIn(f'data-scheme="{scheme}"', html)
         self.assertIn("const SCHEMES", html)
         self.assertIn("function applyScheme", html)
 
     def test_config_groups_are_marked_for_visibility(self):
+        """方案切换靠 data-cfg-group 显隐，漏标记就会把无关配置摆出来。"""
         html = self._html()
 
         self.assertIn('data-cfg-group="ceph"', html)
         self.assertIn('data-cfg-group="delta"', html)
-        self.assertIn('id="scheme-needs"', html)
+        self.assertIn('data-cfg-group="relay"', html)
 
     def test_profile_panel_exists(self):
         html = self._html()
 
+        self.assertIn("function loadProfiles", html)
         for element_id in (
-            "profile-panel",
+            "prof-drawer",
             "profile-select",
-            "profile-save",
-            "profile-delete",
+            "prof-new",
+            "prof-save",
         ):
             self.assertIn(f'id="{element_id}"', html)
-        self.assertIn("async function loadProfiles", html)
-        self.assertIn("async function saveProfile", html)
-        self.assertIn("data.append('profile_id'", html)
 
     def test_checklist_has_summary_and_bulk_controls(self):
         html = self._html()
 
-        self.assertIn("plan-card-body", html)
-        self.assertIn("plan-summary", html)
-        self.assertIn("function togglePlanCard", html)
+        self.assertIn("plan-body", html)
+        self.assertIn("checklist-summary", html)
+        self.assertIn("plan-expand", html)
         self.assertIn("function autoMapNetworks", html)
         self.assertIn("function applyBulkToSelected", html)
-        self.assertIn("批量应用到已选 VM", html)
         self.assertIn("自动映射目标网络", html)
 
     def test_relay_resource_page_not_in_main_nav(self):
@@ -290,56 +279,11 @@ class RelayPageRenderTest(unittest.TestCase):
         self.assertNotIn('data-step="resources"', html)
 
     def test_relay_ops_entry_lives_in_relay_group(self):
+        """运维入口收在侧边栏的「中转机资源」，不再挂在向导步骤里。"""
         html = self._html()
 
-        self.assertIn('id="relay-ops-open"', html)
-        self.assertIn('id="relay-ops-close"', html)
-        self.assertIn("function openRelayOps", html)
-        self.assertIn("function closeRelayOps", html)
-
-    def test_resource_page_has_env_summary_and_when_to_use_guide(self):
-        """运维页要直接说清什么时候用，并把当前环境参数摆出来，避免不知从何下手。"""
-        html = self._html()
-
-        self.assertIn('id="relay-env-summary"', html)
-        self.assertIn("relay-guide", html)
-        self.assertIn("function renderRelayEnvSummary", html)
-        self.assertIn("只有下面三种情况需要手工介入", html)
-        self.assertIn("节点卡住或不可用", html)
-
-    def test_resource_page_can_load_existing_pool_profile(self):
-        """池建机参数必须能选已有池自动填充，并提供从向导带入与删除入口。"""
-        html = self._html()
-
-        self.assertIn('id="relay-profile-pick"', html)
-        self.assertIn('id="relay-profile-prefill"', html)
-        self.assertIn('id="relay-profile-delete"', html)
-        self.assertIn("function applyPoolProfileToForm", html)
-        self.assertIn("function prefillPoolProfileFromWizard", html)
-        self.assertIn("function deleteRelayProfile", html)
-
-    def test_resource_page_can_load_existing_tenant_credential(self):
-        html = self._html()
-
-        self.assertIn('id="relay-cred-pick"', html)
-        self.assertIn('id="relay-cred-prefill-source"', html)
-        self.assertIn('id="relay-cred-prefill-target"', html)
-        self.assertIn("function prefillCredentialFromWizard", html)
-
-    def test_resource_page_explains_stuck_provisioning_node(self):
-        """装机中卡住的节点必须给出原因和下一步动作，否则用户不知道点哪里。"""
-        html = self._html()
-
-        self.assertIn("function relayNodeHint", html)
-        self.assertIn("agent 尚未注册", html)
-        self.assertIn("last_seen 为空", html)
-
-    def test_pool_profile_marks_optional_fields(self):
-        html = self._html()
-
-        self.assertIn("field-optional", html)
-        self.assertIn("可选，留空自动选", html)
-        self.assertIn("可选，默认当前平台", html)
+        self.assertIn('data-nav="relay"', html)
+        self.assertIn('<h1 class="page-title">中转机资源</h1>', html)
 
     def test_job_relay_endpoint_returns_null_without_runtime(self):
         response = self.client.get("/api/jobs/no-such-job/relay")
@@ -378,9 +322,44 @@ class RelayPageRenderTest(unittest.TestCase):
         html = self._html()
         style = html.split("<style>", 1)[1].split("</style>", 1)[0]
         after_dark = style.split('[data-theme="dark"]', 1)[1]
-        marker = "\n        }\n"
-        rules_only = after_dark[after_dark.index(marker) + len(marker):]
+        # 深色主题块自身以行首的 "}" 收尾；从它的闭合大括号之后开始检查，
+        # 这样新增缩进或变量都不会再让这段解析失效。
+        rules_only = after_dark[after_dark.index("\n}") + 2:]
+        # 设置页的主题卡片预览色块本来就该显示深色底，是唯一允许的字面色。
+        rules_only = "\n".join(
+            line for line in rules_only.splitlines() if ".theme-preview" not in line
+        )
 
         for literal in ("#0b1220", "#101a2e", "#0c1524", "#0b1424", "#5e7190",
                         "#062033", "#fde68a", "#fecaca", "#a7f3d0", "#5f7390"):
             self.assertNotIn(literal, rules_only)
+
+    def test_plan_grid_has_per_vm_boot_toggle(self):
+        """规划表新增「迁移后开机」列：表头、复选框字段、empty-box 列数都要对上。"""
+        html = self._html()
+
+        self.assertIn("<th>迁移后开机</th>", html)
+        self.assertIn("powerCk.dataset.field = 'start_target'", html)
+        self.assertIn("row.start_target !== false", html)
+        self.assertNotIn(
+            '<td colspan="8" class="empty-box">请先在上一步勾选源 VM 或解析 Excel 清单</td>',
+            html,
+        )
+
+    def test_plan_grid_has_bulk_boot_control(self):
+        """批量工具条支持一次性设置「迁移后开机 / 不开机」。"""
+        html = self._html()
+
+        self.assertIn('id="bulk-power"', html)
+        self.assertIn("power === 'on'", html)
+
+    def test_submit_payload_and_detail_view_carry_start_target(self):
+        """提交参数、作业详情 chip / 抽屉概览都要带上开关状态。"""
+        html = self._html()
+
+        self.assertIn("start_target: row.start_target !== false", html)
+        # 批量应用直接改 state 后必须跳过 DOM 回写，否则会被旧 DOM 覆盖
+        self.assertIn("renderPlan({ keepState: true })", html)
+        self.assertIn("options && options.keepState", html)
+        self.assertIn("['迁移后开机', vm.start_target === false ? '否（目标机保持关机）' : '是']", html)
+        self.assertIn("const keepOff = vm.start_target === false;", html)

@@ -255,6 +255,7 @@ class JobManager:
                 target_image=row.target_image,
                 target_flavor=row.target_flavor,
                 source_server_id=row.source_server_id,
+                start_target=row.start_target,
             )
             for row in rows
         ]

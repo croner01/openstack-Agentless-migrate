@@ -10,6 +10,8 @@ class MigrationRow:
     target_image: str | None = None
     target_flavor: str | None = None
     mode: str = "full"
+    #: 迁移收尾后是否把目标机开起来（默认开机，与历史行为一致）。
+    start_target: bool = True
     source_networks: list = None  # [{network, ip, cidr}] 供 UI 展示/规划
 
     def __post_init__(self):
@@ -18,8 +20,13 @@ class MigrationRow:
 
 
 REQUIRED_COLUMNS = {"vm_name", "target_az"}
-OPTIONAL_COLUMNS = {"target_image", "target_flavor", "mode"}
+OPTIONAL_COLUMNS = {"target_image", "target_flavor", "mode", "start_target"}
 VALID_MODES = {"full", "incremental"}
+
+#: 「迁移后开机」列/字段的真假字面量。中文与 yes/no 都收，避免用户改一行
+#: 表头就被判非法；留空或缺列一律按"开机"处理，保证老清单继续可用。
+_TRUE_LITERALS = {"true", "t", "yes", "y", "1", "on", "是", "开机", "开"}
+_FALSE_LITERALS = {"false", "f", "no", "n", "0", "off", "否", "不开机", "关", "不开"}
 
 
 def parse_mode(raw: Any) -> str:
@@ -27,6 +34,22 @@ def parse_mode(raw: Any) -> str:
     if text not in VALID_MODES:
         raise ValueError(f"不支持的迁移模式: {raw}（可选 full/incremental）")
     return text
+
+
+def parse_start_target(raw: Any) -> bool:
+    """解析「迁移后是否开机」：空值=开机（默认），非法值报错。"""
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw).strip().lower()
+    if not text:
+        return True
+    if text in _TRUE_LITERALS:
+        return True
+    if text in _FALSE_LITERALS:
+        return False
+    raise ValueError(f"不支持的「迁移后开机」取值: {raw}（可选 是/否、开机/不开机）")
 
 
 def parse_rows(records: list[dict[str, Any]]) -> list[MigrationRow]:
@@ -49,6 +72,11 @@ def parse_rows(records: list[dict[str, Any]]) -> list[MigrationRow]:
         target_az = str(record.get("target_az") or "").strip()
         if not vm_name or not target_az:
             raise ValueError(f"第 {index} 行 vm_name/target_az 不能为空")
+        try:
+            start_target = parse_start_target(record.get("start_target"))
+        except ValueError as exc:
+            # 带上行号，否则用户不知道是哪一行的单元格写错了。
+            raise ValueError(f"第 {index} 行：{exc}") from exc
         rows.append(
             MigrationRow(
                 vm_name=vm_name,
@@ -56,6 +84,7 @@ def parse_rows(records: list[dict[str, Any]]) -> list[MigrationRow]:
                 target_image=str(record.get("target_image") or "").strip() or None,
                 target_flavor=str(record.get("target_flavor") or "").strip() or None,
                 mode=parse_mode(record.get("mode")),
+                start_target=start_target,
             )
         )
     return rows
@@ -80,6 +109,7 @@ def parse_selected_rows(records: list[dict[str, Any]]) -> list[MigrationRow]:
                 target_image=str(record.get("target_image") or "").strip() or None,
                 target_flavor=str(record.get("target_flavor") or "").strip() or None,
                 mode=parse_mode(record.get("mode")),
+                start_target=parse_start_target(record.get("start_target")),
             )
         )
     return rows

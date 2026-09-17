@@ -835,6 +835,11 @@ body.wizard-view .toast-box { bottom: 92px; }
                             <span class="sec-note">每个源网卡都必须选择目标网络/子网；继承值显示为下拉默认项</span>
                             <div class="spacer"></div>
                             <select class="sel" id="bulk-az" style="width:150px"><option value="">批量目标 AZ…</option></select>
+                            <select class="sel" id="bulk-power" style="width:150px">
+                                <option value="">批量开机设置…</option>
+                                <option value="on">迁移后开机</option>
+                                <option value="off">迁移后不开机</option>
+                            </select>
                             <button type="button" class="btn btn-sm" id="bulk-apply">应用</button>
                             <button type="button" class="btn btn-sm" id="auto-map">自动映射目标网络</button>
                             <button type="button" class="btn btn-sm" id="refresh-nets">刷新源网络信息</button>
@@ -842,9 +847,9 @@ body.wizard-view .toast-box { bottom: 92px; }
                         <div class="table-scroll">
                             <table class="table">
                                 <thead><tr>
-                                    <th>VM 名称</th><th>目标 AZ</th><th>目标镜像</th><th>目标 Flavor</th><th>模式</th><th>通道</th><th>网卡/状态</th><th style="text-align:right">明细</th>
+                                    <th>VM 名称</th><th>目标 AZ</th><th>目标镜像</th><th>目标 Flavor</th><th>模式</th><th>通道</th><th>迁移后开机</th><th>网卡/状态</th><th style="text-align:right">明细</th>
                                 </tr></thead>
-                                <tbody id="plan-body"><tr><td colspan="8" class="empty-box">请先在上一步勾选源 VM 或解析 Excel 清单</td></tr></tbody>
+                                <tbody id="plan-body"><tr><td colspan="9" class="empty-box">请先在上一步勾选源 VM 或解析 Excel 清单</td></tr></tbody>
                             </table>
                         </div>
                         <div class="submit-summary" style="margin-top:14px">
@@ -1051,6 +1056,15 @@ function text(tag, className, value) {
     return el;
 }
 
+/* 搜索框逐字符触发全表重绘在大清单上很卡；统一在这里做防抖。 */
+function debounce(fn, wait) {
+    let timer = null;
+    return function debounced(...args) {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => { timer = null; fn.apply(this, args); }, wait || 120);
+    };
+}
+
 function escapeHtml(value) {
     return String(value == null ? '' : value)
         .replace(/&/g, '&amp;')
@@ -1149,6 +1163,9 @@ const state = {
     scheme: 'rbd_full',
     targetCatalog: { images: [], flavors: [], networks: [], subnets: [], availability_zones: [], volume_types: [] },
     previewRows: [],
+    // server_id -> 规划行 / 清单行节点：避免每次渲染都线性扫一遍 previewRows
+    previewRowIndex: new Map(),
+    vmRowNodes: new Map(),
     sourceServers: [],
     sourceServersNextMarker: null,
     sourceServerFilter: '',
@@ -1424,7 +1441,7 @@ function applyWizardForm(form) {
 /* 完全清空向导：状态、表单、动态列表恢复初始态 */
 function resetWizard() {
     state.scheme = 'rbd_full';
-    state.previewRows = [];
+    setPreviewRows([]);
     state.sourceServers = [];
     state.sourceServersNextMarker = null;
     state.sourceServersLoading = false;
@@ -1445,6 +1462,8 @@ function resetWizard() {
     if (globalImage) globalImage.innerHTML = '<option value="">先验证连接加载目录</option>';
     const bulkAz = $('#bulk-az');
     if (bulkAz) bulkAz.innerHTML = '<option value="">批量目标 AZ…</option>';
+    const bulkPower = $('#bulk-power');
+    if (bulkPower) bulkPower.value = '';
     ['source', 'target'].forEach(prefix => {
         const conn = $('#conn-' + prefix);
         if (conn) { conn.className = 'conn none'; conn.textContent = '○ 未验证'; }
@@ -1471,7 +1490,7 @@ function resetWizard() {
     const netRefresh = $('#refresh-selected-nets');
     if (netRefresh) netRefresh.disabled = true;
     const planBody = $('#plan-body');
-    if (planBody) planBody.innerHTML = '<tr><td colspan="8" class="empty-box">请先在上一步勾选源 VM 或解析 Excel 清单</td></tr>';
+    if (planBody) planBody.innerHTML = '<tr><td colspan="9" class="empty-box">请先在上一步勾选源 VM 或解析 Excel 清单</td></tr>';
     const diag = $('#diag-result');
     if (diag) { diag.classList.add('hidden'); diag.innerHTML = ''; }
     const preflight = $('#relay-preflight-result');
@@ -1531,7 +1550,7 @@ function restoreLastSubmit() {
     state.sourceVolumeTypes = (snapshot.sourceVolumeTypes || []).map(item => Object.assign({}, item));
     state.sourceServers = (snapshot.sourceServers || []).map(item => Object.assign({}, item));
     state.sourceServersNextMarker = snapshot.sourceServersNextMarker || null;
-    state.previewRows = (snapshot.rows || []).map(row => JSON.parse(JSON.stringify(row)));
+    setPreviewRows((snapshot.rows || []).map(row => JSON.parse(JSON.stringify(row))));
     state.selectedServerIds = new Set(
         state.previewRows.filter(row => row.server_id).map(row => row.server_id));
     if (state.sourceServers.length) renderSourceServers();
@@ -1883,6 +1902,7 @@ function renderSourceServers() {
     const countLbl = $('#wiz-vm-count-lbl');
     moreWrap.innerHTML = '';
     tb.innerHTML = '';
+    state.vmRowNodes = new Map();
     updateSelCount();
     const shown = filteredSourceServers();
     const term = (state.sourceServerFilter || '').trim();
@@ -1892,12 +1912,7 @@ function renderSourceServers() {
             : '已加载 ' + state.sourceServers.length + ' 台';
     }
     updateSourceNetBanner();
-    const ckAll = $('#wiz-ck-all');
-    if (ckAll) {
-        const allChecked = shown.length > 0 && shown.every(server => state.selectedServerIds.has(server.server_id));
-        ckAll.checked = allChecked;
-        ckAll.indeterminate = !allChecked && shown.some(server => state.selectedServerIds.has(server.server_id));
-    }
+    updateVmCheckAllState();
     if (hint) {
         hint.textContent = state.sourceServersNextMarker
             ? '源项目还有更多 VM 未加载：可「加载更多」，或按回车在源项目内直接检索。'
@@ -1931,7 +1946,9 @@ function renderSourceServers() {
         tr.appendChild(text('td', '', server.availability_zone || '未知AZ'));
         tr.appendChild(text('td', 'mono', (flavor.vcpus || '?') + 'vCPU/' + (flavor.ram || '?') + 'MB'));
         tr.appendChild(text('td', '', server.image_name || 'BFV（卷启动）'));
-        tr.appendChild(networkCellFor(server));
+        const netTd = networkCellFor(server);
+        tr.appendChild(netTd);
+        state.vmRowNodes.set(server.server_id, { tr, ck, netTd });
         tr.addEventListener('click', ev => {
             if (ev.target.tagName === 'INPUT') return;
             ck.checked = !ck.checked;
@@ -1945,6 +1962,26 @@ function renderSourceServers() {
         moreBtn.onclick = () => loadSourceServers(false);
         moreWrap.appendChild(moreBtn);
     }
+}
+
+function indexPreviewRows() {
+    state.previewRowIndex = new Map();
+    state.previewRows.forEach(row => {
+        if (row && row.server_id && !state.previewRowIndex.has(row.server_id)) {
+            state.previewRowIndex.set(row.server_id, row);
+        }
+    });
+    return state.previewRows;
+}
+
+function setPreviewRows(rows) {
+    state.previewRows = rows || [];
+    return indexPreviewRows();
+}
+
+function previewRowForServer(serverId) {
+    if (!serverId) return undefined;
+    return state.previewRowIndex.get(serverId);
 }
 
 function updateSelCount() {
@@ -1963,10 +2000,33 @@ async function setServerSelected(server, checked, options) {
     }
 }
 
+function updateVmCheckAllState() {
+    const ckAll = $('#wiz-ck-all');
+    if (!ckAll) return;
+    const shown = filteredSourceServers();
+    const allChecked = shown.length > 0
+        && shown.every(server => state.selectedServerIds.has(server.server_id));
+    ckAll.checked = allChecked;
+    ckAll.indeterminate = !allChecked
+        && shown.some(server => state.selectedServerIds.has(server.server_id));
+}
+
 async function toggleSourceServer(server, checkbox) {
     await setServerSelected(server, checkbox.checked);
-    // 重新渲染，让本行的「源网卡」状态与提示条及时更新
-    renderSourceServers();
+    // 勾选只影响这一行：整表重建在大清单上会明显卡顿，这里只刷本行。
+    updateSourceRow(server);
+}
+
+/* 单行增量更新：复选框 + 网卡格 + 计数/全选/提示条。 */
+function updateSourceRow(server) {
+    const node = state.vmRowNodes.get(server.server_id);
+    if (node) {
+        node.ck.checked = state.selectedServerIds.has(server.server_id);
+        node.netTd.replaceChildren(...Array.from(networkCellFor(server).childNodes));
+    }
+    updateSelCount();
+    updateVmCheckAllState();
+    updateSourceNetBanner();
 }
 
 /* 全选只作用于当前过滤出来的清单，并真正生成规划行 */
@@ -1991,15 +2051,15 @@ async function bulkToggleSourceServers(checked) {
 }
 
 function removePreviewRowByServerId(serverId) {
-    state.previewRows = state.previewRows.filter(
+    setPreviewRows(state.previewRows.filter(
         row => !(row._picklist && row.server_id === serverId)
-    );
-    if (state.wizStep === 4) renderPlan();
+    ));
+    if (state.wizStep === 4) renderPlan({ keepState: true });
 }
 
 async function addSelectedSourceServer(server, options) {
     const deferNetworks = Boolean(options && options.deferNetworks);
-    if (state.previewRows.some(row => row.server_id === server.server_id)) {
+    if (previewRowForServer(server.server_id)) {
         return;
     }
     const sourceAz = server.availability_zone || '';
@@ -2019,6 +2079,7 @@ async function addSelectedSourceServer(server, options) {
         source_az: server.availability_zone
     };
     state.previewRows.push(row);
+    state.previewRowIndex.set(row.server_id, row);
     if (!deferNetworks) {
         await fillSourceNetworksForRows([row]);
     }
@@ -2032,7 +2093,7 @@ function networkCellFor(server) {
         td.appendChild(text('span', 'sec-note', '—'));
         return td;
     }
-    const row = state.previewRows.find(item => item.server_id === server.server_id);
+    const row = previewRowForServer(server.server_id);
     const nets = row ? (row.source_networks || []) : [];
     if (nets.length) {
         td.appendChild(text('span', 'chip', '网卡 ' + nets.length));
@@ -2052,7 +2113,8 @@ function networkCellFor(server) {
         ev.stopPropagation();
         retry.disabled = true;
         await fillSourceNetworksForRows(row ? [row] : null);
-        renderSourceServers();
+        // 只补这一行的结果，不必重建整张清单
+        updateSourceRow(server);
         if (state.wizStep === 4) renderPlan();
     });
     td.appendChild(retry);
@@ -2082,7 +2144,7 @@ async function parseExcel() {
             source_image: null,
             source_az: null
         }));
-        state.previewRows = listRows.concat(excelRows);
+        setPreviewRows(listRows.concat(excelRows));
         await fillSourceNetworksForRows();
         renderPlan();
         toast('清单已解析：' + excelRows.length + ' 行，已并入迁移规划', 'success');
@@ -2213,13 +2275,17 @@ function ipv4InSubnet(ip, cidr) {
 }
 
 /* ═══════════ 迁移规划表（步骤4）═══════════ */
-function renderPlan() {
+function renderPlan(options) {
     if (!$('#plan-body')) return;
-    const { vmOverrides: previousOverrides } = collectPreviewValues();
+    // 默认先从 DOM 回写用户编辑；由代码直接改 state 后渲染要传 { keepState: true }，
+    // 否则刚写入的值会被旧 DOM 覆盖（批量应用、删除行都会踩到）。
+    const { vmOverrides: previousOverrides } = (options && options.keepState)
+        ? { vmOverrides: {} }
+        : collectPreviewValues();
     const tb = $('#plan-body');
     tb.innerHTML = '';
     if (!state.previewRows.length) {
-        tb.innerHTML = '<tr><td colspan="8" class="empty-box">请先在上一步勾选源 VM 或解析 Excel 清单</td></tr>';
+        tb.innerHTML = '<tr><td colspan="9" class="empty-box">请先在上一步勾选源 VM 或解析 Excel 清单</td></tr>';
         refreshChecklistUI();
         return;
     }
@@ -2287,6 +2353,22 @@ function renderPlan() {
         channelSel.addEventListener('change', refreshChecklistUI);
         channelTd.appendChild(channelSel);
         mainTr.appendChild(channelTd);
+
+        // 逐 VM「迁移完成后是否开机」：默认勾选，与历史行为一致。
+        const powerTd = text('td');
+        const powerLabel = document.createElement('label');
+        powerLabel.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer';
+        const powerCk = document.createElement('input');
+        powerCk.type = 'checkbox';
+        powerCk.checked = row.start_target !== false;
+        powerCk.title = '取消勾选：迁移完成后目标机保持关机，需手动开机';
+        powerCk.dataset.row = index;
+        powerCk.dataset.field = 'start_target';
+        powerCk.addEventListener('change', refreshChecklistUI);
+        powerLabel.appendChild(powerCk);
+        powerLabel.appendChild(text('span', '', '开机'));
+        powerTd.appendChild(powerLabel);
+        mainTr.appendChild(powerTd);
 
         const stateTd = text('td');
         stateTd.appendChild(text('span', 'plan-state chip', '…'));
@@ -2425,7 +2507,8 @@ function collectPreviewValues() {
     });
     $$('#plan-body [data-field]').forEach(input => {
         const row = state.previewRows[Number(input.dataset.row)];
-        if (row) row[input.dataset.field] = input.value;
+        if (!row) return;
+        row[input.dataset.field] = input.type === 'checkbox' ? input.checked : input.value;
     });
     $$('#plan-body .plan-row').forEach(mainTr => {
         const index = Number(mainTr.dataset.row);
@@ -2507,9 +2590,16 @@ function refreshChecklistUI() {
             ? '已就绪 ' + ready + '/' + state.previewRows.length + ' 台 · 可提交'
             : '待完善 ' + issueRows.size + ' 台 · ' + issues.length + ' 项问题';
     }
+    // 先按行号分组：逐行 filter 一遍 issues 会退化成 O(行数 × 问题数)，
+    // 大清单下每次刷新都要重算上百万次比较。
+    const issuesByRow = new Map();
+    issues.forEach(issue => {
+        if (!issuesByRow.has(issue.rowIndex)) issuesByRow.set(issue.rowIndex, []);
+        issuesByRow.get(issue.rowIndex).push(issue);
+    });
     $$('#plan-body .plan-row').forEach(mainTr => {
         const index = Number(mainTr.dataset.row);
-        const rowIssues = issues.filter(issue => issue.rowIndex === index);
+        const rowIssues = issuesByRow.get(index) || [];
         const badge = $('.plan-state', mainTr);
         if (badge) {
             badge.textContent = rowIssues.length ? '待配置 ' + rowIssues.length : '已就绪';
@@ -2571,17 +2661,19 @@ function autoMapNetworks() {
 function applyBulkToSelected() {
     const az = $('#bulk-az').value;
     const image = $('#global-image').value;
-    if (!az && !image) {
-        toast('请先选择要批量应用的目标 AZ 或默认镜像', 'error');
+    const power = $('#bulk-power') ? $('#bulk-power').value : '';
+    if (!az && !image && !power) {
+        toast('请先选择要批量应用的目标 AZ、默认镜像或开机设置', 'error');
         return;
     }
     let count = 0;
     state.previewRows.forEach(row => {
         if (az) row.target_az = az;
         if (image) row.target_image = image;
+        if (power) row.start_target = power === 'on';
         count += 1;
     });
-    renderPlan();
+    renderPlan({ keepState: true });
     toast('已应用到 ' + count + ' 台 VM', 'success');
 }
 
@@ -2609,7 +2701,8 @@ async function startMigration() {
         target_az: row.target_az,
         target_image: row.target_image,
         target_flavor: row.target_flavor || '',
-        mode: row.mode || 'full'
+        mode: row.mode || 'full',
+        start_target: row.start_target !== false
     }));
     const submitExcel = Boolean(excel) && state.previewRows.some(row => !row.server_id);
 
@@ -2676,7 +2769,8 @@ async function startMigration() {
                 target_image: row.target_image,
                 target_flavor: row.target_flavor,
                 mode: row.mode || 'full',
-                data_channel: row.data_channel || $('#data-channel').value || 'rbd'
+                data_channel: row.data_channel || $('#data-channel').value || 'rbd',
+                start_target: row.start_target !== false
             };
         });
         data.append('row_overrides', JSON.stringify(rowOverrides));
@@ -2955,6 +3049,7 @@ function renderVmTable(vms) {
         nameTd.appendChild(text('b', '', vm.name));
         if (vm.status === 'awaiting_cutover') nameTd.appendChild(text('span', 'chip', '手动切换'));
         if ((vm.volumes || []).some(v => v.mode === 'incremental')) nameTd.appendChild(text('span', 'chip', '增量'));
+        if (vm.start_target === false) nameTd.appendChild(text('span', 'chip', '迁移后不开机'));
         tr.appendChild(nameTd);
 
         tr.appendChild(text('td', '', phaseLabel(vm.phase) || vmStatusInfo(vm.status)[1]));
@@ -3034,13 +3129,6 @@ function updateBulkButtons() {
     $('#bulk-cutover').disabled = n === 0;
 }
 
-function volumeRbdCell(name, pool) {
-    const td = text('td');
-    td.appendChild(text('div', 'mono', name || '—'));
-    if (pool) td.appendChild(text('div', 'sec-note', 'pool: ' + pool));
-    return td;
-}
-
 function openVmDrawer(vm) {
     $('#dr-name').textContent = vm.name;
     const st = $('#dr-status');
@@ -3054,6 +3142,7 @@ function openVmDrawer(vm) {
     if (phaseText && phaseText !== statusText) st.appendChild(text('span', 'chip', phaseText));
     if (vm.sync_requested) st.appendChild(text('span', 'chip', '已请求同步'));
     if (vm.cutover_requested) st.appendChild(text('span', 'chip', '已请求切换'));
+    if (vm.start_target === false) st.appendChild(text('span', 'chip', '迁移后不开机'));
 
     const body = $('#dr-body');
     body.innerHTML = '';
@@ -3083,6 +3172,7 @@ function openVmDrawer(vm) {
         ['目标 AZ', vm.target_az || '—'],
         ['目标镜像', vm.target_image || '—'],
         ['目标 Flavor', vm.target_flavor || '—'],
+        ['迁移后开机', vm.start_target === false ? '否（目标机保持关机）' : '是'],
         ['开始时间', formatTime(vm.started_at)],
         ['结束时间', formatTime(vm.finished_at)],
         ['耗时', vm.duration_seconds != null ? vm.duration_seconds + ' 秒' : '—']
@@ -3178,6 +3268,19 @@ function closeDrawer() { document.body.classList.remove('drawer-open', 'prof-ope
 /* ═══════════ 作业列表 / 轮询 / 操作 ═══════════ */
 let jobListCache = [];
 
+/* 作业列表接口只回各状态台数（不回 VM/卷明细），这里统一换算成页面要的计数。 */
+function jobVmCounts(job) {
+    const counts = job.vm_status_counts || {};
+    const total = job.vm_count != null ? job.vm_count
+        : Object.keys(counts).reduce((sum, key) => sum + (counts[key] || 0), 0);
+    return {
+        total: total,
+        success: counts.success || 0,
+        failed: (counts.failed || 0) + (counts.preflight_failed || 0),
+        cutover: counts.awaiting_cutover || 0
+    };
+}
+
 async function loadJobList() {
     const tb = $('#job-table-body');
     try {
@@ -3189,9 +3292,9 @@ async function loadJobList() {
         const counts = { running: 0, completed: 0, failed: 0, warn: 0 };
         let alertHtml = '';
         jobListCache.forEach(job => {
-            const vms = job.vms || [];
-            const cutover = vms.filter(vm => vm.status === 'awaiting_cutover').length;
-            const failed = vms.filter(vm => ['failed', 'preflight_failed'].includes(vm.status)).length;
+            const c = jobVmCounts(job);
+            const cutover = c.cutover;
+            const failed = c.failed;
             if (job.status === 'running') counts.running++;
             if (job.status === 'completed') counts.completed++;
             if (job.status === 'failed' || job.status === 'cancelled') counts.failed++;
@@ -3216,8 +3319,8 @@ async function loadJobList() {
             strip.classList.add('hidden');
         }
         const failBadge = $('#nav-fail-badge');
-        const totalFailed = jobListCache.reduce((sum, job) =>
-            sum + (job.vms || []).filter(vm => ['failed', 'preflight_failed'].includes(vm.status)).length, 0);
+        const totalFailed = jobListCache.reduce(
+            (sum, job) => sum + jobVmCounts(job).failed, 0);
         if (totalFailed > 0) {
             failBadge.textContent = String(totalFailed);
             failBadge.classList.add('show');
@@ -3238,14 +3341,12 @@ async function loadJobList() {
 }
 
 function jobMatchesStatFilter(job, filter) {
-    const vms = job.vms || [];
     if (filter === 'running') return job.status === 'running';
     if (filter === 'completed') return job.status === 'completed';
     if (filter === 'failed') return job.status === 'failed' || job.status === 'cancelled';
     if (filter === 'warn') {
-        const cutover = vms.some(vm => vm.status === 'awaiting_cutover');
-        const failed = vms.some(vm => ['failed', 'preflight_failed'].includes(vm.status));
-        return job.status === 'running' && (cutover || failed);
+        const c = jobVmCounts(job);
+        return job.status === 'running' && (c.cutover > 0 || c.failed > 0);
     }
     return true;
 }
@@ -3277,17 +3378,17 @@ function renderJobTable() {
         return;
     }
     jobs.forEach(job => {
-        const vms = job.vms || [];
-        const done = vms.filter(vm => vm.status === 'success').length;
-        const failed = vms.filter(vm => ['failed', 'preflight_failed'].includes(vm.status)).length;
-        const cutover = vms.filter(vm => vm.status === 'awaiting_cutover').length;
+        const counts = jobVmCounts(job);
+        const done = counts.success;
+        const failed = counts.failed;
+        const cutover = counts.cutover;
         const tr = document.createElement('tr');
         tr.className = 'clickable';
         tr.appendChild(text('td', 'mono', job.id));
         const stTd = text('td');
         stTd.appendChild(jobStatusBadge(job.status));
         tr.appendChild(stTd);
-        tr.appendChild(text('td', 'mono', done + ' / ' + failed + ' / ' + vms.length));
+        tr.appendChild(text('td', 'mono', done + ' / ' + failed + ' / ' + counts.total));
         tr.appendChild(text('td', cutover ? '' : 'sec-note', cutover ? String(cutover) : '—'));
         if (cutover) tr.lastChild.style.cssText = 'color:var(--warn);font-weight:600';
         tr.appendChild(text('td', '', job.created_at || '—'));
@@ -3404,13 +3505,20 @@ function openJobDeleteConfirm(jobId) {
 }
 
 function openCutoverConfirm(vmName) {
+    const vm = ((state.currentJob && state.currentJob.vms) || []).find(item => item.name === vmName) || {};
+    const keepOff = vm.start_target === false;
     openConfirm({
         title: '确认开始切换：' + vmName,
         html: '<ul class="impact-list" style="list-style:none;margin:0">' +
             '<li><b>停止源 VM</b>（业务中断从此刻开始）</li>' +
             '<li>执行最后一轮增量同步（视增量大小，预计数分钟）</li>' +
             '<li>布局校验通过后 rename 换入目标卷</li>' +
-            '<li><b>启动目标 VM</b>，迁移完成</li></ul>' +
+            '<li>' + (keepOff
+                ? '<b>不启动目标 VM</b>（按配置保持关机，需手动开机）'
+                : '<b>启动目标 VM</b>，迁移完成') + '</li></ul>' +
+            (keepOff
+                ? '<p class="sec-note" style="margin:12px 0 0">该 VM 已设置「迁移后不开机」：本次只完成换卷，目标机切换后保持 SHUTOFF。</p>'
+                : '') +
             '<p class="sec-note" style="margin:12px 0 0">停机窗口只取决于末轮增量大小。</p>',
         requireInput: vmName,
         okText: '确认切换',
@@ -3420,7 +3528,9 @@ function openCutoverConfirm(vmName) {
                 const res = await fetch('/api/jobs/' + state.jobId + '/vms/' + encodeURIComponent(vmName) + '/cutover', { method: 'POST' });
                 const json = await res.json().catch(() => ({}));
                 if (!res.ok || !json.ok) throw new Error(json.error || ('HTTP ' + res.status));
-                toast('已下发切换指令：停止源机后补齐末轮增量再启动目标机', 'success');
+                toast(keepOff
+                    ? '已下发切换指令：停止源机后补齐末轮增量，目标机按配置保持关机'
+                    : '已下发切换指令：停止源机后补齐末轮增量再启动目标机', 'success');
             } catch (err) {
                 toast('下发切换指令失败：' + err.message, 'error');
             }
@@ -3446,12 +3556,22 @@ async function requestSync(vmName, button) {
 function bulkCutover() {
     const names = $$('#vm-rows .vm-ck:checked').map(ck => ck.dataset.vm);
     if (!names.length) return;
+    const vms = (state.currentJob && state.currentJob.vms) || [];
+    const keepOff = names.filter(name => {
+        const vm = vms.find(item => item.name === name);
+        return vm && vm.start_target === false;
+    });
     openConfirm({
         title: '批量切换确认',
         html: '<ul class="impact-list" style="list-style:none;margin:0">' +
             '<li>将对 <b>' + names.length + '</b> 台 VM 依次下发切换：' +
             '<span class="mono">' + escapeHtml(names.join('、')) + '</span></li>' +
-            '<li>每台都会停源机 → 末轮增量 → 换入 → 起目标机，业务依次中断。</li></ul>',
+            '<li>每台都会停源机 → 末轮增量 → 换入 → 起目标机，业务依次中断。</li>' +
+            (keepOff.length
+                ? '<li>' + keepOff.length + ' 台设置了「迁移后不开机」，换卷后目标机会被显式关机：' +
+                  '<span class="mono">' + escapeHtml(keepOff.join('、')) + '</span></li>'
+                : '') +
+            '</ul>',
         okText: '批量切换',
         onOk: () => {
             closeModal();
@@ -4016,10 +4136,11 @@ document.addEventListener('DOMContentLoaded', () => {
             : '已重新获取 ' + state.previewRows.length + ' 台 VM 的网卡信息',
             result.missing ? 'error' : 'success');
     });
-    $('#source-vm-search').addEventListener('input', event => {
+    const onSourceVmSearch = debounce(event => {
         state.sourceServerFilter = event.target.value || '';
         renderSourceServers();
-    });
+    }, 150);
+    $('#source-vm-search').addEventListener('input', onSourceVmSearch);
     $('#source-vm-search').addEventListener('keydown', event => {
         if (event.key === 'Enter') {
             event.preventDefault();
@@ -4068,7 +4189,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // 作业总览
     $('#jobs-refresh').addEventListener('click', loadJobList);
-    $('#job-search').addEventListener('input', renderJobTable);
+    $('#job-search').addEventListener('input', debounce(renderJobTable, 150));
     $('#job-state-filter').addEventListener('change', () => {
         state.statFilter = '';
         $$('.stat-card').forEach(card => card.classList.remove('active'));
@@ -4084,7 +4205,9 @@ document.addEventListener('DOMContentLoaded', () => {
             $('#jobtab-' + k).classList.toggle('hidden', k !== t.dataset.tab));
     }));
     $('#vm-state-filter').addEventListener('change', () => { if (state.currentJob) renderVmTable(state.currentJob.vms || []); });
-    $('#vm-search').addEventListener('input', () => { if (state.currentJob) renderVmTable(state.currentJob.vms || []); });
+    $('#vm-search').addEventListener('input', debounce(() => {
+        if (state.currentJob) renderVmTable(state.currentJob.vms || []);
+    }, 150));
     $('#vm-ck-all').addEventListener('change', event => {
         $$('#vm-rows .vm-ck').forEach(ck => { ck.checked = event.target.checked; });
         updateBulkButtons();

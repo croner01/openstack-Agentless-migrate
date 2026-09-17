@@ -34,6 +34,28 @@ class JobManagerTest(unittest.TestCase):
         self._tmp_dir.cleanup()
         logging.disable(logging.NOTSET)
 
+    def test_create_job_carries_start_target_flag(self):
+        """逐 VM 的「迁移后开机」必须落到 VmTask，否则收尾分支读不到。"""
+        job = self.manager.create_job(
+            [
+                MigrationRow(vm_name="vm-a", target_az="az1"),
+                MigrationRow(vm_name="vm-b", target_az="az1", start_target=False),
+            ]
+        )
+
+        self.assertTrue(job.vms[0].start_target)
+        self.assertFalse(job.vms[1].start_target)
+
+    def test_start_target_survives_persist_and_restart(self):
+        job = self.manager.create_job(
+            [MigrationRow(vm_name="vm-a", target_az="az1", start_target=False)]
+        )
+        self.manager.save_now()
+
+        restored = JobManager(state_file=self.manager._state_file).get(job.id)
+
+        self.assertFalse(restored.vms[0].start_target)
+
     def test_job_state_round_trip_survives_restart(self):
         job = self.manager.create_job(
             [MigrationRow(vm_name="vm-a", target_az="az1")]

@@ -139,7 +139,7 @@ class MigrationManager:
         # 3. create blank target data volumes and gather source layout
         logging.info("[MIGRATION] VM %s 采集源卷清单...", vm.name)
         source_entries = self.source_os.get_server_volumes_with_device(
-            source_server.id
+            source_server.id, server=source_server
         )
         ordered_source = order_system_and_data(source_entries)
         source_boot_entries = [
@@ -278,22 +278,14 @@ class MigrationManager:
         if not vm.can_start_target():
             raise RuntimeError("存在 RBD 替换失败的卷，已跳过目标 VM 开机")
         logging.info(
-            "[MIGRATION] VM %s 全部 %s 个卷替换成功，启动目标 VM...",
+            "[MIGRATION] VM %s 全部 %s 个卷替换成功",
             vm.name,
             len(vm.volumes),
         )
 
         # 8. start target only after all volumes are replaced
         self._check_stop()
-        self._set_phase(vm, VmStatus.STARTING_TARGET, "starting_target")
-        logging.info("[MIGRATION] VM %s 启动目标 server=%s", vm.name, vm.target_server_id)
-        self.target_os.start_server(vm.target_server_id)
-        self._set_phase(vm, VmStatus.VERIFYING, "verifying")
-        self.target_os.wait_server_status(
-            vm.target_server_id,
-            target="ACTIVE",
-            fail_states={"ERROR", "SUSPENDED", "PAUSED"},
-        )
+        self._start_target_if_requested(vm)
         self._set_phase(vm, VmStatus.SUCCESS, "success")
 
     # ---------- helpers ----------
@@ -314,7 +306,9 @@ class MigrationManager:
             raise RuntimeError("目标 VM 没有可用端口，源 VM 必须至少有一个固定 IP")
 
         entries = order_system_and_data(
-            self.source_os.get_server_volumes_with_device(source_server.id)
+            self.source_os.get_server_volumes_with_device(
+                source_server.id, server=source_server
+            )
         )
         boot_entries = [entry for entry in entries if entry["is_bootable"]]
         data_entries = [entry for entry in entries if not entry["is_bootable"]]
@@ -372,6 +366,7 @@ class MigrationManager:
         # create 返回后实例可能还在 BUILD（甚至短暂 404），由云侧自动开机；
         # 立刻调 os-start 只会撞 404/409，把一次成功的建机判成失败。
         self.target_os.wait_server_booted(server.id)
+        self._stop_target_if_requested(vm)
         self._set_phase(vm, VmStatus.VERIFYING, "verifying")
 
     def _resolve_source_server(self, vm: VmTask):
@@ -500,6 +495,45 @@ class MigrationManager:
             fail_states={"ERROR", "SUSPENDED", "PAUSED"},
         )
         logging.info("[MIGRATION] 实例 %s 已关机", server_id)
+
+    def _start_target_if_requested(self, vm: VmTask) -> None:
+        """RBD 路径：按每台 VM 的开关决定卷替换后是否启动目标机。
+
+        卷数据替换完成时目标机本身处于 SHUTOFF，所以关掉开关只需跳过
+        ``os-start``，不需要额外停机动作。
+        """
+        if not vm.start_target:
+            logging.info(
+                "[MIGRATION] VM %s 配置为迁移后不开机，目标 server=%s 保持关机",
+                vm.name,
+                vm.target_server_id,
+            )
+            return
+        self._set_phase(vm, VmStatus.STARTING_TARGET, "starting_target")
+        logging.info("[MIGRATION] VM %s 启动目标 server=%s", vm.name, vm.target_server_id)
+        self.target_os.start_server(vm.target_server_id)
+        self._set_phase(vm, VmStatus.VERIFYING, "verifying")
+        self.target_os.wait_server_status(
+            vm.target_server_id,
+            target="ACTIVE",
+            fail_states={"ERROR", "SUSPENDED", "PAUSED"},
+        )
+
+    def _stop_target_if_requested(self, vm: VmTask) -> None:
+        """中转机路径：Nova 建机必然先开机，开关关闭时显式停机到 SHUTOFF。"""
+        if vm.start_target:
+            return
+        logging.info(
+            "[MIGRATION] VM %s 配置为迁移后不开机，停止中转机目标 server=%s",
+            vm.name,
+            vm.target_server_id,
+        )
+        self.target_os.stop_server(vm.target_server_id)
+        self.target_os.wait_server_status(
+            vm.target_server_id,
+            target="SHUTOFF",
+            fail_states={"ERROR"},
+        )
 
     def _build_volume_tasks(
         self,

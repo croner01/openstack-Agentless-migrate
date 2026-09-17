@@ -76,6 +76,10 @@ class OpenStackUtils:
 
             resolved = self._resolve_project_id(auth_args)
             self.conn = openstack.connect(**resolved)
+        # 名字/网段在一次批量请求里会被反复问到，缓存起来避免同一次调用里
+        # 对同一个 network/subnet 重复发请求。
+        self._network_name_cache: dict[str, str] = {}
+        self._subnet_cidr_cache: dict[str, str] = {}
 
     @staticmethod
     def _probe_args_without_project_scope(
@@ -225,8 +229,18 @@ class OpenStackUtils:
     def get_volume(self, volume_id: str):
         return self.conn.block_storage.get_volume(volume_id)
 
-    def get_server_volumes_with_device(self, server_id: str) -> list[dict[str, Any]]:
-        server = self.conn.compute.get_server(server_id)
+    def get_server_volumes_with_device(
+        self,
+        server_id: str,
+        server=None,
+    ) -> list[dict[str, Any]]:
+        """源 VM 的卷清单（含挂载点）。
+
+        ``server`` 已由调用方取到时直接传入，省掉一次重复的 get_server：
+        批量摘要场景下每台 VM 多一次 Nova 请求会成倍放大耗时。
+        """
+        if server is None:
+            server = self.conn.compute.get_server(server_id)
         server_dict = server.to_dict()
         attachments = server_dict.get("attached_volumes", []) or []
         entries = []
@@ -277,22 +291,10 @@ class OpenStackUtils:
             logging.warning("[MIGRATION] 查询端口失败（尝试由 server.addresses 降级）: %s", exc)
             ports = []
         for port in ports:
-            network_name = ""
-            try:
-                network = self.conn.network.get_network(port.network_id)
-                network_name = getattr(network, "name", "") or ""
-            except Exception as exc:  # noqa: BLE001
-                logging.debug("[MIGRATION] 网络名查询失败: %s", exc)
+            network_name = self._network_name(port.network_id)
             for fixed_ip in (getattr(port, "fixed_ips", None) or []):
                 ip = (fixed_ip or {}).get("ip_address") or ""
                 subnet_id = (fixed_ip or {}).get("subnet_id") or ""
-                cidr = ""
-                if subnet_id:
-                    try:
-                        subnet = self.conn.network.get_subnet(subnet_id)
-                        cidr = getattr(subnet, "cidr", "") or ""
-                    except Exception as exc:  # noqa: BLE001
-                        logging.debug("[MIGRATION] 子网查询失败: %s", exc)
                 if ip:
                     details.append(
                         {
@@ -300,11 +302,297 @@ class OpenStackUtils:
                             "network_name": network_name,
                             "ip": ip,
                             "subnet_id": subnet_id,
-                            "cidr": cidr,
+                            "cidr": self._subnet_cidr(subnet_id),
                             "mac": getattr(port, "mac_address", "") or "",
                         }
                     )
         return details
+
+    def _network_name(self, network_id: str) -> str:
+        """网络名（带缓存）：同一批 VM 常常落在同一批网络里。"""
+        key = str(network_id or "")
+        if not key:
+            return ""
+        if key not in self._network_name_cache:
+            name = ""
+            try:
+                network = self.conn.network.get_network(key)
+                name = getattr(network, "name", "") or ""
+            except Exception as exc:  # noqa: BLE001
+                logging.debug("[MIGRATION] 网络名查询失败: %s", exc)
+            self._network_name_cache[key] = name
+        return self._network_name_cache[key]
+
+    def _subnet_cidr(self, subnet_id: str) -> str:
+        """子网网段（带缓存）。"""
+        key = str(subnet_id or "")
+        if not key:
+            return ""
+        if key not in self._subnet_cidr_cache:
+            cidr = ""
+            try:
+                subnet = self.conn.network.get_subnet(key)
+                cidr = getattr(subnet, "cidr", "") or ""
+            except Exception as exc:  # noqa: BLE001
+                logging.debug("[MIGRATION] 子网查询失败: %s", exc)
+            self._subnet_cidr_cache[key] = cidr
+        return self._subnet_cidr_cache[key]
+
+    #: 清单超过这个台数时，一次性拉全量端口/卷再按 device_id 分组更划算；
+    #: 台数少时定向查询更省，避免为了 3 台 VM 拉整个项目的资源。
+    BULK_LOOKUP_MIN_VMS = 8
+
+    def collect_vm_network_briefs(
+        self,
+        vm_names: list[str],
+        server_ids: list[str] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """批量取多台源 VM 的网卡与卷摘要，返回 ``{vm_name: {...}}``。
+
+        逐台调用会放大成 O(N × (端口 + 卷)) 次请求：50 台 VM 就是数百次串行
+        HTTP，页面表现为长时间「获取中」乃至超时失败。清单较大时这里改成
+        「整体拉一次 + 按 device_id 分组」，请求次数与 VM 台数无关。
+
+        每台 VM 的失败互相隔离：查不到的 VM 只在自己那份结果里带 ``error``。
+        """
+        pairs = self._pair_vm_and_server_ids(vm_names, server_ids)
+        if len(pairs) >= self.BULK_LOOKUP_MIN_VMS:
+            return self._collect_briefs_bulk(pairs)
+        return self._collect_briefs_per_vm(pairs)
+
+    @staticmethod
+    def _pair_vm_and_server_ids(
+        vm_names: list[str],
+        server_ids: list[str] | None,
+    ) -> list[tuple[str, str]]:
+        """把两个数组配对；长度不一致时按"没有 id"处理，避免索引错位。"""
+        ids = list(server_ids or [])
+        aligned = len(ids) == len(vm_names)
+        pairs: list[tuple[str, str]] = []
+        for index, raw_name in enumerate(vm_names):
+            vm_name = str(raw_name or "").strip()
+            server_id = str(ids[index]).strip() if aligned else ""
+            pairs.append((vm_name, server_id))
+        return pairs
+
+    def _collect_briefs_per_vm(
+        self,
+        pairs: list[tuple[str, str]],
+    ) -> dict[str, dict[str, Any]]:
+        """台数少时的定向查询：每台一次 server + 一次 ports + 一次 volumes。"""
+        result: dict[str, dict[str, Any]] = {}
+        for vm_name, server_id in pairs:
+            if not server_id:
+                server = self._find_server_by_name(vm_name)
+                if server is None:
+                    result[vm_name] = {"error": "源 VM 不存在"}
+                    continue
+                server_id = str(getattr(server, "id", "") or "")
+            else:
+                try:
+                    server = self.conn.compute.get_server(server_id)
+                except Exception as exc:  # noqa: BLE001 - 单台失败不拖垮整批
+                    logging.warning(
+                        "[MIGRATION] VM %s（%s）查询失败: %s", vm_name, server_id, exc
+                    )
+                    result[vm_name] = {"error": "源 VM 不存在"}
+                    continue
+            try:
+                ports = self.get_server_port_details(server_id)
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("[MIGRATION] VM %s 端口信息查询失败", vm_name)
+                result[vm_name] = {"error": str(exc)}
+                continue
+            result[vm_name] = {
+                "server_id": server_id,
+                "ports": ports,
+                "volumes": self._volume_briefs_for_server(server, server_id),
+            }
+        return result
+
+    def _find_server_by_name(self, vm_name: str):
+        if not vm_name:
+            return None
+        try:
+            return self.conn.compute.find_server(vm_name)
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("[MIGRATION] 按名字查 VM 失败 name=%s: %s", vm_name, exc)
+            return None
+
+    def _volume_briefs_for_server(self, server, server_id: str) -> list[dict[str, Any]]:
+        """单台的卷摘要；查不到返回空列表，不阻塞网卡信息。"""
+        try:
+            entries = self.get_server_volumes_with_device(server_id, server=server)
+        except Exception as exc:  # noqa: BLE001 - 卷清单拿不到不阻塞网络映射
+            logging.debug("[MIGRATION] 查询源 VM 卷清单失败 server=%s: %s", server_id, exc)
+            return []
+        return [
+            {
+                "volume_id": str(entry.get("volume_id") or ""),
+                "size": int(entry.get("size") or 0),
+                "device": str(entry.get("device") or ""),
+                "is_bootable": bool(entry.get("is_bootable")),
+            }
+            for entry in entries
+        ]
+
+    def _collect_briefs_bulk(
+        self,
+        pairs: list[tuple[str, str]],
+    ) -> dict[str, dict[str, Any]]:
+        """台数多时的批量查询：端口/卷/网络/子网各拉一次再本地分组。"""
+        servers = self._list_all_servers()
+        server_by_id: dict[str, Any] = {}
+        id_by_name: dict[str, str] = {}
+        if servers is not None:
+            for server in servers:
+                server_id = str(getattr(server, "id", "") or "")
+                if server_id:
+                    server_by_id[server_id] = server
+                name = str(getattr(server, "name", "") or "")
+                if name:
+                    id_by_name.setdefault(name, server_id)
+
+        ports_by_device = self._bulk_ports_by_device()
+        networks, subnets = self._bulk_network_maps()
+        volumes_by_server = self._bulk_volumes_by_server()
+
+        result: dict[str, dict[str, Any]] = {}
+        for vm_name, payload_id in pairs:
+            server_id = payload_id or id_by_name.get(vm_name, "")
+            if not server_id:
+                result[vm_name] = {"error": "源 VM 不存在"}
+                continue
+            server = server_by_id.get(server_id)
+            if servers is not None and server is None:
+                result[vm_name] = {"error": "源 VM 不存在"}
+                continue
+            if ports_by_device is None:
+                # 整体拉端口失败（例如 Neutron 策略受限）：退回定向查询。
+                try:
+                    ports = self.get_server_port_details(server_id)
+                except Exception as exc:  # noqa: BLE001
+                    logging.exception("[MIGRATION] VM %s 端口信息查询失败", vm_name)
+                    result[vm_name] = {"error": str(exc)}
+                    continue
+            else:
+                ports = []
+                for port in ports_by_device.get(server_id, []):
+                    ports.extend(self._port_briefs(port, networks, subnets))
+            if volumes_by_server is None:
+                volumes = (
+                    self._volume_briefs_for_server(server, server_id)
+                    if server is not None
+                    else []
+                )
+            else:
+                volumes = volumes_by_server.get(server_id, [])
+            result[vm_name] = {
+                "server_id": server_id,
+                "ports": ports,
+                "volumes": volumes,
+            }
+        return result
+
+    def _list_all_servers(self) -> list[Any] | None:
+        """列一次项目内所有 VM；失败返回 None（调用方据此跳过存在性校验）。"""
+        try:
+            return list(self.conn.compute.servers())
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("[MIGRATION] 整体列举 VM 失败，跳过存在性校验: %s", exc)
+            return None
+
+    def _bulk_ports_by_device(self) -> dict[str, list[Any]] | None:
+        """一次拉取项目内端口并按 device_id 分组；失败返回 None。"""
+        grouped: dict[str, list[Any]] = {}
+        try:
+            for port in self.conn.network.ports():
+                device_id = str(getattr(port, "device_id", "") or "")
+                if device_id:
+                    grouped.setdefault(device_id, []).append(port)
+        except Exception as exc:  # noqa: BLE001 - 退回逐台查询
+            logging.warning("[MIGRATION] 批量查询端口失败，改为逐台查询: %s", exc)
+            return None
+        return grouped
+
+    def _bulk_network_maps(self) -> tuple[dict[str, str], dict[str, str]]:
+        """一次拉取网络名与子网网段映射，失败时退化为空表（只少显示名字）。"""
+        networks: dict[str, str] = {}
+        subnets: dict[str, str] = {}
+        try:
+            for network in self.conn.network.networks():
+                network_id = str(getattr(network, "id", "") or "")
+                if network_id:
+                    networks[network_id] = str(getattr(network, "name", "") or "")
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("[MIGRATION] 批量查询网络失败: %s", exc)
+        try:
+            for subnet in self.conn.network.subnets():
+                subnet_id = str(getattr(subnet, "id", "") or "")
+                if subnet_id:
+                    subnets[subnet_id] = str(getattr(subnet, "cidr", "") or "")
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("[MIGRATION] 批量查询子网失败: %s", exc)
+        return networks, subnets
+
+    def _bulk_volumes_by_server(self) -> dict[str, list[dict[str, Any]]] | None:
+        """一次拉取项目内卷并按挂载的 server_id 分组；失败返回 None。"""
+        try:
+            volumes = list(self.conn.block_storage.volumes())
+        except Exception as exc:  # noqa: BLE001 - 退回逐台查询
+            logging.warning("[MIGRATION] 批量查询卷失败，改为逐台查询: %s", exc)
+            return None
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for volume in volumes:
+            volume_id = str(getattr(volume, "id", "") or "")
+            for attachment in self._volume_attachments(volume):
+                server_id = str(attachment.get("server_id") or "")
+                if not server_id:
+                    continue
+                grouped.setdefault(server_id, []).append(
+                    {
+                        "volume_id": volume_id,
+                        "size": int(getattr(volume, "size", 0) or 0),
+                        "device": str(attachment.get("device") or ""),
+                        "is_bootable": bool(getattr(volume, "is_bootable", False)),
+                    }
+                )
+        for entries in grouped.values():
+            entries.sort(key=lambda item: (item["device"] or "zz", item["volume_id"]))
+        return grouped
+
+    @staticmethod
+    def _volume_attachments(volume) -> list[dict[str, Any]]:
+        to_dict = getattr(volume, "to_dict", None)
+        data = to_dict() if callable(to_dict) else {}
+        attachments = (data or {}).get("attachments") or []
+        return [item for item in attachments if isinstance(item, dict)]
+
+    def _port_briefs(
+        self,
+        port,
+        networks: dict[str, str],
+        subnets: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        """单个端口的 fixed-IP 明细，形状与 get_server_port_details 一致。"""
+        network_id = str(getattr(port, "network_id", "") or "")
+        briefs = []
+        for fixed_ip in (getattr(port, "fixed_ips", None) or []):
+            ip = (fixed_ip or {}).get("ip_address") or ""
+            if not ip:
+                continue
+            subnet_id = str((fixed_ip or {}).get("subnet_id") or "")
+            briefs.append(
+                {
+                    "network_id": network_id,
+                    "network_name": networks.get(network_id, ""),
+                    "ip": ip,
+                    "subnet_id": subnet_id,
+                    "cidr": subnets.get(subnet_id, ""),
+                    "mac": getattr(port, "mac_address", "") or "",
+                }
+            )
+        return briefs
 
     def get_server_flavor_spec(self, server) -> dict[str, Any]:
         flavor_id = (server.to_dict().get("flavor") or {}).get("id")

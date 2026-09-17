@@ -24,7 +24,9 @@ spec:
       terminationGracePeriodSeconds: 600
       containers:
       - name: openstack-vm-migration-container
-        image: hub.ecns.io/migration/openstack-vm-migration:v1.0.5
+        # 与线上 (192.168.3.205) 实际运行的标签保持一致；改这里之前先确认
+        # 该 tag 已 push 到 registry，否则滚动更新会因拉不到镜像而失败。
+        image: hub.ecns.io/migration/openstack-vm-migration:v1.6.1
         ports:
         - containerPort: 19099
         env:

@@ -98,6 +98,25 @@ class VmTaskTest(unittest.TestCase):
         self.assertEqual(restored.delta_interval_seconds, 0.0)
         self.assertEqual(restored.delta_cutover_mode, "")
 
+    def test_start_target_defaults_to_boot(self):
+        """默认开机：不传该字段的老作业与老前端语义不变。"""
+        vm = VmTask(name="vm1", target_az="az1")
+
+        self.assertTrue(vm.start_target)
+
+    def test_start_target_survives_dict_round_trip(self):
+        vm = VmTask(name="vm1", target_az="az1", start_target=False)
+
+        restored = VmTask.from_dict(vm.to_dict())
+
+        self.assertFalse(restored.start_target)
+
+    def test_start_target_defaults_for_legacy_payload(self):
+        """历史 jobs_state.json 没有该键，必须落到"开机"而不是报错。"""
+        restored = VmTask.from_dict({"name": "vm1", "target_az": "az1"})
+
+        self.assertTrue(restored.start_target)
+
 
 class MigrationJobTest(unittest.TestCase):
     def test_job_completed_when_all_vms_terminal(self):

@@ -26,7 +26,7 @@ from ceph_utils import (
 from config import LOG_FILE, UPLOAD_FOLDER, default_vm_pass
 from env_utils import env_float, env_int, env_str
 from environment_profiles import EnvironmentProfile, EnvironmentProfileStore
-from excel_parser import parse_mode, parse_rows, parse_selected_rows
+from excel_parser import parse_mode, parse_rows, parse_selected_rows, parse_start_target
 from graceful_shutdown import ShutdownCoordinator
 from job_manager import JobManager
 from migration_manager import MigrationManager
@@ -724,6 +724,7 @@ def _serialize_vm(vm) -> dict[str, Any]:
         "target_ips": vm.target_ips,
         "target_network_ports": vm.target_network_ports,
         "cutover_requested": vm.cutover_requested,
+        "start_target": vm.start_target,
     }
 
 
@@ -735,6 +736,28 @@ def _serialize_job(job) -> dict[str, Any]:
         "cancelled": bool(getattr(job, "cancelled", False)),
         "created_at": job.created_at,
         "vms": [_serialize_vm(vm) for vm in job.vms],
+    }
+
+
+def _serialize_job_summary(job) -> dict[str, Any]:
+    """作业列表用的摘要。
+
+    列表页只用到状态与各状态台数，``_serialize_job`` 会把每个作业的
+    VM 与卷明细全部展开，历史作业一多响应体就线性膨胀。详情接口
+    （``/api/jobs/<id>``）仍返回完整数据。
+    """
+    counts: dict[str, int] = {}
+    for vm in job.vms:
+        key = vm.status.value
+        counts[key] = counts.get(key, 0) + 1
+    return {
+        "id": job.id,
+        "status": job.status.value,
+        "error": job.error,
+        "cancelled": bool(getattr(job, "cancelled", False)),
+        "created_at": job.created_at,
+        "vm_count": len(job.vms),
+        "vm_status_counts": counts,
     }
 
 
@@ -885,6 +908,8 @@ def _create_job_and_files(
         row.target_flavor = str(override.get("target_flavor") or row.target_flavor or "") or None
         if override.get("mode"):
             row.mode = parse_mode(override["mode"])
+        if "start_target" in override:
+            row.start_target = parse_start_target(override["start_target"])
         # 中转机通道用拷贝过来的目标卷启动 VM，不依赖目标镜像。
         if require_target_image and not row.target_image:
             raise ValueError(f"VM {row.vm_name} 缺少目标镜像，请在页面选择")
@@ -1162,8 +1187,11 @@ def api_job(job_id: str):
 
 @app.get("/api/jobs")
 def api_jobs():
+    """作业列表默认返回摘要；``?full=1`` 保留旧的完整展开行为。"""
     jobs = job_manager.list_jobs()
-    return jsonify({"ok": True, "jobs": [_serialize_job(job) for job in jobs]})
+    if (request.args.get("full") or "").strip() in {"1", "true", "yes"}:
+        return jsonify({"ok": True, "jobs": [_serialize_job(job) for job in jobs]})
+    return jsonify({"ok": True, "jobs": [_serialize_job_summary(job) for job in jobs]})
 
 
 @app.post("/api/jobs/<job_id>/cancel")
@@ -1487,24 +1515,6 @@ def api_source_vms():
         return jsonify({"ok": False, "error": str(exc)}), 400
 
 
-def _source_volume_brief(source_os, server_id: str) -> list[dict[str, Any]]:
-    """源 VM 的卷清单（供页面逐卷选目标卷类型）。查不到时返回空列表。"""
-    try:
-        entries = source_os.get_server_volumes_with_device(server_id)
-    except Exception as exc:  # noqa: BLE001 - 卷清单拿不到不阻塞网络映射
-        logging.debug("[MIGRATION] 查询源 VM 卷清单失败 server=%s: %s", server_id, exc)
-        return []
-    return [
-        {
-            "volume_id": str(entry.get("volume_id") or ""),
-            "size": int(entry.get("size") or 0),
-            "device": str(entry.get("device") or ""),
-            "is_bootable": bool(entry.get("is_bootable")),
-        }
-        for entry in entries
-    ]
-
-
 @app.post("/api/source-vm-networks")
 def api_source_vm_networks():
     """Return source fixed IP / subnet info per VM for the checklist preview."""
@@ -1520,32 +1530,12 @@ def api_source_vm_networks():
         if not isinstance(server_ids, list):
             raise ValueError("server_ids 必须是数组")
         source_os = OpenStackUtils(auth_args)
-        result = {}
-        for index, vm_name in enumerate(vm_names):
-            server_id = (
-                str(server_ids[index]).strip()
-                if len(server_ids) == len(vm_names)
-                else ""
-            )
-            server = (
-                source_os.get_server_detail(server_id)
-                if server_id
-                else source_os.get_server_by_name(str(vm_name))
-            )
-            if not server:
-                result[vm_name] = {"error": "源 VM 不存在"}
-                continue
-            try:
-                ports = source_os.get_server_port_details(server.id)
-            except Exception as exc:  # noqa: BLE001
-                logging.exception("[MIGRATION] VM %s 端口信息查询失败", vm_name)
-                result[vm_name] = {"error": str(exc)}
-                continue
-            result[vm_name] = {
-                "server_id": server.id,
-                "ports": ports,
-                "volumes": _source_volume_brief(source_os, server.id),
-            }
+        # 逐台查询会放大成 O(N × (端口 + 卷)) 次串行请求，清单一大就超时；
+        # 交给 OpenStackUtils 做批量拉取 + 分组，请求次数与 VM 台数无关。
+        result = source_os.collect_vm_network_briefs(
+            [str(name) for name in vm_names],
+            [str(item) for item in server_ids],
+        )
         try:
             source_volume_types = source_os.list_volume_types()
         except Exception:  # noqa: BLE001 - 卷类型拿不到不影响网络映射

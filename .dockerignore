@@ -1,0 +1,43 @@
+# 构建上下文瘦身 + 防止运行时状态进镜像。
+#
+# 关键：Dockerfile 是 COPY . .，而 uploads/ 下有 relay-master-key /
+# relay-secret（解密租户密码与节点 SSH 口令的主密钥）以及作业 JSON。
+# 不加这一层，任何一次本地 docker build 都会把生产密钥烧进镜像层，
+# 推仓库后无法回收。runtime 目录由 Dockerfile 里的 RUN mkdir 重建。
+
+# ── 版本控制 / 工具链元数据 ──
+.git
+.gitignore
+.dockerignore
+.github
+
+# ── Python 字节码与打包产物 ──
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# ── 运行时状态：凭据、主密钥、台账/租约、上传文件、日志 ──
+uploads/
+*.log
+
+# ── 只用于开发/交付，镜像内不需要 ──
+tests/
+docs/
+deploy/
+README.md
+AGENTS.md
+
+# ── 编辑器 / 系统 ──
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# ── 本地构建产物 ──
+*.tar
+*.tar.gz

@@ -158,6 +158,9 @@ class VmTask:
     delta_threshold_bytes: int = 0
     delta_interval_seconds: float = 0.0
     delta_cutover_mode: str = ""
+    #: 迁移收尾后是否把目标机开起来。关掉时数据照常迁移、状态照常成功，
+    #: 但目标机保持 SHUTOFF，等人工开机（默认开机，与历史行为一致）。
+    start_target: bool = True
 
     def can_start_target(self) -> bool:
         return bool(self.volumes) and all(
@@ -228,6 +231,7 @@ class VmTask:
             "delta_threshold_bytes": self.delta_threshold_bytes,
             "delta_interval_seconds": self.delta_interval_seconds,
             "delta_cutover_mode": self.delta_cutover_mode,
+            "start_target": self.start_target,
         }
 
     @classmethod
@@ -266,6 +270,7 @@ class VmTask:
             delta_threshold_bytes=int(data.get("delta_threshold_bytes") or 0),
             delta_interval_seconds=float(data.get("delta_interval_seconds") or 0.0),
             delta_cutover_mode=str(data.get("delta_cutover_mode") or ""),
+            start_target=bool(data.get("start_target", True)),
         )
 
 

@@ -47,6 +47,66 @@ class StopSignalTest(unittest.TestCase):
         self.assertIn("停机信号中断", vm.volumes[0].error)
 
 
+class TargetPowerStateTest(unittest.TestCase):
+    """「迁移后不开机」：RBD 路径跳过 os-start，中转机路径建机后再关掉。"""
+
+    def setUp(self):
+        self.source_os = mock.Mock()
+        self.target_os = mock.Mock()
+        self.manager = MigrationManager(
+            self.source_os, self.target_os, ceph_utils=mock.Mock()
+        )
+
+    @staticmethod
+    def _vm(start_target: bool) -> VmTask:
+        vm = VmTask(name="vm1", target_az="az1", start_target=start_target)
+        vm.target_server_id = "srv-tgt"
+        vm.volumes = [
+            VolumeTask(
+                source_volume_id="s1",
+                source_rbd_name="volume-s1",
+                target_volume_id="t1",
+                target_rbd_name="volume-t1",
+                status=VolumeStatus.SUCCESS,
+            )
+        ]
+        return vm
+
+    def test_rbd_path_starts_target_by_default(self):
+        vm = self._vm(start_target=True)
+
+        self.manager._start_target_if_requested(vm)
+
+        self.target_os.start_server.assert_called_once_with("srv-tgt")
+        self.assertEqual(vm.status, VmStatus.VERIFYING)
+
+    def test_rbd_path_skips_start_when_flag_off(self):
+        vm = self._vm(start_target=False)
+
+        self.manager._start_target_if_requested(vm)
+
+        self.target_os.start_server.assert_not_called()
+        self.target_os.wait_server_status.assert_not_called()
+
+    def test_relay_path_keeps_target_running_by_default(self):
+        vm = self._vm(start_target=True)
+
+        self.manager._stop_target_if_requested(vm)
+
+        self.target_os.stop_server.assert_not_called()
+
+    def test_relay_path_stops_target_when_flag_off(self):
+        """中转机由 Nova 建机必然先开机，关掉开关要显式停机并等 SHUTOFF。"""
+        vm = self._vm(start_target=False)
+
+        self.manager._stop_target_if_requested(vm)
+
+        self.target_os.stop_server.assert_called_once_with("srv-tgt")
+        self.target_os.wait_server_status.assert_called_once_with(
+            "srv-tgt", target="SHUTOFF", fail_states={"ERROR"}
+        )
+
+
 class CopyStallSlotReleaseTest(unittest.TestCase):
     """拷贝停滞必须释放名额并把卷标失败，否则后续任务永远排在队里。"""
 

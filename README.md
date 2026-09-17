@@ -5,12 +5,27 @@
 在目标 OpenStack 云创建 BFV（Boot From Volume）VM：
 
 1. 直接从源项目加载 VM 列表勾选，或通过高级入口解析 Excel
-   （`vm_name`、`target_az` 必填；`target_image`、`target_flavor` 可选）；
+   （`vm_name`、`target_az` 必填；`target_image`、`target_flavor`、
+   `start_target` 可选）；
 2. 创建目标端口与数据卷，使用指定目标镜像创建 BFV VM；
 3. 依次停止目标 VM 与源 VM；
 4. 从源 Ceph 集群逐卷导出并导入到目标 BFV VM 的实际 RBD 卷；
-5. 所有卷替换成功后才启动目标 VM；单个 VM 失败不会影响批次内其他 VM；
+5. 所有卷替换成功后按每台 VM 的「迁移后开机」开关决定是否启动目标 VM；
+   单个 VM 失败不会影响批次内其他 VM；
 6. 失败时不自动删除目标资源，任务状态保留已创建资源与错误原因。
+
+「迁移后开机」逐 VM 生效（规划表里的复选框，或 Excel 的 `start_target` 列，
+也支持工具条批量设置），**默认勾选 = 迁移完成后启动目标机**，与历史行为一致：
+
+- `开机`（默认）：卷替换完成 → `os-start` → 等 `ACTIVE`；
+- `不开机`：卷替换完成后目标机保持 `SHUTOFF`，需要时再手动开机。
+  - RBD 直连通道的目标机在换卷期间本来就是关机状态，勾掉开关只是跳过
+    `os-start`，不会多一次开关机动作；
+  - 中转机通道由 Nova 建机时必然先开机（`create` 后即 `ACTIVE`），关掉
+    开关会在建机完成后显式 `os-stop` 并等 `SHUTOFF`，因此目标机的系统盘
+    会被真实引导一次。
+  - 手动切换模式下「开始切换」仍然完成停源 → 末轮增量 → 换卷，但换卷后
+    按该开关决定是否起机。
 
 迁移模式为两个**相互独立**的功能项，逐 VM 选择：
 
@@ -234,13 +249,19 @@ limit=16384MiB 已等待 322s 占用中: ren-跳板机/volume-xxx(1383s)
 
 - `POST /api/migrate`：提交 OpenStack 凭据、Ceph conf、并发、单卷限速与
   每台 VM 的网卡规划；VM 清单支持 `selected_rows` JSON（列表勾选）或
-  `excel_file`（高级导入），返回 `job_id`；
-- `GET /api/jobs/<job_id>`：任务状态；
+  `excel_file`（高级导入），逐台 VM 的覆盖项（`row_overrides`）里可带
+  `start_target` 控制迁移后是否开机（缺省 true），返回 `job_id`；
+- `GET /api/jobs/<job_id>`：任务状态（完整 VM/卷明细）；
+- `GET /api/jobs`：作业列表，只返回摘要（`vm_count` + `vm_status_counts`），
+  避免历史作业一多列表响应体线性膨胀；需要完整展开时用 `?full=1`；
 - `POST /api/preview`：上传 Excel 返回行预览；
 - `POST /api/projects`：使用当前凭据列出账号可访问项目（name + domain + UUID）；
 - `POST /api/diag`：目标环境诊断（连接作用域、卷/计算接口探测、可手执行的
   openstack 命令）；
 - `POST /api/source-vms`：列出当前源项目下 VM（search/limit/marker）；
+- `POST /api/source-vm-networks`：批量返回勾选 VM 的网卡/卷摘要。清单较大时
+  走「整体拉取一次再按 `device_id` 分组」，请求次数与 VM 台数无关；台数少时
+  退回逐台定向查询，单台失败只影响该台；
 - `POST /api/catalog`：列出目标云 images/flavors/networks/subnets/availability_zones；
 - `GET /healthz`：健康检查。
 
@@ -258,7 +279,10 @@ python repro_create.py --auth-url <目标keystone> --username admin \
 其中 `--az` 只作用于 BFV 建机（Nova），数据卷固定建在 Cinder 的 `default-az`。
 
 服务代码打包在镜像里（Deployment `openstack-vm-migration-deployment` 只挂
-`/app/uploads`），更新后需要重新构建镜像、推送并滚动重启。镜像同时支持
+`/app/uploads`），更新后需要重新构建镜像、推送并滚动重启。构建走
+`.dockerignore` 裁剪上下文：`uploads/`（含 `relay-master-key` /
+`relay-secret` 主密钥与租户凭据密文）、`__pycache__/`、`tests/`、`docs/`、
+`deploy/` 都不会进镜像，请勿删除该文件。镜像同时支持
 **amd64 与 arm64**，两种架构共用一个 tag（多架构 manifest），ARM 集群与
 x86 集群可以拉同一个 tag：
 
@@ -268,7 +292,7 @@ docker buildx create --name multiarch --driver docker-container --use
 docker buildx build --platform linux/amd64,linux/arm64 \
   --build-arg CEPH_DEB_REPO=https://mirrors.tuna.tsinghua.edu.cn/ceph/debian-nautilus \
   --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
-  -t hub.ecns.io/migration/openstack-vm-migration:v1.4.7 --push .
+  -t hub.ecns.io/migration/openstack-vm-migration:v1.6.1 --push .
 
 # 方式二：默认 docker 驱动不支持多平台导出（报 Multi-platform build is not
 # supported for the docker driver），改成逐平台推送再用 manifest 合并；自签
@@ -278,16 +302,16 @@ for p in amd64 arm64; do
   docker buildx build --platform linux/$p \
     --build-arg CEPH_DEB_REPO=https://mirrors.tuna.tsinghua.edu.cn/ceph/debian-nautilus \
     --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
-    -t $R:v1.4.7-$p --push .
+    -t $R:v1.6.1-$p --push .
 done
-docker manifest create --insecure --amend $R:v1.4.7 $R:v1.4.7-amd64 $R:v1.4.7-arm64
-docker manifest push --insecure $R:v1.4.7
+docker manifest create --insecure --amend $R:v1.6.1 $R:v1.6.1-amd64 $R:v1.6.1-arm64
+docker manifest push --insecure $R:v1.6.1
 
 # 只在本机构建（单架构）时仍可用 docker build
-docker build -t hub.ecns.io/migration/openstack-vm-migration:v1.4.7 .
+docker build -t hub.ecns.io/migration/openstack-vm-migration:v1.6.1 .
 
 kubectl -n migrate set image deployment/openstack-vm-migration-deployment \
-  openstack-vm-migration-container=hub.ecns.io/migration/openstack-vm-migration:v1.4.7
+  openstack-vm-migration-container=hub.ecns.io/migration/openstack-vm-migration:v1.6.1
 kubectl -n migrate rollout status deployment/openstack-vm-migration-deployment --timeout=180s
 ```
 
@@ -316,7 +340,7 @@ build arg，默认分别是官方源 `download.ceph.com` 与 `pypi.org`）：
 docker build \
   --build-arg CEPH_DEB_REPO=https://mirrors.tuna.tsinghua.edu.cn/ceph/debian-nautilus \
   --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
-  -t hub.ecns.io/migration/openstack-vm-migration:v1.4.7 .
+  -t hub.ecns.io/migration/openstack-vm-migration:v1.6.1 .
 ```
 
 发布后确认客户端版本（应为 `ceph version 14.2.22 ... nautilus`），两个架构
@@ -325,9 +349,9 @@ docker build \
 ```bash
 kubectl -n migrate exec deploy/openstack-vm-migration-deployment -- rbd --version
 docker run --rm --platform linux/arm64 \
-  hub.ecns.io/migration/openstack-vm-migration:v1.4.7 rbd --version
+  hub.ecns.io/migration/openstack-vm-migration:v1.6.1 rbd --version
 docker manifest inspect --insecure \
-  hub.ecns.io/migration/openstack-vm-migration:v1.4.7 | grep architecture
+  hub.ecns.io/migration/openstack-vm-migration:v1.6.1 | grep architecture
 ```
 
 镜像内不含 `tests/`、`docs/` 与 `uploads/`（见 `.dockerignore`），`uploads/`
