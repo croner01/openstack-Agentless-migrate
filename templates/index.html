@@ -808,7 +808,7 @@ body.wizard-view .toast-box { bottom: 92px; }
                                     <div><label class="form-label">心跳超时 (秒)</label><input class="fld mono" type="number" min="1" name="relay_heartbeat_timeout" value="30"></div>
                                     <div><label class="form-label">拷贝重试次数</label><input class="fld mono" type="number" min="0" max="10" name="relay_copy_retries" value="3"></div>
                                     <div><label class="form-label">停滞判死 (秒)</label><input class="fld mono" type="number" min="30" name="relay_stall_timeout" value="300"></div>
-                                    <div><label class="form-label" title="打快照与快照派生卷的等待上限。0 = 按卷大小自动放宽（商业存储上这一步常是存储侧全量拷贝）">卷/快照就绪超时 (秒)</label><input class="fld mono" type="number" min="0" name="volume_ready_timeout" value="0" placeholder="0 = 按卷大小自动"></div>
+                                    <div><label class="form-label" title="打快照与快照派生卷的等待上限。0 = 不限制等待（默认，每 60s 打点记录进度）；商业存储上这一步常是存储侧全量拷贝，大卷几小时都正常，强行判死会让平台在云上还在建盘时就把任务标失败。填正数时按卷大小自适应放宽。">卷/快照就绪超时 (秒)</label><input class="fld mono" type="number" min="0" name="volume_ready_timeout" value="0" placeholder="0 = 不限制（默认）"></div>
                                     <div><label class="form-label" title="池里没有空闲中转机时的等待上限">等待空闲槽位 (秒)</label><input class="fld mono" type="number" min="0" name="relay_slot_wait_seconds" value="1800"></div>
                                     <div><label class="form-label">空洞模式</label>
                                         <select class="sel" name="relay_hole_mode" style="width:100%">
@@ -1037,7 +1037,7 @@ body.wizard-view .toast-box { bottom: 92px; }
         </div>
         <div class="modal-body" id="cm-body"></div>
         <div class="modal-foot">
-            <button type="button" class="btn" onclick="closeModal()">取消</button>
+            <button type="button" class="btn" id="cm-cancel" onclick="confirmCancel()">取消</button>
             <button type="button" class="btn btn-primary" id="cm-ok">确认</button>
         </div>
     </div>
@@ -1093,6 +1093,7 @@ function toast(message, type) {
 
 /* 通用确认弹窗：info 仅展示说明；requireInput 需要输入名称确认 */
 let cmHandler = null;
+let cmCancelHandler = null;
 function openConfirm(opt) {
     $('#cm-title').textContent = opt.title || '确认';
     $('#cm-body').innerHTML = (opt.html || '') + (opt.requireInput ?
@@ -1102,6 +1103,10 @@ function openConfirm(opt) {
     okBtn.textContent = opt.okText || '确认';
     okBtn.disabled = false;
     cmHandler = opt.onOk || null;
+    // 「取消」也可以有语义：例如「回向导继续编辑」而不是单纯关掉弹窗。
+    const cancelBtn = $('#cm-cancel');
+    cancelBtn.textContent = opt.cancelText || '取消';
+    cmCancelHandler = opt.onCancel || null;
     if (opt.requireInput) {
         okBtn.disabled = true;
         $('#cm-input').addEventListener('input', ev => {
@@ -1111,7 +1116,12 @@ function openConfirm(opt) {
     document.body.classList.add('modal-open');
 }
 function confirmOk() { if (cmHandler) cmHandler(); }
-function closeModal() { document.body.classList.remove('modal-open'); cmHandler = null; }
+function confirmCancel() { if (cmCancelHandler) cmCancelHandler(); else closeModal(); }
+function closeModal() {
+    document.body.classList.remove('modal-open');
+    cmHandler = null;
+    cmCancelHandler = null;
+}
 
 /* ═══════════ API 令牌（沿用原机制）═══════════ */
 const API_TOKEN_KEY = 'migration-api-token';
@@ -1181,6 +1191,11 @@ const state = {
     currentJob: null,
     wizStep: 1,
     lastSubmit: null,
+    //: 向导里是否有"用户编辑过但还没提交"的内容。只是回放过作业参数、或纯粹
+    //: 浏览清单都不算，避免点「新建迁移」时对着没动过的旧内容弹确认框。
+    wizardDirty: false,
+    //: 当前向导内容来自哪个作业的参数回放（用弹窗里说明来源）。
+    wizardOriginJobId: null,
     catalogLoaded: false,
     profiles: [],
     editingProfileId: '',
@@ -1444,6 +1459,8 @@ function applyWizardForm(form) {
 /* 完全清空向导：状态、表单、动态列表恢复初始态 */
 function resetWizard() {
     state.scheme = 'rbd_full';
+    state.wizardDirty = false;
+    state.wizardOriginJobId = null;
     setPreviewRows([]);
     state.sourceServers = [];
     state.sourceServersNextMarker = null;
@@ -1510,18 +1527,32 @@ function goWizardView() {
     else location.hash = '#/wizard';
 }
 
-/* 侧栏「新建迁移」/ 作业总览「＋ 新建迁移」：一定给一份干净的向导 */
+/* 侧栏「新建迁移」/ 作业总览「＋ 新建迁移」：默认直接给一份干净的向导 */
 function startNewMigration() {
     const start = () => { resetWizard(); goWizardView(); };
-    if (!state.previewRows.length) { start(); return; }
+    const rows = state.previewRows.length;
+    // 没编辑过（只是回放过作业参数、或浏览过清单）就直接清掉重建：这些内容
+    // 本来就不需要保存，不该拿"未提交"再确认一次。
+    if (!rows || !state.wizardDirty) { start(); return; }
+    const origin = state.wizardOriginJobId
+        ? '<li>这份配置来自作业 <b class="mono">' + escapeHtml(state.wizardOriginJobId) +
+          '</b> 的参数回放；已提交的作业本身不受影响。</li>'
+        : '<li>已提交的作业不受影响；需要改参数重跑时，到作业详情点「调整参数重新提交」。</li>';
     openConfirm({
         title: '开始新的迁移？',
         html: '<ul class="impact-list" style="list-style:none;margin:0">' +
-            '<li>当前向导里有 <b>' + state.previewRows.length + ' 台</b>尚未提交的 VM 配置，将被清空。</li>' +
-            '<li>已提交的作业不受影响；需要改参数重跑时，到作业详情点「调整参数重新提交」。</li></ul>',
+            '<li>向导里有 <b>' + rows + ' 台</b> VM 的配置已编辑但还没提交，继续新建会清空它们。</li>' +
+            '<li>想先提交它们：点「回向导继续编辑」，回到向导就能直接提交或改参数。</li>' +
+            origin + '</ul>',
         okText: '清空并新建',
-        onOk: () => { closeModal(); start(); }
+        onOk: () => { closeModal(); start(); },
+        cancelText: '回向导继续编辑',
+        onCancel: () => { closeModal(); goWizardView(); }
     });
+}
+
+function markWizardDirty() {
+    state.wizardDirty = true;
 }
 
 function captureSubmitSnapshot(jobId) {
@@ -1539,10 +1570,32 @@ function captureSubmitSnapshot(jobId) {
     };
 }
 
+/* 取某个作业的提交参数：内存快照优先，其次服务器落盘的那份 */
+async function fetchSubmitSnapshot(jobId) {
+    if (state.lastSubmit && state.lastSubmit.jobId === jobId) return state.lastSubmit;
+    if (!jobId) return null;
+    try {
+        const res = await fetch('/api/jobs/' + encodeURIComponent(jobId) + '/params');
+        const json = await res.json();
+        if (!json.ok) {
+            toast(json.error || '取回提交参数失败', 'error');
+            return null;
+        }
+        const snapshot = json.params || {};
+        snapshot.jobId = jobId;
+        return snapshot;
+    } catch (err) {
+        toast('取回提交参数失败：' + err.message, 'error');
+        return null;
+    }
+}
+
 /* 载入上次提交的作业参数：可改后重新提交 */
-function restoreLastSubmit() {
-    const snapshot = state.lastSubmit;
-    if (!snapshot) { toast('本次会话没有可复用的提交参数', 'error'); return; }
+async function restoreLastSubmit() {
+    const job = state.currentJob;
+    const snapshot = await fetchSubmitSnapshot(job && job.id);
+    if (!snapshot) return;
+    const fromServer = !(state.lastSubmit && state.lastSubmit.jobId === (job && job.id));
     resetWizard();
     applyScheme(snapshot.scheme || 'rbd_full');
     applyWizardForm(snapshot.form);
@@ -1560,7 +1613,15 @@ function restoreLastSubmit() {
     goWizardView();
     renderPlan();
     wizGo(4);
-    toast('已载入上次提交的参数（沿用上次验证的目录），修改后可直接重新提交', 'success');
+    // 回放出来的参数是"起点"而不是用户编辑：没有真正改动前不该吓唬用户。
+    state.wizardDirty = false;
+    state.wizardOriginJobId = job ? job.id : null;
+    toast(
+        fromServer
+            ? '已载入该作业保存的提交参数（沿用上次验证的目录）；口令已从服务器快照中剔除，提交前请补填'
+            : '已载入上次提交的参数（沿用上次验证的目录），修改后可直接重新提交',
+        'success'
+    );
 }
 
 /* ═══════════ 环境档案：向导下拉 + 档案页 ═══════════ */
@@ -2054,6 +2115,7 @@ async function bulkToggleSourceServers(checked) {
 }
 
 function removePreviewRowByServerId(serverId) {
+    markWizardDirty();
     setPreviewRows(state.previewRows.filter(
         row => !(row._picklist && row.server_id === serverId)
     ));
@@ -2081,6 +2143,7 @@ async function addSelectedSourceServer(server, options) {
         source_image: server.image_name,
         source_az: server.availability_zone
     };
+    markWizardDirty();
     state.previewRows.push(row);
     state.previewRowIndex.set(row.server_id, row);
     if (!deferNetworks) {
@@ -2147,6 +2210,7 @@ async function parseExcel() {
             source_image: null,
             source_az: null
         }));
+        markWizardDirty();
         setPreviewRows(listRows.concat(excelRows));
         await fillSourceNetworksForRows();
         renderPlan();
@@ -2711,6 +2775,10 @@ async function startMigration() {
 
     const doSubmit = async () => {
         const data = new FormData();
+        // 提交参数快照随请求一起落盘：作业详情页刷新/换浏览器后仍能
+        // 「调整参数重新提交」。口令由后端剔除，不会写到磁盘上。
+        const snapshot = captureSubmitSnapshot(null);
+        data.append('submit_snapshot', JSON.stringify(snapshot));
         ['source', 'target'].forEach(prefix => {
             Object.entries(readAuth(prefix)).forEach(([key, value]) => data.append(prefix + '_' + key, value));
         });
@@ -2789,7 +2857,8 @@ async function startMigration() {
             const json = await res.json();
             if (!json.ok) throw new Error(json.error || '启动失败');
             toast('任务已提交：' + json.job_id, 'success');
-            state.lastSubmit = captureSubmitSnapshot(json.job_id);
+            snapshot.jobId = json.job_id;
+            state.lastSubmit = snapshot;
             resetWizard();
             nav('job', json.job_id);
         } catch (err) {
@@ -2983,8 +3052,9 @@ function renderJob(job) {
         'VM ' + vms.length + ' 台 · 创建于 ' + (job.created_at || '—');
     const resubmitBtn = $('#job-resubmit-btn');
     if (resubmitBtn) {
-        resubmitBtn.style.display =
-            (state.lastSubmit && state.lastSubmit.jobId === job.id) ? '' : 'none';
+        // 只要作业还在就保留入口：参数优先用浏览器内存里的快照，没有就回
+        // 服务器取作业提交时保存的那份（刷新/换浏览器后按钮不会再消失）。
+        resubmitBtn.style.display = '';
     }
 
     renderLifecycle(job);
@@ -4128,7 +4198,10 @@ document.addEventListener('DOMContentLoaded', () => {
     window.addEventListener('hashchange', route);
 
     // 方案卡
-    $$('.scheme-card').forEach(card => card.addEventListener('click', () => applyScheme(card.dataset.scheme)));
+    $$('.scheme-card').forEach(card => card.addEventListener('click', () => {
+        markWizardDirty();
+        applyScheme(card.dataset.scheme);
+    }));
 
     // 下拉被裁掉的长名字，选中后写进 title，悬停即可看全
     document.addEventListener('change', event => syncSelectTitle(event.target));
@@ -4209,6 +4282,15 @@ document.addEventListener('DOMContentLoaded', () => {
             : '源网络信息已刷新', result.missing ? 'error' : 'success');
     });
     $('#start-migration').addEventListener('click', startMigration);
+    // 向导里的填写/勾选都算"编辑过"。清单搜索框只是过滤，不算。
+    const wizardView = $('#view-wizard');
+    if (wizardView) {
+        ['input', 'change'].forEach(evt => wizardView.addEventListener(evt, event => {
+            const target = event.target;
+            if (target && target.id === 'vm-search') return;
+            markWizardDirty();
+        }, true));
+    }
 
     // 档案页
     $('#prof-new').addEventListener('click', () => openProfDrawer(null));

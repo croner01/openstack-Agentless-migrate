@@ -85,7 +85,10 @@ class RelayVolumeMover:
         chunk_size: int = DEFAULT_CHUNK,
         rate_limit_bytes_per_sec: float = 0.0,
         ready_timeout: float = 180.0,
-        result_timeout: float = 6 * 3600.0,
+        #: 单卷拷贝的墙钟上限（秒），0 = 不限时。真正防卡死的是 stall_timeout 的
+    #: 字节进度看门狗；这个上限只是兜底，1TiB 盘在 50MB/s 下要 5.8 小时，
+    #: 按 6 小时判死会把"只是慢"的拷贝判失败。
+    result_timeout: float = 0.0,
         poll_interval: float = 1.0,
         sleeper: Callable[[float], None] = time.sleep,
         copy_retries: int = 3,
@@ -121,6 +124,15 @@ class RelayVolumeMover:
         self.stall_timeout = stall_timeout
         self.slot_wait_timeout = slot_wait_timeout
         self.clock = clock
+
+    def _bounded_timeout(self) -> float:
+        """给没有进度看门狗的子步骤用的兜底上限。
+
+        ``result_timeout <= 0``（不限时）只针对带字节进度检测的拷贝等待；
+        校验、等待 agent 监听这类步骤一旦卡住没有任何信号，必须有墙钟兜底。
+        """
+        timeout = float(self.result_timeout or 0.0)
+        return timeout if timeout > 0 else 6 * 3600.0
 
     def record(self, volume: Any) -> Any:
         from relay_ledger import VolumeTaskRecord
@@ -186,6 +198,15 @@ class RelayVolumeMover:
             record.vm_id = vm_name
         copy = None
         self._save(record, phase="snapshotting")
+
+        def touch(_waited: float = 0.0) -> None:
+            """等待期间刷新台账时间戳。
+
+            这一步现在默认不限时，一块盘准备几小时很正常；对账清理只看
+            ``updated_at``，不刷新的话准备到一半的派生卷会被当成残留删掉。
+            """
+            self._save(record, phase=record.phase)
+
         try:
             copy = self.lifecycle.create_source_copy(
                 volume_id=volume.source_volume_id,
@@ -193,6 +214,7 @@ class RelayVolumeMover:
                 index=index,
                 size=int(volume.size or 0),
                 volume_type=source_volume_type or self.source_volume_type or None,
+                on_wait=touch,
             )
             self._save(
                 record,
@@ -204,6 +226,7 @@ class RelayVolumeMover:
                 name=f"{vm_name}-vol-{index}",
                 size=int(volume.size or 0),
                 volume_type=target_volume_type or self.target_volume_type or None,
+                on_wait=touch,
             )
             self._save(
                 record, phase="attaching_target", target_volume_id=target_volume_id
@@ -500,9 +523,9 @@ class RelayVolumeMover:
     def _wait_for_results(self, *, record: Any, task_ids: tuple[str, str]) -> None:
         """等两端结果，同时盯住字节进度。
 
-        只看 result_timeout（默认 6 小时）不够：数据面真卡住时页面和平台都会
-        一直显示"拷贝中"。这里要求 copied_bytes 每 stall_timeout 秒至少涨一次，
-        任一端出结果（失败也算）立即收尾。
+        墙钟上限（``result_timeout``，0 = 不限时）只是兜底：真正判断"卡住"靠
+        字节进度——要求 copied_bytes 每 stall_timeout 秒至少涨一次，否则页面和
+        平台都会一直显示"拷贝中"。任一端出结果（失败也算）立即收尾。
         """
 
         def finished() -> bool:
@@ -513,15 +536,19 @@ class RelayVolumeMover:
                     return True
             return all(self.state.task_result(task_id) is not None for task_id in task_ids)
 
-        deadline = self.clock() + self.result_timeout
+        timeout = float(self.result_timeout or 0.0)
+        deadline = self.clock() + timeout if timeout > 0 else None
         last_bytes = int(getattr(record, "copied_bytes", 0) or 0)
         last_change = self.clock()
         while True:
             if finished():
                 return
             now = self.clock()
-            if now >= deadline:
-                raise TimeoutError("块拷贝任务超时未返回结果")
+            if deadline is not None and now >= deadline:
+                raise TimeoutError(
+                    f"块拷贝任务超过 {timeout:.0f}s 未返回结果"
+                    "（可用 MIGRATION_RELAY_RESULT_TIMEOUT 调大或设为 0 不限时）"
+                )
             current = int(getattr(record, "copied_bytes", 0) or 0)
             if current != last_bytes:
                 last_bytes = current
@@ -640,7 +667,7 @@ class RelayVolumeMover:
         wait_for(
             lambda: self.state.task_result(source_task_id) is not None
             and self.state.task_result(target_task_id) is not None,
-            timeout=self.result_timeout,
+            timeout=self._bounded_timeout(),
             interval=self.poll_interval,
             sleeper=self.sleeper,
             message="完成校验任务超时未返回结果",

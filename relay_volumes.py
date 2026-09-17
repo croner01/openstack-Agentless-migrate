@@ -6,13 +6,30 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
+
+from env_utils import env_float
 
 from openstack_utils import (
     derive_ready_timeout,
     snapshot_ready_timeout_default,
     volume_ready_timeout_default,
 )
+
+#: 挂载 / 卸载卷的等待上限（秒）。与"建卷"不同：Cinder 卡在 attaching 不会自己
+#: 往前走（通常意味着宿主机连不上存储后端），保留一个可预期上限、超时后走
+#: 卸载回滚，比无限等待更安全。商业存储上需要放宽时用
+#: MIGRATION_ATTACH_READY_TIMEOUT 覆盖，0 = 不限时。
+ATTACH_READY_TIMEOUT_SECONDS = 1800.0
+
+
+def attach_ready_timeout() -> float:
+    """挂载 / 卸载卷的等待上限，MIGRATION_ATTACH_READY_TIMEOUT 可覆盖。"""
+    return env_float(
+        "MIGRATION_ATTACH_READY_TIMEOUT",
+        ATTACH_READY_TIMEOUT_SECONDS,
+        minimum=0.0,
+    )
 
 
 @dataclass
@@ -39,7 +56,11 @@ class VolumeLifecycle:
 
     ``ready_timeout`` / ``snapshot_timeout`` 是作业级覆盖（秒）：给了就原样用，
     留空则按环境变量基线 + 卷容量自适应。商业存储上「打快照 → 派生卷」多半是
-    存储侧全量拷贝，耗时与卷大小成正比，固定阈值会把只是慢的大卷判成失败。
+    存储侧全量拷贝，耗时与卷大小成正比；两者默认都是 0 = 不限时（只按 60s
+    打点），避免云上还在建盘、平台已经判失败并回收资源。
+
+    ``should_stop`` 是取消/停机回调：不限时等待必须能被用户取消，否则作业
+    取消后工作线程会一直挂在轮询里。
     """
 
     def __init__(
@@ -49,14 +70,16 @@ class VolumeLifecycle:
         *,
         ready_timeout: float | None = None,
         snapshot_timeout: float | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ):
         self.source_os = source_os
         self.target_os = target_os
         self.ready_timeout = float(ready_timeout) if ready_timeout else None
         self.snapshot_timeout = float(snapshot_timeout) if snapshot_timeout else None
+        self.should_stop = should_stop
 
     def _derive_timeouts(self, size: int) -> tuple[float, float]:
-        """返回 (快照等待, 派生卷等待)，单位秒。"""
+        """返回 (快照等待, 派生卷等待)，单位秒；0 表示不限时。"""
         snapshot = self.snapshot_timeout or derive_ready_timeout(
             snapshot_ready_timeout_default(), size
         )
@@ -64,6 +87,10 @@ class VolumeLifecycle:
             volume_ready_timeout_default(), size
         )
         return float(snapshot), float(volume)
+
+    @staticmethod
+    def _describe_timeout(seconds: float) -> str:
+        return "不限时" if float(seconds or 0) <= 0 else f"{float(seconds):.0f}s"
 
     def _os_for(self, role: str):
         if role == "source":
@@ -90,22 +117,31 @@ class VolumeLifecycle:
         index: int,
         size: int = 0,
         volume_type: str | None = None,
+        on_wait: Callable[[float], None] | None = None,
     ) -> SourceCopy:
-        """对源卷打快照并派生一份可挂载的拷贝源。"""
+        """对源卷打快照并派生一份可挂载的拷贝源。
+
+        ``on_wait`` 在每 60s 打点时回调：这一段的等待可能长达几小时，调用方
+        （台账）需要在等待期间保持时间戳新鲜，否则会被对账逻辑当成残留清理。
+        """
         name = f"mig-{vm_name}-{index}"
         resolved_type = volume_type or self._source_volume_type(volume_id)
         snapshot_timeout, volume_timeout = self._derive_timeouts(size)
         context = f"（源卷派生 {name}，{int(size or 0)}GiB）"
         logging.info(
-            "[MIGRATION] 源卷 %s 开始快照派生 %s，等待上限 快照 %.0fs / 派生 %.0fs",
+            "[MIGRATION] 源卷 %s 开始快照派生 %s，等待上限 快照 %s / 派生 %s",
             volume_id,
             context,
-            snapshot_timeout,
-            volume_timeout,
+            self._describe_timeout(snapshot_timeout),
+            self._describe_timeout(volume_timeout),
         )
         snapshot = self.source_os.create_volume_snapshot(volume_id=volume_id, name=name)
         self.source_os.wait_snapshot_status(
-            snapshot.id, timeout=snapshot_timeout, context=context
+            snapshot.id,
+            timeout=snapshot_timeout,
+            context=context,
+            should_stop=self.should_stop,
+            on_wait=on_wait,
         )
         try:
             derived = self.source_os.create_volume_from_snapshot(
@@ -119,7 +155,11 @@ class VolumeLifecycle:
                 exc, side="源端派生", size=size, volume_type=resolved_type or ""
             )
         self.source_os.wait_volume_status(
-            derived.id, timeout=volume_timeout, context=context
+            derived.id,
+            timeout=volume_timeout,
+            context=context,
+            should_stop=self.should_stop,
+            on_wait=on_wait,
         )
         logging.info(
             "[MIGRATION] 源卷派生完成 volume=%s snapshot=%s derived=%s",
@@ -135,6 +175,7 @@ class VolumeLifecycle:
         name: str,
         size: int,
         volume_type: str | None = None,
+        on_wait: Callable[[float], None] | None = None,
     ) -> str:
         """在目标云建空白卷，内容由中转机全量拷贝写入。"""
         try:
@@ -145,7 +186,12 @@ class VolumeLifecycle:
             )
         except Exception as exc:  # noqa: BLE001 - 配额类错误给出可操作提示
             _raise_quota_hint(exc, side="目标", size=size, volume_type=volume_type or "")
-        self.target_os.wait_volume_status(target.id)
+        self.target_os.wait_volume_status(
+            target.id,
+            context=f"（目标端空白卷 {name}，{int(size or 0)}GiB）",
+            should_stop=self.should_stop,
+            on_wait=on_wait,
+        )
         return target.id
 
     def mark_bootable(self, *, volume_id: str, role: str = "target") -> None:
@@ -161,7 +207,11 @@ class VolumeLifecycle:
         try:
             # Cinder 的挂载完成状态是 "in-use"（连字符），不是 "in_use"。
             os_utils.wait_volume_status(
-                volume_id, target="in-use", context=context
+                volume_id,
+                target="in-use",
+                timeout=attach_ready_timeout(),
+                context=context,
+                should_stop=self.should_stop,
             )
         except Exception:
             # 挂载失败不能把卷留在 attaching：尽力卸载，否则后续删除会被 Cinder 拒绝。
@@ -191,7 +241,12 @@ class VolumeLifecycle:
                 "[MIGRATION] 强制卸载卷失败 volume=%s server=%s", volume_id, server_id
             )
             return
-        os_utils.wait_volume_status(volume_id, target="available")
+        os_utils.wait_volume_status(
+            volume_id,
+            target="available",
+            timeout=attach_ready_timeout(),
+            should_stop=self.should_stop,
+        )
 
     def cleanup_source_copy(self, copy: SourceCopy, relay_server_id: str) -> None:
         """清理派生卷与快照；任一步失败只记录，不阻塞后续清理。"""

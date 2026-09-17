@@ -49,8 +49,12 @@ class VolumeLifecycleTest(unittest.TestCase):
         self.assertIn("40GiB", clone_kwargs["context"])
 
     def test_derive_waits_scale_with_volume_size(self):
-        """大卷在商业存储上是全量拷贝，快照/派生等待必须按容量放大。"""
-        with mock.patch.dict("os.environ", {}, clear=True):
+        """配了上限基线时，大卷在商业存储上是全量拷贝，等待必须按容量放大。"""
+        env = {
+            "MIGRATION_SNAPSHOT_READY_TIMEOUT": "600",
+            "MIGRATION_VOLUME_READY_TIMEOUT": "600",
+        }
+        with mock.patch.dict("os.environ", env, clear=True):
             self.lifecycle.create_source_copy(
                 volume_id="vol-s1", vm_name="vm-1", index=0, size=2048
             )
@@ -60,17 +64,22 @@ class VolumeLifecycleTest(unittest.TestCase):
         self.assertEqual(snap_kwargs["timeout"], 2048 * 20)
         self.assertEqual(clone_kwargs["timeout"], 2048 * 20)
 
-    def test_small_volume_keeps_env_defaults(self):
+    def test_default_env_waits_unlimited(self):
+        """默认不限时（0）：200GiB 以上的盘在商业存储上超过 1 小时很常见。"""
         with mock.patch.dict("os.environ", {}, clear=True):
             self.lifecycle.create_source_copy(
                 volume_id="vol-s1", vm_name="vm-1", index=0, size=10
             )
 
         self.assertEqual(
-            self.source_os.wait_snapshot_status.call_args.kwargs["timeout"], 600
+            self.source_os.wait_snapshot_status.call_args.kwargs["timeout"], 0
         )
         self.assertEqual(
-            self.source_os.wait_volume_status.call_args.kwargs["timeout"], 1800
+            self.source_os.wait_volume_status.call_args.kwargs["timeout"], 0
+        )
+        self.assertEqual(
+            self.source_os.wait_volume_status.call_args.kwargs["should_stop"],
+            self.lifecycle.should_stop,
         )
 
     def test_job_level_timeout_overrides_size_scaling(self):
@@ -90,6 +99,78 @@ class VolumeLifecycleTest(unittest.TestCase):
         self.assertEqual(
             self.source_os.wait_volume_status.call_args.kwargs["timeout"], 7200
         )
+
+    def test_should_stop_is_forwarded_to_both_waits(self):
+        """不限时等待必须能被取消，否则作业取消后线程会一直挂着。"""
+        stop = lambda: False  # noqa: E731 - 只验证透传
+        lifecycle = VolumeLifecycle(
+            self.source_os, self.target_os, should_stop=stop
+        )
+
+        lifecycle.create_source_copy(
+            volume_id="vol-s1", vm_name="vm-1", index=0, size=10
+        )
+
+        self.assertIs(
+            self.source_os.wait_snapshot_status.call_args.kwargs["should_stop"], stop
+        )
+        self.assertIs(
+            self.source_os.wait_volume_status.call_args.kwargs["should_stop"], stop
+        )
+
+    def test_on_wait_hook_is_forwarded_to_both_waits(self):
+        """长等待期间调用方要能刷新台账，否则会被对账当成残留清理。"""
+        touched: list[float] = []
+
+        def touch(waited: float) -> None:
+            touched.append(waited)
+
+        lifecycle = VolumeLifecycle(self.source_os, self.target_os)
+
+        lifecycle.create_source_copy(
+            volume_id="vol-s1",
+            vm_name="vm-1",
+            index=0,
+            size=40,
+            on_wait=touch,
+        )
+
+        self.assertIs(
+            self.source_os.wait_snapshot_status.call_args.kwargs["on_wait"], touch
+        )
+        self.assertIs(
+            self.source_os.wait_volume_status.call_args.kwargs["on_wait"], touch
+        )
+
+    def test_target_volume_wait_gets_on_wait_hook(self):
+        self.target_os.create_blank_volume.return_value = mock.Mock(id="vol-t1")
+
+        self.lifecycle.create_target_volume(
+            name="vm-1-vol-0", size=40, on_wait=print
+        )
+
+        self.assertIs(
+            self.target_os.wait_volume_status.call_args.kwargs["on_wait"], print
+        )
+
+    def test_attach_waits_with_its_own_bounded_timeout(self):
+        """挂载卡住不会自己往前走，保留可预期上限 + 取消回调。"""
+        from relay_volumes import ATTACH_READY_TIMEOUT_SECONDS
+
+        self.lifecycle.attach(role="source", server_id="relay-s", volume_id="vol-d1")
+
+        kwargs = self.source_os.wait_volume_status.call_args.kwargs
+        self.assertEqual(kwargs["timeout"], ATTACH_READY_TIMEOUT_SECONDS)
+        self.assertEqual(kwargs["target"], "in-use")
+
+    def test_target_blank_volume_wait_can_be_cancelled(self):
+        self.target_os.create_blank_volume.return_value = mock.Mock(id="vol-t1")
+
+        self.lifecycle.create_target_volume(name="vm-1-0", size=40)
+
+        kwargs = self.target_os.wait_volume_status.call_args.kwargs
+        self.assertIn("40GiB", kwargs["context"])
+        self.assertEqual(kwargs["should_stop"], self.lifecycle.should_stop)
 
     def test_attach_uses_role_cloud_and_waits_in_use(self):
         attachment = self.lifecycle.attach(
@@ -160,9 +241,9 @@ class VolumeLifecycleTest(unittest.TestCase):
         self.target_os.detach_volume.assert_called_once_with(
             server_id="relay-t", volume_id="vol-t1"
         )
-        self.target_os.wait_volume_status.assert_called_with(
-            "vol-t1", target="available"
-        )
+        kwargs = self.target_os.wait_volume_status.call_args.kwargs
+        self.assertEqual(self.target_os.wait_volume_status.call_args.args, ("vol-t1",))
+        self.assertEqual(kwargs["target"], "available")
 
     def test_cleanup_source_copy_detaches_then_deletes(self):
         copy = self.lifecycle.create_source_copy(
@@ -201,7 +282,11 @@ class VolumeLifecycleTest(unittest.TestCase):
             size=40,
             volume_type="ssd",
         )
-        self.target_os.wait_volume_status.assert_called_with("vol-t1")
+        kwargs = self.target_os.wait_volume_status.call_args.kwargs
+        self.assertEqual(
+            self.target_os.wait_volume_status.call_args.args, ("vol-t1",)
+        )
+        self.assertIn("vm-1-vol-0", kwargs["context"])
 
     def test_target_volume_passes_volume_type(self):
         self.target_os.create_blank_volume.return_value = mock.Mock(id="vol-t1")

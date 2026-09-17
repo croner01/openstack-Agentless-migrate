@@ -248,8 +248,72 @@ class RelayVolumeMoverTest(unittest.TestCase):
     def test_default_stall_timeout_is_five_minutes(self):
         self.assertEqual(self.mover.stall_timeout, 300.0)
 
+    def test_default_result_timeout_is_unlimited(self):
+        """1TiB 盘按 50MB/s 要 5.8 小时，不能再用 6 小时墙钟判死。"""
+        self.assertEqual(self.mover.result_timeout, 0.0)
+
+    def test_bounded_timeout_falls_back_for_substeps(self):
+        """校验/等待监听没有进度看门狗，不限时时必须有墙钟兜底。"""
+        self.assertEqual(self.mover._bounded_timeout(), 6 * 3600.0)
+        self.mover.result_timeout = 7200.0
+        self.assertEqual(self.mover._bounded_timeout(), 7200.0)
+
+    def test_prepare_touches_ledger_during_long_waits(self):
+        """准备阶段默认不限时，等待期间必须刷新台账时间戳。
+
+        对账清理只按 updated_at 判断残留；不刷新的话，一块盘准备超过静默
+        窗口（>1 小时）就会把正在派生的卷当成孤儿删掉。
+        """
+        original_save = self.ledger.save
+        self.ledger.save = mock.MagicMock(side_effect=original_save)
+
+        prepared = self.mover.prepare(
+            volume=_Volume(), vm_name="vm-1", index=0
+        )
+
+        on_wait = self.lifecycle.create_source_copy.call_args.kwargs["on_wait"]
+        target_on_wait = self.lifecycle.create_target_volume.call_args.kwargs["on_wait"]
+        self.assertTrue(callable(on_wait))
+        self.assertTrue(callable(target_on_wait))
+
+        record = self.ledger.get("job-1", "vol-s1")
+        before = record.updated_at
+        self.ledger.save.reset_mock()
+        on_wait(600.0)
+
+        self.assertGreaterEqual(record.updated_at, before)
+        self.assertEqual(self.ledger.save.call_count, 1)
+        self.assertEqual(record.volume_id, "vol-s1")
+        self.assertEqual(prepared.target_volume_id, "vol-t1")
+
+    def test_unlimited_result_timeout_still_catches_stall(self):
+        """不限时也必须靠字节看门狗把卡死的拷贝判失败。"""
+        clock = _FakeClock()
+        self.mover.clock = clock
+        self.mover.result_timeout = 0.0
+        self.mover.stall_timeout = 30.0
+
+        def sleeper(seconds):
+            clock.advance(float(seconds))
+            if clock.now > 3600.0:
+                raise AssertionError("不限时也不能让卡死的拷贝一直空转")
+
+        self.mover.sleeper = sleeper
+
+        def enqueue(task):
+            self.state.enqueued.append(task)
+            if task["role"] == "target":
+                self.state.mark_task_ready(task["task_id"])
+
+        self.state.enqueue = enqueue
+
+        with self.assertRaises(TimeoutError) as ctx:
+            self._run()
+
+        self.assertIn("停滞", str(ctx.exception))
+
     def test_transfer_without_progress_raises_stall_timeout(self):
-        """字节长时间不涨必须判定卡死，而不是等到 6 小时的 result_timeout。"""
+        """字节长时间不涨必须判定卡死，而不是等到墙钟上限。"""
         clock = _FakeClock()
         self.mover.clock = clock
         self.mover.stall_timeout = 30.0

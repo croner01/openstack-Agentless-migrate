@@ -36,6 +36,36 @@ class WizardLayoutRenderTest(unittest.TestCase):
         self.assertIn('class="pool-col" id="relay-source-pool"', html)
         self.assertIn('class="pool-col" id="relay-target-pool"', html)
 
+    def test_new_migration_only_warns_about_real_edits(self):
+        """只是回放过作业参数/浏览过清单时，新建迁移不该再弹「尚未提交」确认。
+
+        旧实现只看 `state.previewRows.length`，用户回看作业参数后再点新建就会
+        被拦一次，而且弹窗里只有「清空并新建」、没有回去继续编辑的入口。
+        """
+        html = self._html()
+
+        self.assertIn("if (!rows || !state.wizardDirty) { start(); return; }", html)
+        self.assertIn("wizardDirty: false,", html)
+        self.assertIn("function markWizardDirty()", html)
+
+    def test_confirm_modal_can_offer_a_way_back_to_the_wizard(self):
+        """确认弹窗的取消动作可自定义，用来「回向导继续编辑」。"""
+        html = self._html()
+
+        self.assertIn("cmCancelHandler", html)
+        self.assertIn("function confirmCancel()", html)
+        self.assertIn("cancelText: '回向导继续编辑'", html)
+
+    def test_wizard_marks_dirty_on_edits_but_not_on_list_search(self):
+        html = self._html()
+
+        # 方案卡是 button，不会触发 input/change，必须显式标记
+        self.assertIn("markWizardDirty();\n        applyScheme(card.dataset.scheme);", html)
+        # 清单搜索框只是过滤，不算编辑
+        self.assertIn("if (target && target.id === 'vm-search') return;", html)
+        # 勾选/取消源 VM、解析 Excel 都算编辑
+        self.assertIn("function removePreviewRowByServerId(serverId) {\n    markWizardDirty();", html)
+
     def test_nic_rows_and_selects_are_constrained(self):
         style = self._style()
         html = self._html()

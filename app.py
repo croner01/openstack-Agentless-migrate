@@ -29,6 +29,7 @@ from environment_profiles import EnvironmentProfile, EnvironmentProfileStore
 from excel_parser import parse_mode, parse_rows, parse_selected_rows, parse_start_target
 from graceful_shutdown import ShutdownCoordinator
 from job_manager import JobManager
+from json_store import atomic_write_json
 from migration_manager import MigrationManager
 from migration_planner import override_key
 from openstack_utils import OpenStackUtils
@@ -494,6 +495,85 @@ def relay_persistent_warnings(relay_config) -> list[str]:
     return warnings
 
 
+#: 提交参数快照的体积上限：VM 行可能上千条，超过就只记日志不落盘。
+SUBMIT_PARAMS_MAX_BYTES = 4 * 1024 * 1024
+
+#: 落盘时要剔除的字段名片段（小写匹配），避免把口令写进磁盘。
+_SUBMIT_SECRET_MARKERS = ("password", "passwd", "secret", "token")
+
+
+def _submit_params_dir() -> str:
+    """提交参数快照目录（每个作业一个文件）。
+
+    「调整参数重新提交」此前只认浏览器内存里的 lastSubmit：刷新页面、换浏览器
+    或提交下一个作业后按钮就消失了。把快照落盘后，任何会话都能在作业详情页
+    重新载入参数。口令类字段一律不落盘（见 _sanitize_submit_params）。
+    """
+    return os.path.join(
+        app.config.get("UPLOAD_FOLDER") or UPLOAD_FOLDER, "job_params"
+    )
+
+
+def _submit_params_path(job_id: str) -> str:
+    """快照文件路径；job_id 会被清洗成安全文件名。"""
+    safe = "".join(ch for ch in str(job_id or "") if ch.isalnum() or ch in "-_")
+    return os.path.join(_submit_params_dir(), f"{safe}.json")
+
+
+def _sanitize_submit_params(value: Any) -> Any:
+    """递归剔除口令类字段，其余原样保留。"""
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_submit_params(item)
+            for key, item in value.items()
+            if not any(marker in str(key).lower() for marker in _SUBMIT_SECRET_MARKERS)
+        }
+    if isinstance(value, list):
+        return [_sanitize_submit_params(item) for item in value]
+    return value
+
+
+def _save_submit_params(job_id: str, raw: str) -> None:
+    """保存提交参数快照；解析/写盘失败只记日志，不影响作业提交。"""
+    text = str(raw or "").strip()
+    if not text:
+        return
+    if len(text) > SUBMIT_PARAMS_MAX_BYTES:
+        logging.warning(
+            "[MIGRATION] 提交参数快照过大（%s 字节），跳过保存 job=%s",
+            len(text),
+            job_id,
+        )
+        return
+    try:
+        payload = json.loads(text)
+    except ValueError as exc:
+        logging.warning("[MIGRATION] 提交参数快照不是合法 JSON job=%s: %s", job_id, exc)
+        return
+    if not isinstance(payload, dict):
+        logging.warning("[MIGRATION] 提交参数快照不是对象，跳过保存 job=%s", job_id)
+        return
+    path = _submit_params_path(job_id)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        atomic_write_json(path, _sanitize_submit_params(payload))
+    except Exception:  # noqa: BLE001 - 快照落盘失败不能拦住迁移
+        logging.exception("[MIGRATION] 保存提交参数快照失败 job=%s", job_id)
+
+
+def _load_submit_params(job_id: str) -> dict[str, Any] | None:
+    path = _submit_params_path(job_id)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        logging.warning("[MIGRATION] 读取提交参数快照失败 job=%s: %s", job_id, exc)
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def start_job_relay_runtime(
     relay_config,
     *,
@@ -501,6 +581,7 @@ def start_job_relay_runtime(
     target_auth: dict[str, str],
     job_id: str,
     options: dict[str, Any],
+    should_stop=None,
 ):
     """作业级中转机运行时装配；relay_config 为 None 时表示不走中转机通道。"""
     if relay_config is None:
@@ -545,6 +626,8 @@ def start_job_relay_runtime(
         registry=RELAY_STATE,
         scheduler=scheduler,
         scheduler_factory=scheduler_factory,
+        # 卷/快照等待默认不限时，取消作业时必须能把等待中的轮询一并打断。
+        should_stop=should_stop,
     )
     try:
         runtime.start()
@@ -1036,6 +1119,8 @@ def api_migrate():
         target_auth = _auth_args("target", _profile_auth(profile, "target"))
 
         job = job_manager.create_job(rows, job_id=job_id)
+        # 表单自带的提交参数快照：作业详情页后续可用它「调整参数重新提交」。
+        _save_submit_params(job_id, request.form.get("submit_snapshot"))
         options = {
             "job_id": job_id,
             "source_auth_args": source_auth,
@@ -1073,9 +1158,10 @@ def api_migrate():
                 if (request.form.get("cutover_mode") or "").strip() == "manual"
                 else "auto"
             ),
-            # 「快照 / 快照派生卷」等待上限（秒）：0 = 按卷大小自适应。
-            # 商业存储上这一步常是存储侧全量拷贝，1TiB 卷按 20s/GiB 要 5 小时
-            # 以上，所以这里的上限放宽到 7 天，不能套用默认的 10240s。
+            # 「快照 / 快照派生卷」等待上限（秒）：0 = 不限时（默认）。
+            # 商业存储上这一步常是存储侧全量拷贝，200GiB 实测能超过 1 小时，
+            # 1TiB 按 20s/GiB 要 5 小时以上；按时间判死会让平台在云上还在建盘
+            # 时判失败并回收资源。填正数时上限放宽到 7 天，且会按卷大小自适应。
             "volume_ready_timeout": _non_negative_float(
                 request.form.get("volume_ready_timeout"),
                 maximum=7 * 24 * 3600.0,
@@ -1111,6 +1197,10 @@ def api_migrate():
                         target_auth=target_auth,
                         job_id=job_id,
                         options=options,
+                        should_stop=lambda: (
+                            shutdown_coordinator.stopping
+                            or job_manager.is_cancelled(job.id)
+                        ),
                     )
 
                 def run_vm(vm, _options):
@@ -1259,7 +1349,33 @@ def api_job_delete(job_id: str):
         return jsonify({"ok": False, "error": error}), status
     drop_runtime(job_id)
     RELAY_STATE.forget_job(job_id)
+    # 参数快照跟着作业一起删，避免作业目录删了快照还留在磁盘上。
+    try:
+        os.unlink(_submit_params_path(job_id))
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logging.exception("[MIGRATION] 删除提交参数快照失败 job=%s", job_id)
     return jsonify({"ok": True})
+
+
+@app.get("/api/jobs/<job_id>/params")
+def api_job_params(job_id: str):
+    """作业提交时的向导参数快照（口令字段已剔除），用于「调整参数重新提交」。"""
+    if job_manager.get(job_id) is None:
+        return jsonify({"ok": False, "error": "job 不存在"}), 404
+    params = _load_submit_params(job_id)
+    if params is None:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "服务器没有保存这个作业的提交参数，请重新在向导里填写",
+                }
+            ),
+            404,
+        )
+    return jsonify({"ok": True, "params": params})
 
 
 @app.get("/api/jobs/<job_id>/relay")

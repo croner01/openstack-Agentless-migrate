@@ -2,7 +2,7 @@ import base64
 import logging
 import os
 import time
-from typing import Any
+from typing import Any, Callable
 
 from env_utils import env_float, env_int
 
@@ -28,40 +28,48 @@ def relay_boot_volume_size(image_bytes: int, *, extra_gib: int = 10) -> int:
 
 
 def volume_ready_timeout_default() -> int:
-    """卷等待 available 的默认超时。
+    """卷等待 available 的默认超时；0 = 不限时（默认）。
 
-    这套环境的 Cinder 建卷经常 3~5 分钟，并发时还会更慢；默认 600s 太紧，
-    会把只是"慢"的卷判成失败。
+    Cinder 建卷/派生卷的耗时完全取决于存储后端：商业存储上「快照 → 派生卷」
+    常是存储侧全量拷贝，一块 1TiB 盘几小时很正常，实测 200GiB 也能超过 1
+    小时。按时间判死只会把"只是慢"的卷判失败，而云上其实还在正常建盘，
+    平台却已经把资源回收掉——重试又得从头等一遍。
+    因此默认不限时，只按 60s 打点记录等待时长；需要兜底时用
+    MIGRATION_VOLUME_READY_TIMEOUT 或页面上的作业级超时。
     """
-    return env_int("MIGRATION_VOLUME_READY_TIMEOUT", 1800, minimum=1)
+    return env_int("MIGRATION_VOLUME_READY_TIMEOUT", 0, minimum=0)
 
 
-#: Cinder 快照等待 available 的默认超时。后端是 Ceph 这类 CoW 存储时打快照
-#: 是秒级；商业存储多半是存储侧全量拷贝，大卷远不止这个数，靠下面的
-#: `derive_ready_timeout()` 按卷大小放大。
-SNAPSHOT_READY_TIMEOUT_SECONDS = 600
+#: Cinder 快照等待 available 的默认超时；0 = 不限时（默认），同
+#: `volume_ready_timeout_default()` 的理由。
+SNAPSHOT_READY_TIMEOUT_SECONDS = 0
 
-#: 「快照 → 派生卷」每 GiB 折算的等待秒数。全量拷贝按 50MB/s 估算约 20s/GiB，
-#: 用来给大卷兜底；用 MIGRATION_DERIVE_SECONDS_PER_GIB 覆盖。
+#: 仅在显式配置了超时基线时参与"按卷大小放大"的折算系数（秒/GiB）。
 DERIVE_SECONDS_PER_GIB = 20.0
 
 
 def snapshot_ready_timeout_default() -> int:
-    """快照等待 available 的默认超时，MIGRATION_SNAPSHOT_READY_TIMEOUT 调整。"""
+    """快照等待 available 的默认超时；0 = 不限时。
+
+    用 MIGRATION_SNAPSHOT_READY_TIMEOUT 配置硬上限。
+    """
     return env_int(
         "MIGRATION_SNAPSHOT_READY_TIMEOUT",
         SNAPSHOT_READY_TIMEOUT_SECONDS,
-        minimum=1,
+        minimum=0,
     )
 
 
 def derive_ready_timeout(base: float, size_gib: Any) -> float:
-    """按卷大小放大「快照 / 派生卷」的等待超时。
+    """按卷大小放大「快照 / 派生卷」的等待超时；基数为 0 时返回 0（不限时）。
 
-    商业存储上 `create_snapshot` 与 `create_volume(snapshot_id=...)` 常常是
-    存储侧全量拷贝，耗时与卷容量成正比；固定阈值只会把"只是慢"的大卷判成
-    失败。取 `max(base, size_gib × 每秒GiB折算)`：小卷保持基线，大卷自动放宽。
+    显式配了基线（环境变量或页面上的作业级超时）才按容量放大：商业存储上
+    `create_snapshot` 与 `create_volume(snapshot_id=...)` 常常是存储侧全量
+    拷贝，耗时与卷容量成正比，取 `max(base, size_gib × 每秒GiB折算)` 让大卷
+    自动放宽；小卷仍按基线等。
     """
+    if float(base or 0) <= 0:
+        return 0.0
     per_gib = env_float(
         "MIGRATION_DERIVE_SECONDS_PER_GIB",
         DERIVE_SECONDS_PER_GIB,
@@ -1675,10 +1683,11 @@ class OpenStackUtils:
         start_if_shutoff: bool,
     ):
         fail_states = fail_states or {"ERROR", "PAUSED", "SUSPENDED"}
-        deadline = time.time() + timeout
+        # timeout <= 0 表示不限时，与 wait_volume_status 的语义保持一致。
+        deadline = time.time() + timeout if float(timeout or 0) > 0 else None
         visibility_deadline = time.time() + not_found_grace
         started = False
-        while time.time() < deadline:
+        while True:
             try:
                 server = self.conn.compute.get_server(server_id)
             except Exception as exc:  # noqa: BLE001 - 404 是建机后的可见性竞态
@@ -1707,6 +1716,8 @@ class OpenStackUtils:
                 # 只有云侧确实没有自动开机时才兜底启动，避免创建后立刻插队。
                 self.start_server(server_id)
                 started = True
+            if deadline is not None and time.time() >= deadline:
+                break
             time.sleep(poll_interval)
         raise TimeoutError(f"等待 VM {server_id} 达到 {target} 超时")
 
@@ -1718,13 +1729,30 @@ class OpenStackUtils:
         poll_interval: int = 5,
         *,
         context: str = "",
+        should_stop: Callable[[], bool] | None = None,
+        on_wait: Callable[[float], None] | None = None,
     ):
+        """等待快照达到目标状态。
+
+        ``timeout`` <= 0 表示不限时（默认，见 ``snapshot_ready_timeout_default``）：
+        商业存储上打快照常是存储侧全量拷贝，200GiB 的卷也可能超过 1 小时，按
+        时间判死只会把"只是慢"的快照判失败，而云上其实还在正常打快照，
+        平台却已经回收了资源。等待期间每 60s 打点一次记录进度（同时调用
+        ``on_wait``，调用方用它刷新台账时间戳，避免长等待期间被对账逻辑当成
+        孤儿资源清理），需要中止时由 ``should_stop`` 回调决定（例如用户取消
+        作业）。
+        """
         if timeout is None:
             timeout = snapshot_ready_timeout_default()
-        deadline = time.time() + timeout
+        deadline = time.time() + float(timeout) if float(timeout or 0) > 0 else None
         last_status = "unknown"
         polls = 0
-        while time.time() < deadline:
+        while True:
+            if should_stop is not None and should_stop():
+                raise RuntimeError(
+                    f"等待快照 {snapshot_id} 达到 {target} 被取消"
+                    f"（已等待 {polls * poll_interval}s，最后状态 {last_status}）{context}"
+                )
             snapshot = self.conn.block_storage.get_snapshot(snapshot_id)
             last_status = str(snapshot.status or "unknown")
             status = _normalize_status(last_status)
@@ -1746,29 +1774,49 @@ class OpenStackUtils:
                     polls * poll_interval,
                     context,
                 )
+                if on_wait is not None:
+                    on_wait(float(polls * poll_interval))
+            if deadline is not None and time.time() >= deadline:
+                break
             time.sleep(poll_interval)
         raise TimeoutError(
             f"等待快照 {snapshot_id} 达到 {target} 超时"
-            f"（等待 {timeout:.0f}s，最后状态 {last_status}）{context}"
+            f"（等待 {float(timeout):.0f}s，最后状态 {last_status}）{context}"
         )
 
     def wait_volume_status(
         self,
         volume_id: str,
         target: str = "available",
-        timeout: int | None = None,
+        timeout: float | None = None,
         poll_interval: int = 5,
         *,
         context: str = "",
+        should_stop: Callable[[], bool] | None = None,
+        on_wait: Callable[[float], None] | None = None,
     ):
+        """等待卷达到目标状态。
+
+        ``timeout`` <= 0 表示不限时（默认，见 ``volume_ready_timeout_default``）：
+        商业存储上「快照 → 派生卷」常是存储侧全量拷贝，一块 1TiB 盘几小时很
+        正常，按时间判死会让平台在云上还在建盘时就判失败并回收资源。等待期间
+        每 60s 打点一次记录进度（同时调用 ``on_wait``，调用方用它刷新台账
+        时间戳，避免长等待期间被对账逻辑当成孤儿资源清理），需要中止时由
+        ``should_stop`` 回调决定。
+        """
         if timeout is None:
             timeout = volume_ready_timeout_default()
-        deadline = time.time() + timeout
+        deadline = time.time() + float(timeout) if float(timeout or 0) > 0 else None
         wanted = _normalize_status(target)
         last_status = "unknown"
         polls = 0
         seen_attaching = False
-        while time.time() < deadline:
+        while True:
+            if should_stop is not None and should_stop():
+                raise RuntimeError(
+                    f"等待卷 {volume_id} 达到 {target} 被取消"
+                    f"（已等待 {polls * poll_interval}s，最后状态 {last_status}）{context}"
+                )
             volume = self.conn.block_storage.get_volume(volume_id)
             last_status = str(volume.status or "unknown")
             status = _normalize_status(last_status)
@@ -1800,10 +1848,14 @@ class OpenStackUtils:
                     polls * poll_interval,
                     context,
                 )
+                if on_wait is not None:
+                    on_wait(float(polls * poll_interval))
+            if deadline is not None and time.time() >= deadline:
+                break
             time.sleep(poll_interval)
         raise TimeoutError(
             f"等待卷 {volume_id} 达到 {target} 超时"
-            f"（等待 {timeout}s，最后状态 {last_status}）{context}"
+            f"（等待 {float(timeout):.0f}s，最后状态 {last_status}）{context}"
         )
 
     def log(self, message: str, level: str = "info") -> None:

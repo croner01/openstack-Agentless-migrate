@@ -110,12 +110,36 @@ class ParseRelayOptionsTest(unittest.TestCase):
 
         self.assertEqual(config.target.volume_type, "ssd")
 
-    def test_derive_timeouts_default_to_zero_meaning_auto(self):
-        """作业表单不填超时 ⇒ 0，交给按卷大小自适应的逻辑。"""
-        config = parse_relay_options(self._options())
+    def test_derive_timeouts_default_to_zero_meaning_unlimited(self):
+        """作业表单不填超时 ⇒ 0，即"不限制等待"（云上还在建盘就不能判死）。"""
+        with mock.patch.dict("os.environ", {}, clear=True):
+            config = parse_relay_options(self._options())
 
         self.assertEqual(config.volume_ready_timeout, 0.0)
         self.assertEqual(config.snapshot_ready_timeout, 0.0)
+
+    def test_result_timeout_defaults_to_unlimited(self):
+        """单卷拷贝默认也没有墙钟上限：防卡死靠 stall_timeout 的字节看门狗。"""
+        with mock.patch.dict("os.environ", {}, clear=True):
+            config = parse_relay_options(self._options())
+
+        self.assertEqual(config.result_timeout, 0.0)
+
+    def test_result_timeout_env_override(self):
+        with mock.patch.dict(
+            "os.environ", {"MIGRATION_RELAY_RESULT_TIMEOUT": "43200"}, clear=True
+        ):
+            config = parse_relay_options(self._options())
+
+        self.assertEqual(config.result_timeout, 43200.0)
+
+    def test_result_timeout_job_option_wins(self):
+        with mock.patch.dict(
+            "os.environ", {"MIGRATION_RELAY_RESULT_TIMEOUT": "43200"}, clear=True
+        ):
+            config = parse_relay_options(self._options(relay_result_timeout="3600"))
+
+        self.assertEqual(config.result_timeout, 3600.0)
 
     def test_derive_timeouts_come_from_job_options(self):
         config = parse_relay_options(

@@ -373,6 +373,25 @@ class RelayPageRenderTest(unittest.TestCase):
         self.assertIn("state.relayNow = json.relay.now", html)
         self.assertIn("finished.indexOf(volume.phase || '') < 0", html)
 
+    def test_resubmit_button_is_not_gated_by_browser_session(self):
+        """刷新/换浏览器后「调整参数重新提交」不能消失。
+
+        旧实现按 `state.lastSubmit.jobId === job.id` 决定显隐，快照只存在浏览器
+        内存里，用户过一会儿再看作业就只剩「取消任务」了。
+        """
+        html = self._html()
+
+        self.assertNotIn("state.lastSubmit.jobId === job.id) ? '' : 'none'", html)
+        self.assertIn("async function fetchSubmitSnapshot", html)
+        self.assertIn("'/api/jobs/' + encodeURIComponent(jobId) + '/params'", html)
+
+    def test_submit_form_carries_parameters_snapshot(self):
+        """提交时把向导快照一并上报，服务器才有参数可回放。"""
+        html = self._html()
+
+        self.assertIn("data.append('submit_snapshot'", html)
+        self.assertIn("captureSubmitSnapshot(null)", html)
+
     def test_submit_form_carries_all_relay_timeouts(self):
         """提交表单必须带上此前只在预检里传的超时，否则填了也不生效。"""
         html = self._html()
@@ -382,11 +401,11 @@ class RelayPageRenderTest(unittest.TestCase):
         for field in ("relay_stall_timeout", "relay_slot_wait_seconds", "volume_ready_timeout"):
             self.assertIn("'" + field + "'", html)
 
-    def test_derive_timeout_field_defaults_to_auto(self):
-        """「卷/快照就绪超时」默认 0 = 按卷大小自动，页面要写清楚。"""
+    def test_derive_timeout_field_defaults_to_unlimited(self):
+        """「卷/快照就绪超时」默认 0 = 不限制等待，页面要写清楚。"""
         html = self._html()
 
-        self.assertIn('0 = 按卷大小自动', html)
+        self.assertIn('0 = 不限制（默认）', html)
 
     def test_volume_concurrency_hint_covers_relay_prepare(self):
         """「单台卷拷贝并发」同样作用于中转机的快照/派生并发，页面要说明。"""

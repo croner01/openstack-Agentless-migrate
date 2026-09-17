@@ -7,6 +7,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
+from env_utils import env_float
+
 from relay_orchestrator import RelayVolumeMover
 from relay_pool import RelayPool
 from relay_protocol import DEFAULT_CHUNK, issue_token
@@ -15,6 +17,22 @@ from relay_volumes import VolumeLifecycle
 
 #: 台账里已完结记录的保留时长；超过后由 finish() 机会性回收，避免无限增长。
 LEDGER_RETENTION_SECONDS = 7 * 24 * 3600.0
+
+#: 单卷数据面拷贝的墙钟上限（秒），0 = 不限时。真正防卡死的是 stall_timeout 的
+#: 字节进度看门狗：1TiB 盘按 50MB/s 要 5.8 小时，按 6 小时墙钟判死会把"只是慢"
+#: 的拷贝判失败。用 MIGRATION_RELAY_RESULT_TIMEOUT 配置上限。
+RELAY_RESULT_TIMEOUT_SECONDS = 0.0
+
+#: 对账清理"残留"记录的最短静默窗口（秒）。等待建盘/派生卷期间台账会按 60s
+#: 打点刷新 updated_at，所以这个窗口只要覆盖"挂载"这类无打点的步骤即可。
+RELAY_REAPER_MIN_STALE_SECONDS = 3600.0
+
+
+def relay_result_timeout_default() -> float:
+    """单卷拷贝的墙钟上限；0 = 不限时（默认）。"""
+    return env_float(
+        "MIGRATION_RELAY_RESULT_TIMEOUT", RELAY_RESULT_TIMEOUT_SECONDS, minimum=0.0
+    )
 
 
 RELAY_PHASE_LABELS = {
@@ -72,8 +90,10 @@ class RelayChannelConfig:
     heartbeat_timeout: int = 30
     stall_timeout: float = 300.0
     slot_wait_timeout: float = 1800.0
-    #: 「打快照 / 快照派生卷」的等待超时（秒），0 = 按卷大小自适应。
-    #: 商业存储上这一步常是存储侧全量拷贝，固定阈值会把只是慢的大卷判成失败。
+    #: 「打快照 / 快照派生卷」的等待超时（秒）。0 = 不限时（默认）：商业存储
+    #: 上这一步常是存储侧全量拷贝，200GiB 也能超过 1 小时，按时间判死会让
+    #: 平台在云上还在建盘时就判失败并回收资源。给了正数则按下面 env 的
+    #: 基线一同参与"按卷大小自适应"。
     volume_ready_timeout: float = 0.0
     snapshot_ready_timeout: float = 0.0
     hole_mode: str = "skip"
@@ -82,7 +102,8 @@ class RelayChannelConfig:
     rate_limit_bytes_per_sec: float = 0.0
     chunk_size: int = DEFAULT_CHUNK
     ready_timeout: float = 180.0
-    result_timeout: float = 6 * 3600.0
+    #: 单卷拷贝的墙钟上限（秒），0 = 不限时；防卡死靠 stall_timeout。
+    result_timeout: float = 0.0
     node_mode: str = "persistent"
     slots_per_node: int = 5
     max_nodes: int = 6
@@ -269,6 +290,15 @@ def parse_relay_options(options: dict[str, Any]) -> RelayChannelConfig | None:
         heartbeat_interval=max(int(options.get("relay_heartbeat_interval") or 10), 1),
         heartbeat_timeout=max(int(options.get("relay_heartbeat_timeout") or 30), 1),
         stall_timeout=max(float(options.get("relay_stall_timeout") or 300.0), 30.0),
+        # 0 = 不限时：拷多慢都不判死，卡住由 stall_timeout 的进度看门狗兜底。
+        result_timeout=max(
+            float(
+                options.get("relay_result_timeout")
+                or relay_result_timeout_default()
+                or 0.0
+            ),
+            0.0,
+        ),
         slot_wait_timeout=max(float(options.get("relay_slot_wait_seconds") or 1800.0), 0.0),
         volume_ready_timeout=max(float(options.get("volume_ready_timeout") or 0.0), 0.0),
         # 页面只有一个「卷/快照就绪超时」输入；未单独给快照超时时沿用它。
@@ -347,6 +377,7 @@ class RelayRuntime:
         registry: Any = None,
         scheduler: Any = None,
         scheduler_factory: Any = None,
+        should_stop: Callable[[], bool] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ):
         self.config = config
@@ -358,6 +389,8 @@ class RelayRuntime:
         self.registry = registry or state
         self.scheduler = scheduler
         self.scheduler_factory = scheduler_factory
+        # 卷/快照等待默认不限时，必须能感知用户取消，否则工作线程会一直挂着。
+        self.should_stop = should_stop or (lambda: False)
         self.clock = clock
         self._progress_samples: dict[str, tuple[float, int, float | None]] = {}
         self._progress_percent: dict[str, float] = {}
@@ -367,6 +400,7 @@ class RelayRuntime:
             target_os,
             ready_timeout=config.volume_ready_timeout or None,
             snapshot_timeout=config.snapshot_ready_timeout or None,
+            should_stop=self.should_stop,
         )
         self.source_pool = RelayPool(
             role="source",
@@ -416,7 +450,12 @@ class RelayRuntime:
             ledger=ledger,
             lifecycle=self.lifecycle,
             pools={"source": self.source_pool, "target": self.target_pool},
-            stale_seconds=max(config.result_timeout, 600.0),
+            # 对账窗口不能跟着 result_timeout 一起被调小到 0：它必须覆盖
+            # 「挂载」等没有 60s 打点的步骤，否则会把在途卷当残留删掉。
+            stale_seconds=max(
+                float(config.result_timeout or 0.0),
+                RELAY_REAPER_MIN_STALE_SECONDS,
+            ),
         )
 
     def _token(self, job_id: str, role: str) -> str:

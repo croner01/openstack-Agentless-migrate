@@ -17,24 +17,22 @@ class BootVolumeSizeTest(unittest.TestCase):
 
 
 class VolumeReadyTimeoutTest(unittest.TestCase):
-    def test_defaults_to_1800_seconds(self):
-        with mock.patch.dict("os.environ", {}, clear=False):
-            import os
-
-            os.environ.pop("MIGRATION_VOLUME_READY_TIMEOUT", None)
-            self.assertEqual(volume_ready_timeout_default(), 1800)
+    def test_defaults_to_unlimited(self):
+        """默认不限时：商业存储建盘几分钟到几小时都有可能，不能按时间判死。"""
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(volume_ready_timeout_default(), 0)
 
     def test_reads_env_override(self):
         with mock.patch.dict(
-            "os.environ", {"MIGRATION_VOLUME_READY_TIMEOUT": "2400"}
+            "os.environ", {"MIGRATION_VOLUME_READY_TIMEOUT": "2400"}, clear=True
         ):
             self.assertEqual(volume_ready_timeout_default(), 2400)
 
     def test_ignores_invalid_env_value(self):
         with mock.patch.dict(
-            "os.environ", {"MIGRATION_VOLUME_READY_TIMEOUT": "abc"}
+            "os.environ", {"MIGRATION_VOLUME_READY_TIMEOUT": "abc"}, clear=True
         ):
-            self.assertEqual(volume_ready_timeout_default(), 1800)
+            self.assertEqual(volume_ready_timeout_default(), 0)
 
 
 class RelayServerBootVolumeTest(unittest.TestCase):
