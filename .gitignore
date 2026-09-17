@@ -1,0 +1,26 @@
+# Python 字节码与打包产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# 运行时状态：云凭据与主密钥（relay-master-key / relay-secret）、
+# 作业/台账/租约 JSON、上传的 Ceph conf 与 Excel 清单。
+# 按 AGENTS.md：uploads/ 与 __pycache__/ 属于生成物，不进版本库。
+uploads/
+
+# 日志（LOG_FILE 默认落在 uploads/ 下，根目录的历史日志一并忽略）
+*.log
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# 本地构建产物（镜像 tar 包等）
+*.tar
+*.tar.gz
