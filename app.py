@@ -1073,6 +1073,13 @@ def api_migrate():
                 if (request.form.get("cutover_mode") or "").strip() == "manual"
                 else "auto"
             ),
+            # 「快照 / 快照派生卷」等待上限（秒）：0 = 按卷大小自适应。
+            # 商业存储上这一步常是存储侧全量拷贝，1TiB 卷按 20s/GiB 要 5 小时
+            # 以上，所以这里的上限放宽到 7 天，不能套用默认的 10240s。
+            "volume_ready_timeout": _non_negative_float(
+                request.form.get("volume_ready_timeout"),
+                maximum=7 * 24 * 3600.0,
+            ),
             "target_volume_type": request.form.get("target_volume_type")
             or (profile.target_volume_type if profile else None)
             or None,

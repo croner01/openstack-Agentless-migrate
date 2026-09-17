@@ -191,7 +191,12 @@ class RelayPathBranchTest(unittest.TestCase):
         ]
         self.manager._stop_and_wait = mock.Mock()
         self.mover = mock.MagicMock()
-        self.mover.move.side_effect = [
+        # 单卷流程已拆成「准备（打快照/派生）→ 传输」，管理器的编排按这两步断言。
+        self.mover.prepare.side_effect = [
+            mock.Mock(index=0, target_volume_id="vol-t0"),
+            mock.Mock(index=1, target_volume_id="vol-t1"),
+        ]
+        self.mover.transfer.side_effect = [
             {"target_volume_id": "vol-t0", "size": 40, "source_volume_id": "vol-s1"},
             {"target_volume_id": "vol-t1", "size": 20, "source_volume_id": "vol-s2"},
         ]
@@ -211,11 +216,12 @@ class RelayPathBranchTest(unittest.TestCase):
             },
         )
 
-        self.assertEqual(self.mover.move.call_count, 2)
-        first_call = self.mover.move.call_args_list[0].kwargs
+        self.assertEqual(self.mover.prepare.call_count, 2)
+        self.assertEqual(self.mover.transfer.call_count, 2)
+        first_call = self.mover.prepare.call_args_list[0].kwargs
         self.assertEqual(first_call["index"], 0)
         self.assertEqual(first_call["volume"].source_volume_id, "vol-s1")
-        second_call = self.mover.move.call_args_list[1].kwargs
+        second_call = self.mover.prepare.call_args_list[1].kwargs
         self.assertEqual(second_call["volume"].source_volume_id, "vol-s2")
         kwargs = self.manager.target_os.create_server_from_volumes.call_args.kwargs
         self.assertEqual(kwargs["boot_volume_id"], "vol-t0")
@@ -230,8 +236,12 @@ class RelayPathBranchTest(unittest.TestCase):
         self.manager._stop_and_wait = mock.Mock(
             side_effect=lambda *args, **kwargs: order.append("stop")
         )
-        self.mover.move.side_effect = lambda **kwargs: (
-            order.append("move"),
+        self.mover.prepare.side_effect = lambda **kwargs: (
+            order.append("prepare"),
+            mock.Mock(),
+        )[1]
+        self.mover.transfer.side_effect = lambda item: (
+            order.append("transfer"),
             {"target_volume_id": "vol-t0", "size": 40},
         )[1]
 
@@ -245,7 +255,113 @@ class RelayPathBranchTest(unittest.TestCase):
         )
 
         self.assertEqual(order[0], "stop")
-        self.assertIn("move", order)
+        self.assertIn("prepare", order)
+        self.assertIn("transfer", order)
+
+    def test_relay_path_finishes_every_prepare_before_transferring(self):
+        """先把所有盘准备好再开始传数据：传输要占中转机槽位，早占只会白等。"""
+        events = []
+        self.mover.prepare.side_effect = lambda **kwargs: (
+            events.append(("prepare", kwargs["index"])),
+            mock.Mock(),
+        )[1]
+        self.mover.transfer.side_effect = lambda item: (
+            events.append(("transfer",)),
+            {"target_volume_id": "vol-t0", "size": 40},
+        )[1]
+
+        self.manager._migrate_vm_inner(
+            self.vm,
+            {
+                "job_id": "job-1",
+                "data_channel": "relay",
+                "relay_mover_factory": self.mover_factory,
+                "volume_concurrency": 2,
+            },
+        )
+
+        kinds = [event[0] for event in events]
+        self.assertEqual(kinds, ["prepare", "prepare", "transfer", "transfer"])
+        self.assertEqual(sorted(e[1] for e in events if e[0] == "prepare"), [0, 1])
+
+    def test_relay_path_prepares_volumes_concurrently(self):
+        """打快照/派生卷这一段按「单台卷拷贝并发」并行，等待时间不再线性叠加。"""
+        lock = threading.Lock()
+        inflight: list[int] = []
+        peak = [0]
+
+        def fake_prepare(**kwargs):
+            with lock:
+                inflight.append(kwargs["index"])
+                peak[0] = max(peak[0], len(inflight))
+            barrier.wait(timeout=5)     # 两块盘必须同时在准备，否则超时失败
+            with lock:
+                inflight.remove(kwargs["index"])
+            return mock.Mock()
+
+        barrier = threading.Barrier(2)
+        self.mover.prepare.side_effect = fake_prepare
+
+        self.manager._migrate_vm_inner(
+            self.vm,
+            {
+                "job_id": "job-1",
+                "data_channel": "relay",
+                "relay_mover_factory": self.mover_factory,
+                "volume_concurrency": 2,
+            },
+        )
+
+        self.assertEqual(peak[0], 2)
+        self.assertEqual(self.mover.transfer.call_count, 2)
+
+    def test_relay_path_prepare_stays_serial_by_default(self):
+        lock = threading.Lock()
+        inflight: list[int] = []
+        peak = [0]
+
+        def fake_prepare(**kwargs):
+            with lock:
+                inflight.append(kwargs["index"])
+                peak[0] = max(peak[0], len(inflight))
+            time.sleep(0.05)
+            with lock:
+                inflight.remove(kwargs["index"])
+            return mock.Mock()
+
+        self.mover.prepare.side_effect = fake_prepare
+
+        self.manager._migrate_vm_inner(
+            self.vm,
+            {
+                "job_id": "job-1",
+                "data_channel": "relay",
+                "relay_mover_factory": self.mover_factory,
+            },
+        )
+
+        self.assertEqual(peak[0], 1)
+
+    def test_relay_path_discards_prepared_volumes_when_one_fails(self):
+        """一块盘准备失败就不能继续传输，已准备好的派生卷要回收。"""
+        self.mover.prepare.side_effect = [
+            mock.Mock(target_volume_id="vol-t0"),
+            RuntimeError("快照超时"),
+        ]
+
+        with self.assertRaises(RuntimeError):
+            self.manager._migrate_vm_inner(
+                self.vm,
+                {
+                    "job_id": "job-1",
+                    "data_channel": "relay",
+                    "relay_mover_factory": self.mover_factory,
+                    "volume_concurrency": 1,
+                },
+            )
+
+        self.mover.transfer.assert_not_called()
+        self.mover.discard.assert_called_once()
 
     def test_relay_path_waits_instead_of_starting_immediately(self):
         """create 返回后实例可能还不可见，立刻 os-start 会拿到 404 并把建机判失败。"""
@@ -305,8 +421,8 @@ class RelayPathBranchTest(unittest.TestCase):
             },
         )
 
-        first = self.mover.move.call_args_list[0].kwargs
-        second = self.mover.move.call_args_list[1].kwargs
+        first = self.mover.prepare.call_args_list[0].kwargs
+        second = self.mover.prepare.call_args_list[1].kwargs
         self.assertEqual(first["source_volume_type"], "src-ssd")
         self.assertEqual(first["target_volume_type"], "boot-ssd")
         self.assertIsNone(second["source_volume_type"])
@@ -323,7 +439,7 @@ class RelayPathBranchTest(unittest.TestCase):
             },
         )
 
-        first = self.mover.move.call_args_list[0].kwargs
+        first = self.mover.prepare.call_args_list[0].kwargs
         self.assertEqual(first["target_volume_type"], "boot-ssd")
 
     def test_relay_path_omits_override_when_not_configured(self):
@@ -336,7 +452,7 @@ class RelayPathBranchTest(unittest.TestCase):
             },
         )
 
-        first = self.mover.move.call_args_list[0].kwargs
+        first = self.mover.prepare.call_args_list[0].kwargs
         self.assertIsNone(first["target_volume_type"])
 
     def test_relay_path_requires_mover_factory(self):

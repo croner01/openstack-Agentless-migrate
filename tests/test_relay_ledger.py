@@ -109,3 +109,35 @@ class LedgerTest(unittest.TestCase):
         )
 
         self.assertEqual(Ledger.load(self.path).get("job-1", "vol-1").phase, "queued")
+
+    def test_concurrent_upsert_and_save_keeps_every_record(self):
+        """并发准备（快照/派生）时多线程同时写台账，不能丢记录或写坏文件。"""
+        import threading
+
+        ledger = Ledger.load(self.path)
+        count = 16
+        start = threading.Barrier(count)
+
+        def worker(index):
+            start.wait(timeout=5)
+            for _ in range(5):
+                ledger.upsert(
+                    VolumeTaskRecord(
+                        job_id="job-1",
+                        vm_id=f"vm-{index}",
+                        volume_id=f"vol-{index}",
+                        phase="cloning",
+                    )
+                )
+                ledger.save()
+                # 页面轮询会在同一时刻读台账
+                ledger.all()
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        self.assertEqual(len(ledger.all()), count)
+        self.assertEqual(len(Ledger.load(self.path).all()), count)

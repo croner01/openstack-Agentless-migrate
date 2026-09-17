@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from relay_protocol import DEFAULT_CHUNK, agent_supports_sparse
@@ -52,6 +53,21 @@ def _describe(pool: Any) -> list[str]:
         return list(describe())
     except Exception:  # noqa: BLE001 - 诊断信息取不到不影响主流程
         return []
+
+
+@dataclass
+class PreparedVolume:
+    """「打快照 → 派生拷贝源 → 建目标空白卷」的产物。
+
+    这一段只等存储侧拷贝，没有数据面流量，因此可以按卷并发准备；准备好
+    之后再逐卷走 attach/传输。拆开是为了让多盘 VM 的等待时间不再线性叠加。
+    """
+
+    volume: Any
+    record: Any
+    copy: Any
+    target_volume_id: str
+    index: int
 
 
 class RelayVolumeMover:
@@ -139,15 +155,36 @@ class RelayVolumeMover:
         source_volume_type: str | None = None,
         target_volume_type: str | None = None,
     ) -> dict[str, Any]:
+        """准备 + 传输一条卷，保持原有单卷调用语义。"""
+        return self.transfer(
+            self.prepare(
+                volume=volume,
+                vm_name=vm_name,
+                index=index,
+                source_volume_type=source_volume_type,
+                target_volume_type=target_volume_type,
+            )
+        )
+
+    def prepare(
+        self,
+        *,
+        volume: Any,
+        vm_name: str,
+        index: int,
+        source_volume_type: str | None = None,
+        target_volume_type: str | None = None,
+    ) -> PreparedVolume:
+        """只做「打快照 → 派生拷贝源 → 建目标空白卷」。
+
+        没有数据面流量，多块盘可以并发准备；失败时把已经建出来的快照与
+        派生卷回收，不留占配额的空壳。
+        """
         record = self.record(volume)
         if not record.vm_id:
             # 台账里的 vm_id 就是页面展示用的 VM 名（relay 通道此前一直是空串）。
             record.vm_id = vm_name
-        source_node = target_node = None
         copy = None
-        cleaned = False
-        target_volume_id = ""
-        started_bytes = max(int(record.copied_bytes or 0), 0)
         self._save(record, phase="snapshotting")
         try:
             copy = self.lifecycle.create_source_copy(
@@ -171,7 +208,45 @@ class RelayVolumeMover:
             self._save(
                 record, phase="attaching_target", target_volume_id=target_volume_id
             )
+        except Exception:
+            self._save(record, phase="failed")
+            self.discard(
+                PreparedVolume(
+                    volume=volume,
+                    record=record,
+                    copy=copy,
+                    target_volume_id="",
+                    index=index,
+                )
+            )
+            raise
+        return PreparedVolume(
+            volume=volume,
+            record=record,
+            copy=copy,
+            target_volume_id=target_volume_id,
+            index=index,
+        )
 
+    def discard(self, prepared: PreparedVolume) -> None:
+        """回收准备阶段建出来的派生卷与快照（该卷不再继续传输）。"""
+        if prepared is None or prepared.copy is None:
+            return
+        try:
+            self.lifecycle.cleanup_source_copy(prepared.copy, "")
+        except Exception:  # noqa: BLE001 - 清理失败不覆盖原始错误
+            logging.exception("[MIGRATION] 回收派生卷失败")
+
+    def transfer(self, prepared: PreparedVolume) -> dict[str, Any]:
+        """挂载两侧卷、搬数据、清理，返回目标卷信息。"""
+        volume = prepared.volume
+        record = prepared.record
+        copy = prepared.copy
+        target_volume_id = prepared.target_volume_id
+        source_node = target_node = None
+        cleaned = False
+        started_bytes = max(int(record.copied_bytes or 0), 0)
+        try:
             source_node = self._acquire_with_wait(
                 self.source_pool, volume.source_volume_id
             )

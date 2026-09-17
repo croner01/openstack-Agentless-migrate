@@ -72,6 +72,10 @@ class RelayChannelConfig:
     heartbeat_timeout: int = 30
     stall_timeout: float = 300.0
     slot_wait_timeout: float = 1800.0
+    #: 「打快照 / 快照派生卷」的等待超时（秒），0 = 按卷大小自适应。
+    #: 商业存储上这一步常是存储侧全量拷贝，固定阈值会把只是慢的大卷判成失败。
+    volume_ready_timeout: float = 0.0
+    snapshot_ready_timeout: float = 0.0
     hole_mode: str = "skip"
     source_cloud: str = ""
     target_cloud: str = ""
@@ -266,6 +270,16 @@ def parse_relay_options(options: dict[str, Any]) -> RelayChannelConfig | None:
         heartbeat_timeout=max(int(options.get("relay_heartbeat_timeout") or 30), 1),
         stall_timeout=max(float(options.get("relay_stall_timeout") or 300.0), 30.0),
         slot_wait_timeout=max(float(options.get("relay_slot_wait_seconds") or 1800.0), 0.0),
+        volume_ready_timeout=max(float(options.get("volume_ready_timeout") or 0.0), 0.0),
+        # 页面只有一个「卷/快照就绪超时」输入；未单独给快照超时时沿用它。
+        snapshot_ready_timeout=max(
+            float(
+                options.get("snapshot_ready_timeout")
+                or options.get("volume_ready_timeout")
+                or 0.0
+            ),
+            0.0,
+        ),
         hole_mode=hole_mode,
         ready_timeout=max(float(options.get("relay_ready_timeout") or 180), 1.0),
         source_cloud=str(options.get("source_cloud") or ""),
@@ -348,7 +362,12 @@ class RelayRuntime:
         self._progress_samples: dict[str, tuple[float, int, float | None]] = {}
         self._progress_percent: dict[str, float] = {}
         self._created_ports: dict[str, list[str]] = {"source": [], "target": []}
-        self.lifecycle = VolumeLifecycle(source_os, target_os)
+        self.lifecycle = VolumeLifecycle(
+            source_os,
+            target_os,
+            ready_timeout=config.volume_ready_timeout or None,
+            snapshot_timeout=config.snapshot_ready_timeout or None,
+        )
         self.source_pool = RelayPool(
             role="source",
             job_id=job_id,
@@ -627,6 +646,9 @@ class RelayRuntime:
             "target": [asdict(node) for node in self.target_pool.nodes],
             "ledger": self.ledger_summary(),
             "volumes": self.volume_progress(),
+            # 用服务端时钟做基准：浏览器与服务器时间不同步时，页面算出来的
+            # "已等待" 才不会凭空多出几小时。
+            "now": time.time(),
         }
 
     def volume_progress(self) -> list[dict[str, Any]]:
@@ -675,6 +697,9 @@ class RelayRuntime:
                     ),
                     "progress_percent": percent,
                     "throughput_mb_s": throughput,
+                    # 打快照/派生卷这类阶段没有字节流动，页面靠 updated_at
+                    # 显示"已等待多久"，否则只能看到"暂无在途卷"。
+                    "updated_at": float(getattr(record, "updated_at", 0.0) or 0.0),
                 }
             )
         return items

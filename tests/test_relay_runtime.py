@@ -110,6 +110,28 @@ class ParseRelayOptionsTest(unittest.TestCase):
 
         self.assertEqual(config.target.volume_type, "ssd")
 
+    def test_derive_timeouts_default_to_zero_meaning_auto(self):
+        """作业表单不填超时 ⇒ 0，交给按卷大小自适应的逻辑。"""
+        config = parse_relay_options(self._options())
+
+        self.assertEqual(config.volume_ready_timeout, 0.0)
+        self.assertEqual(config.snapshot_ready_timeout, 0.0)
+
+    def test_derive_timeouts_come_from_job_options(self):
+        config = parse_relay_options(
+            self._options(volume_ready_timeout="7200", snapshot_ready_timeout="5400")
+        )
+
+        self.assertEqual(config.volume_ready_timeout, 7200.0)
+        self.assertEqual(config.snapshot_ready_timeout, 5400.0)
+
+    def test_snapshot_timeout_follows_volume_timeout_when_unset(self):
+        """页面只有一个超时输入框，没单独填快照超时就沿用它。"""
+        config = parse_relay_options(self._options(volume_ready_timeout="7200"))
+
+        self.assertEqual(config.volume_ready_timeout, 7200.0)
+        self.assertEqual(config.snapshot_ready_timeout, 7200.0)
+
     def test_fixed_ips_accept_space_and_semicolon_separators(self):
         config = parse_relay_options(
             self._options(relay_source_ips="10.0.0.11 10.0.0.12;10.0.0.13")
@@ -312,6 +334,26 @@ class RelayRuntimeTest(unittest.TestCase):
         self.assertEqual(volumes[0]["progress_percent"], 25.0)
         # 与 RBD 直连一致：带上中文阶段标签，页面才有「标签 · 百分比 · 速率」。
         self.assertEqual(volumes[0]["progress_label"], "全量传输")
+
+    def test_snapshot_exposes_phase_age_for_waiting_volumes(self):
+        """打快照/派生卷阶段没有字节流动，页面靠 now - updated_at 显示已等待多久。"""
+        from relay_ledger import VolumeTaskRecord
+
+        record = VolumeTaskRecord(
+            job_id="job-1",
+            vm_id="vm-1",
+            volume_id="vol-s1",
+            phase="snapshotting",
+            total_bytes=0,
+            copied_bytes=0,
+        )
+        record.updated_at = 1000.0
+        self.ledger.all.return_value = [record]
+
+        snapshot = self.runtime.snapshot()
+
+        self.assertEqual(snapshot["volumes"][0]["updated_at"], 1000.0)
+        self.assertIn("now", snapshot)
 
     def test_volume_progress_percent_never_goes_backwards(self):
         from relay_ledger import VolumeTaskRecord

@@ -4,7 +4,7 @@ import os
 import time
 from typing import Any
 
-from env_utils import env_int
+from env_utils import env_float, env_int
 
 
 # Version marker: bump whenever the diagnostic path changes so a running
@@ -34,6 +34,44 @@ def volume_ready_timeout_default() -> int:
     会把只是"慢"的卷判成失败。
     """
     return env_int("MIGRATION_VOLUME_READY_TIMEOUT", 1800, minimum=1)
+
+
+#: Cinder 快照等待 available 的默认超时。后端是 Ceph 这类 CoW 存储时打快照
+#: 是秒级；商业存储多半是存储侧全量拷贝，大卷远不止这个数，靠下面的
+#: `derive_ready_timeout()` 按卷大小放大。
+SNAPSHOT_READY_TIMEOUT_SECONDS = 600
+
+#: 「快照 → 派生卷」每 GiB 折算的等待秒数。全量拷贝按 50MB/s 估算约 20s/GiB，
+#: 用来给大卷兜底；用 MIGRATION_DERIVE_SECONDS_PER_GIB 覆盖。
+DERIVE_SECONDS_PER_GIB = 20.0
+
+
+def snapshot_ready_timeout_default() -> int:
+    """快照等待 available 的默认超时，MIGRATION_SNAPSHOT_READY_TIMEOUT 调整。"""
+    return env_int(
+        "MIGRATION_SNAPSHOT_READY_TIMEOUT",
+        SNAPSHOT_READY_TIMEOUT_SECONDS,
+        minimum=1,
+    )
+
+
+def derive_ready_timeout(base: float, size_gib: Any) -> float:
+    """按卷大小放大「快照 / 派生卷」的等待超时。
+
+    商业存储上 `create_snapshot` 与 `create_volume(snapshot_id=...)` 常常是
+    存储侧全量拷贝，耗时与卷容量成正比；固定阈值只会把"只是慢"的大卷判成
+    失败。取 `max(base, size_gib × 每秒GiB折算)`：小卷保持基线，大卷自动放宽。
+    """
+    per_gib = env_float(
+        "MIGRATION_DERIVE_SECONDS_PER_GIB",
+        DERIVE_SECONDS_PER_GIB,
+        minimum=0.0,
+    )
+    try:
+        size = max(float(size_gib or 0.0), 0.0)
+    except (TypeError, ValueError):
+        size = 0.0
+    return max(float(base), size * per_gib)
 
 
 #: Cinder 卷可用区（与 Nova 的 AZ 是两套独立命名空间）。
@@ -1676,18 +1714,43 @@ class OpenStackUtils:
         self,
         snapshot_id: str,
         target: str = "available",
-        timeout: int = 600,
+        timeout: float | None = None,
         poll_interval: int = 5,
+        *,
+        context: str = "",
     ):
+        if timeout is None:
+            timeout = snapshot_ready_timeout_default()
         deadline = time.time() + timeout
+        last_status = "unknown"
+        polls = 0
         while time.time() < deadline:
             snapshot = self.conn.block_storage.get_snapshot(snapshot_id)
-            if snapshot.status == target:
+            last_status = str(snapshot.status or "unknown")
+            status = _normalize_status(last_status)
+            if status == _normalize_status(target):
                 return snapshot
-            if snapshot.status == "error":
-                raise RuntimeError(f"快照 {snapshot_id} 状态异常: {snapshot.status}")
+            if status.startswith("error"):
+                raise RuntimeError(
+                    f"快照 {snapshot_id} 状态异常: {last_status}{context}"
+                )
+            polls += 1
+            if polls % 12 == 0:
+                # 商业存储打快照可能是全量拷贝，几分钟没有任何输出会让用户
+                # 以为任务卡死；按同样的节奏打点，日志里能看出还在推进。
+                logging.warning(
+                    "[MIGRATION] 快照 %s 等待 %s，当前状态 %s，已等待 %ss%s",
+                    snapshot_id,
+                    target,
+                    last_status,
+                    polls * poll_interval,
+                    context,
+                )
             time.sleep(poll_interval)
-        raise TimeoutError(f"等待快照 {snapshot_id} 达到 {target} 超时")
+        raise TimeoutError(
+            f"等待快照 {snapshot_id} 达到 {target} 超时"
+            f"（等待 {timeout:.0f}s，最后状态 {last_status}）{context}"
+        )
 
     def wait_volume_status(
         self,

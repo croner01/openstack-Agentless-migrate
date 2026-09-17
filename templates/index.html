@@ -755,7 +755,7 @@ body.wizard-view .toast-box { bottom: 92px; }
                                             <option value="incremental">增量预拷贝（实验）</option>
                                         </select></div>
                                     <div><label class="form-label">同时迁移 VM 数</label><input class="fld mono" type="number" min="1" max="10" name="vm_concurrency" value="1"></div>
-                                    <div><label class="form-label">单台卷拷贝并发</label><input class="fld mono" type="number" min="1" max="8" name="volume_concurrency" value="1"></div>
+                                    <div><label class="form-label" title="RBD 直连：同时拷贝几块卷；中转机通道：几块盘同时打快照/派生（这一段只等存储，调大可显著缩短多盘 VM 的等待）">单台卷拷贝并发</label><input class="fld mono" type="number" min="1" max="8" name="volume_concurrency" value="1"></div>
                                     <div><label class="form-label">单卷限速 (MiB/s，0 不限)</label><input class="fld mono" type="number" min="0" step="any" name="rate_limit_mb_s" value="0"></div>
                                     <div><label class="form-label">默认 VM 密码</label><input class="fld" type="password" name="admin_password" autocomplete="new-password" placeholder="留空则随机生成"></div>
                                     <div><label class="form-label">目标卷类型</label><input class="fld mono" name="target_volume_type" placeholder="留空使用目标默认"></div>
@@ -808,6 +808,8 @@ body.wizard-view .toast-box { bottom: 92px; }
                                     <div><label class="form-label">心跳超时 (秒)</label><input class="fld mono" type="number" min="1" name="relay_heartbeat_timeout" value="30"></div>
                                     <div><label class="form-label">拷贝重试次数</label><input class="fld mono" type="number" min="0" max="10" name="relay_copy_retries" value="3"></div>
                                     <div><label class="form-label">停滞判死 (秒)</label><input class="fld mono" type="number" min="30" name="relay_stall_timeout" value="300"></div>
+                                    <div><label class="form-label" title="打快照与快照派生卷的等待上限。0 = 按卷大小自动放宽（商业存储上这一步常是存储侧全量拷贝）">卷/快照就绪超时 (秒)</label><input class="fld mono" type="number" min="0" name="volume_ready_timeout" value="0" placeholder="0 = 按卷大小自动"></div>
+                                    <div><label class="form-label" title="池里没有空闲中转机时的等待上限">等待空闲槽位 (秒)</label><input class="fld mono" type="number" min="0" name="relay_slot_wait_seconds" value="1800"></div>
                                     <div><label class="form-label">空洞模式</label>
                                         <select class="sel" name="relay_hole_mode" style="width:100%">
                                             <option value="skip" selected>skip（空盘最快，依赖空白卷）</option>
@@ -1183,7 +1185,8 @@ const state = {
     profiles: [],
     editingProfileId: '',
     statFilter: '',
-    theme: 'auto'
+    theme: 'auto',
+    relayNow: 0
 };
 
 function readAuth(prefix) {
@@ -2740,7 +2743,9 @@ async function startMigration() {
             data.append('relay_agent_install', $('[name="relay_agent_install"]').value);
             data.append('relay_data_port', $('[name="relay_data_port"]').value);
             ['relay_admin_password', 'relay_ssh_public_key', 'relay_ready_timeout',
-             'relay_heartbeat_interval', 'relay_heartbeat_timeout', 'relay_copy_retries'].forEach(name => {
+             'relay_heartbeat_interval', 'relay_heartbeat_timeout', 'relay_copy_retries',
+             'relay_stall_timeout', 'relay_slot_wait_seconds',
+             'volume_ready_timeout'].forEach(name => {
                 const el = $('[name="' + name + '"]');
                 if (el) data.append(name, el.value);
             });
@@ -3785,6 +3790,7 @@ async function refreshRelayPool() {
         const json = await res.json();
         if (!json.relay) { tab.classList.add('hidden'); return; }
         tab.classList.remove('hidden');
+        state.relayNow = json.relay.now || 0;
         const nodes = [...json.relay.source, ...json.relay.target];
         const busy = nodes.filter(node => node.state === 'busy').length;
         const unhealthy = nodes.filter(node => node.state === 'unhealthy').length;
@@ -3819,10 +3825,29 @@ function relayPhaseBadge(volume) {
     const span = text('span', 'badge ' + cls);
     if (cls === 'badge-running') span.innerHTML = '<span class="bdot"></span>';
     span.appendChild(document.createTextNode(volume.progress_label || phase || '—'));
+    const waited = relayWaitText(volume, state.relayNow);
+    if (waited) {
+        span.appendChild(text('span', 'sec-note', ' · ' + waited));
+    }
     return span;
 }
 
 /* 与 RBD 路径共用 progressBarHTML，两侧进度条观感保持一致。 */
+/* 打快照 / 派生卷 / 排队这类阶段没有字节流动，进度条永远是 0，
+   页面要单独把"已经等了多久"说清楚，否则看起来像卡死。 */
+const RELAY_WAIT_PHASES = ['queued', 'snapshotting', 'cloning', 'attaching_source', 'attaching_target'];
+function relayWaitText(volume, serverNow) {
+    if (RELAY_WAIT_PHASES.indexOf(volume.phase || '') < 0) return '';
+    const started = Number(volume.updated_at) || 0;
+    const now = Number(serverNow) || 0;
+    if (!started || !now || now < started) return '';
+    const seconds = Math.floor(now - started);
+    if (seconds < 5) return '';
+    return seconds >= 3600
+        ? '已等待 ' + Math.floor(seconds / 3600) + 'h' + Math.floor((seconds % 3600) / 60) + 'm'
+        : '已等待 ' + Math.floor(seconds / 60) + 'm' + (seconds % 60) + 's';
+}
+
 function relayProgressHTML(volume) {
     if (volume.phase === 'done') return '100%';
     const total = Number(volume.total_bytes) || 0;
@@ -3843,7 +3868,12 @@ function relayVolumeBytes(volume) {
 function relayVolumeProgress(volumes) {
     const tb = $('#relay-volume-progress');
     if (!tb) return;
-    const rows = (volumes || []).filter(volume => volume.total_bytes > 0 || volume.copied_bytes > 0);
+    // 打快照/派生卷阶段还没有任何字节，按字节过滤会把最慢的一步整段藏起来，
+    // 页面显示"暂无在途卷"而任务其实在跑。未结束的记录一律保留。
+    const finished = ['done', 'cleaned', 'failed', 'failed_retained'];
+    const rows = (volumes || []).filter(volume =>
+        volume.total_bytes > 0 || volume.copied_bytes > 0 ||
+        finished.indexOf(volume.phase || '') < 0);
     if (!rows.length) {
         tb.innerHTML = '<tr><td colspan="5" class="empty-box">暂无在途卷</td></tr>';
         return;

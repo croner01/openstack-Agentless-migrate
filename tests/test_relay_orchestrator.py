@@ -475,6 +475,67 @@ class RelayVolumeMoverTest(unittest.TestCase):
         kwargs = self.lifecycle.create_target_volume.call_args.kwargs
         self.assertEqual(kwargs["volume_type"], "pool-default")
 
+    def test_prepare_only_snapshots_and_builds_target_volume(self):
+        """准备阶段不碰数据面：不取中转机槽位、不挂载、不传输。"""
+        prepared = self.mover.prepare(volume=_Volume(), vm_name="vm-1", index=3)
+
+        self.assertEqual(prepared.target_volume_id, "vol-t1")
+        self.assertEqual(prepared.copy.derived_volume_id, "vol-d1")
+        self.assertEqual(self.ledger.get("job-1", "vol-s1").phase, "attaching_target")
+        self.assertEqual(self.state.enqueued, [])
+        self.lifecycle.attach.assert_not_called()
+        # 目标卷名按盘序号区分，多块盘并发准备不会撞名。
+        self.assertEqual(
+            self.lifecycle.create_target_volume.call_args.kwargs["name"],
+            "vm-1-vol-3",
+        )
+
+    def test_prepare_failure_reclaims_derived_copy(self):
+        """派生卷建出来之后再失败（例如建目标卷配额拒绝）也要回收。"""
+        self.lifecycle.create_target_volume.side_effect = RuntimeError("quota exceeded")
+
+        with self.assertRaises(RuntimeError):
+            self.mover.prepare(volume=_Volume(), vm_name="vm-1", index=0)
+
+        self.lifecycle.cleanup_source_copy.assert_called_once()
+        self.assertEqual(self.ledger.get("job-1", "vol-s1").phase, "failed")
+
+    def test_prepare_failure_before_copy_skips_cleanup(self):
+        self.lifecycle.create_source_copy.side_effect = RuntimeError("快照失败")
+
+        with self.assertRaises(RuntimeError):
+            self.mover.prepare(volume=_Volume(), vm_name="vm-1", index=0)
+
+        self.lifecycle.cleanup_source_copy.assert_not_called()
+
+    def test_discard_is_noop_without_copy(self):
+        from relay_orchestrator import PreparedVolume
+
+        self.mover.discard(
+            PreparedVolume(
+                volume=_Volume(), record=None, copy=None, target_volume_id="", index=0
+            )
+        )
+
+        self.lifecycle.cleanup_source_copy.assert_not_called()
+
+    def test_discard_survives_cleanup_error(self):
+        """回收失败只记日志，不能盖掉调用方真正要抛的失败原因。"""
+        from relay_orchestrator import PreparedVolume
+        from relay_volumes import SourceCopy
+
+        self.lifecycle.cleanup_source_copy.side_effect = RuntimeError("删不掉")
+
+        self.mover.discard(
+            PreparedVolume(
+                volume=_Volume(),
+                record=None,
+                copy=SourceCopy(snapshot_id="s", derived_volume_id="d"),
+                target_volume_id="",
+                index=0,
+            )
+        )
+
     def test_move_cleans_up_and_releases_on_success(self):
         original_enqueue = self.state.enqueue
         self.state.enqueue = lambda task: (original_enqueue(task), self._auto_complete())

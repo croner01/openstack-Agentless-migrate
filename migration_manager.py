@@ -326,21 +326,17 @@ class MigrationManager:
             override_key(vm.source_server_id, vm.name)
         ) or {}
         self._set_phase(vm, VmStatus.COPYING_VOLUMES, "relay_copying")
+        indexed_entries = list(enumerate([boot_entries[0]] + data_entries))
+        prepared = self._prepare_relay_volumes(
+            mover,
+            vm,
+            indexed_entries,
+            volume_types,
+            workers=int(options.get("volume_concurrency") or 1),
+        )
         target_volume_ids: list[str] = []
-        for index, entry in enumerate([boot_entries[0]] + data_entries):
-            override = volume_types.get(entry["volume_id"]) or {}
-            if isinstance(override, str):  # 兼容只写了目标类型的旧格式
-                override = {"target": override}
-            result = mover.move(
-                volume=SimpleNamespace(
-                    source_volume_id=entry["volume_id"],
-                    size=int(entry.get("size") or 0),
-                ),
-                vm_name=vm.name,
-                index=index,
-                source_volume_type=str(override.get("source") or "").strip() or None,
-                target_volume_type=str(override.get("target") or "").strip() or None,
-            )
+        for index, item in enumerate(prepared):
+            result = mover.transfer(item)
             target_volume_id = str(result["target_volume_id"])
             if index == 0:
                 # 空白启动盘默认不可启动，先置位再建机，否则 Nova 返回
@@ -368,6 +364,90 @@ class MigrationManager:
         self.target_os.wait_server_booted(server.id)
         self._stop_target_if_requested(vm)
         self._set_phase(vm, VmStatus.VERIFYING, "verifying")
+
+    def _prepare_relay_volumes(
+        self,
+        mover: Any,
+        vm: VmTask,
+        indexed_entries: list[tuple[int, dict[str, Any]]],
+        volume_types: dict[str, Any],
+        *,
+        workers: int,
+    ) -> list[Any]:
+        """并发把每块盘的「打快照 → 派生拷贝源 → 建目标空白卷」做完。
+
+        这一段只等存储侧拷贝，没有任何数据面流量：串行做的话，多盘 VM 的
+        等待时间会随盘数线性叠加（每块大容量盘在商业存储上都要几小时）。
+        并发度沿用「单台卷拷贝并发」，默认 1（与原来的串行行为一致）。
+
+        失败时不再继续传输，已建出来的派生卷/快照一律回收，避免占配额；
+        正在跑的其余准备任务会先跑完再抛错，防止后台线程留下孤儿资源。
+        """
+        limit = max(1, min(int(workers or 1), len(indexed_entries)))
+
+        def prepare_one(index: int, entry: dict[str, Any]):
+            override = volume_types.get(entry["volume_id"]) or {}
+            if isinstance(override, str):  # 兼容只写了目标类型的旧格式
+                override = {"target": override}
+            return mover.prepare(
+                volume=SimpleNamespace(
+                    source_volume_id=entry["volume_id"],
+                    size=int(entry.get("size") or 0),
+                ),
+                vm_name=vm.name,
+                index=index,
+                source_volume_type=str(override.get("source") or "").strip() or None,
+                target_volume_type=str(override.get("target") or "").strip() or None,
+            )
+
+        if limit <= 1:
+            prepared: list[Any] = []
+            try:
+                for index, entry in indexed_entries:
+                    prepared.append(prepare_one(index, entry))
+            except Exception:
+                # 串行同样会"先全部准备、再逐块传输"，中途失败时前面已建好的
+                # 派生卷/目标卷还没人用上，必须回收。
+                for item in prepared:
+                    mover.discard(item)
+                raise
+            return prepared
+
+        logging.info(
+            "[MIGRATION] VM %s 并发准备 %s 块盘（快照/派生并发 %s）",
+            vm.name,
+            len(indexed_entries),
+            limit,
+        )
+        results: list[Any] = [None] * len(indexed_entries)
+        failure: Exception | None = None
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=limit, thread_name_prefix="relay-prep"
+        ) as pool:
+            futures = {
+                pool.submit(prepare_one, index, entry): position
+                for position, (index, entry) in enumerate(indexed_entries)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                position = futures[future]
+                try:
+                    results[position] = future.result()
+                except Exception as exc:  # noqa: BLE001 - 汇总成一次 VM 级失败
+                    if failure is None:
+                        failure = exc
+                        for pending in futures:
+                            pending.cancel()
+                    else:
+                        logging.warning(
+                            "[MIGRATION] VM %s 并发准备另有失败: %s", vm.name, exc
+                        )
+        if failure is not None:
+            # 已经建出来的派生卷/目标卷不能留：连同失败的那块一起回收。
+            for item in results:
+                if item is not None:
+                    mover.discard(item)
+            raise failure
+        return results
 
     def _resolve_source_server(self, vm: VmTask):
         if vm.source_server_id:

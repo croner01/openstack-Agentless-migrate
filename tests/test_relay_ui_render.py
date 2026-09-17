@@ -363,3 +363,33 @@ class RelayPageRenderTest(unittest.TestCase):
         self.assertIn("options && options.keepState", html)
         self.assertIn("['迁移后开机', vm.start_target === false ? '否（目标机保持关机）' : '是']", html)
         self.assertIn("const keepOff = vm.start_target === false;", html)
+
+    def test_relay_progress_keeps_byte_less_phases_visible(self):
+        """打快照/派生卷阶段字节为 0，按字节过滤会让页面显示「暂无在途卷」。"""
+        html = self._html()
+
+        self.assertIn("function relayWaitText", html)
+        self.assertIn("RELAY_WAIT_PHASES", html)
+        self.assertIn("state.relayNow = json.relay.now", html)
+        self.assertIn("finished.indexOf(volume.phase || '') < 0", html)
+
+    def test_submit_form_carries_all_relay_timeouts(self):
+        """提交表单必须带上此前只在预检里传的超时，否则填了也不生效。"""
+        html = self._html()
+
+        self.assertIn('name="volume_ready_timeout"', html)
+        self.assertIn('name="relay_slot_wait_seconds"', html)
+        for field in ("relay_stall_timeout", "relay_slot_wait_seconds", "volume_ready_timeout"):
+            self.assertIn("'" + field + "'", html)
+
+    def test_derive_timeout_field_defaults_to_auto(self):
+        """「卷/快照就绪超时」默认 0 = 按卷大小自动，页面要写清楚。"""
+        html = self._html()
+
+        self.assertIn('0 = 按卷大小自动', html)
+
+    def test_volume_concurrency_hint_covers_relay_prepare(self):
+        """「单台卷拷贝并发」同样作用于中转机的快照/派生并发，页面要说明。"""
+        html = self._html()
+
+        self.assertIn("几块盘同时打快照/派生", html)

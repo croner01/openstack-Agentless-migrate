@@ -8,6 +8,12 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from openstack_utils import (
+    derive_ready_timeout,
+    snapshot_ready_timeout_default,
+    volume_ready_timeout_default,
+)
+
 
 @dataclass
 class SourceCopy:
@@ -29,9 +35,35 @@ def _raise_quota_hint(exc: Exception, *, side: str, size: int, volume_type: str)
 
 
 class VolumeLifecycle:
-    def __init__(self, source_os: Any, target_os: Any):
+    """卷生命周期：源快照、派生卷、挂载卸载与清理。
+
+    ``ready_timeout`` / ``snapshot_timeout`` 是作业级覆盖（秒）：给了就原样用，
+    留空则按环境变量基线 + 卷容量自适应。商业存储上「打快照 → 派生卷」多半是
+    存储侧全量拷贝，耗时与卷大小成正比，固定阈值会把只是慢的大卷判成失败。
+    """
+
+    def __init__(
+        self,
+        source_os: Any,
+        target_os: Any,
+        *,
+        ready_timeout: float | None = None,
+        snapshot_timeout: float | None = None,
+    ):
         self.source_os = source_os
         self.target_os = target_os
+        self.ready_timeout = float(ready_timeout) if ready_timeout else None
+        self.snapshot_timeout = float(snapshot_timeout) if snapshot_timeout else None
+
+    def _derive_timeouts(self, size: int) -> tuple[float, float]:
+        """返回 (快照等待, 派生卷等待)，单位秒。"""
+        snapshot = self.snapshot_timeout or derive_ready_timeout(
+            snapshot_ready_timeout_default(), size
+        )
+        volume = self.ready_timeout or derive_ready_timeout(
+            volume_ready_timeout_default(), size
+        )
+        return float(snapshot), float(volume)
 
     def _os_for(self, role: str):
         if role == "source":
@@ -62,8 +94,19 @@ class VolumeLifecycle:
         """对源卷打快照并派生一份可挂载的拷贝源。"""
         name = f"mig-{vm_name}-{index}"
         resolved_type = volume_type or self._source_volume_type(volume_id)
+        snapshot_timeout, volume_timeout = self._derive_timeouts(size)
+        context = f"（源卷派生 {name}，{int(size or 0)}GiB）"
+        logging.info(
+            "[MIGRATION] 源卷 %s 开始快照派生 %s，等待上限 快照 %.0fs / 派生 %.0fs",
+            volume_id,
+            context,
+            snapshot_timeout,
+            volume_timeout,
+        )
         snapshot = self.source_os.create_volume_snapshot(volume_id=volume_id, name=name)
-        self.source_os.wait_snapshot_status(snapshot.id)
+        self.source_os.wait_snapshot_status(
+            snapshot.id, timeout=snapshot_timeout, context=context
+        )
         try:
             derived = self.source_os.create_volume_from_snapshot(
                 name=f"{name}-copy",
@@ -75,7 +118,9 @@ class VolumeLifecycle:
             _raise_quota_hint(
                 exc, side="源端派生", size=size, volume_type=resolved_type or ""
             )
-        self.source_os.wait_volume_status(derived.id)
+        self.source_os.wait_volume_status(
+            derived.id, timeout=volume_timeout, context=context
+        )
         logging.info(
             "[MIGRATION] 源卷派生完成 volume=%s snapshot=%s derived=%s",
             volume_id,

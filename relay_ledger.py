@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,9 @@ class Ledger:
     def __init__(self, path: Path | str):
         self.path = Path(path)
         self._records: dict[str, VolumeTaskRecord] = {}
+        # 并发准备（打快照/派生卷）时会有多个线程同时写台账，页面轮询也在
+        # 同时读；没有锁的话 upsert 可能撞上 dump 的迭代，或丢掉更新的记录。
+        self._lock = threading.RLock()
 
     @classmethod
     def load(cls, path: Path | str) -> "Ledger":
@@ -59,10 +63,12 @@ class Ledger:
         return ledger
 
     def get(self, job_id: str, volume_id: str) -> VolumeTaskRecord | None:
-        return self._records.get(f"{job_id}:{volume_id}")
+        with self._lock:
+            return self._records.get(f"{job_id}:{volume_id}")
 
     def all(self) -> list[VolumeTaskRecord]:
-        return list(self._records.values())
+        with self._lock:
+            return list(self._records.values())
 
     def prune(
         self,
@@ -78,26 +84,26 @@ class Ledger:
         """
         current = time.time() if now is None else now
         cutoff = current - max_age_seconds
-        stale = [
-            key
-            for key, record in self._records.items()
-            if record.phase in prunable_phases
-            and (record.updated_at or record.created_at or 0.0) < cutoff
-        ]
-        for key in stale:
-            self._records.pop(key, None)
+        with self._lock:
+            stale = [
+                key
+                for key, record in self._records.items()
+                if record.phase in prunable_phases
+                and (record.updated_at or record.created_at or 0.0) < cutoff
+            ]
+            for key in stale:
+                self._records.pop(key, None)
         return len(stale)
 
     def upsert(self, record: VolumeTaskRecord) -> VolumeTaskRecord:
-        existing = self._records.get(record.key)
-        if existing is not None and not record.created_at:
-            record.created_at = existing.created_at
-        self._records[record.key] = record
+        with self._lock:
+            existing = self._records.get(record.key)
+            if existing is not None and not record.created_at:
+                record.created_at = existing.created_at
+            self._records[record.key] = record
         return record
 
     def save(self) -> None:
-        atomic_write_json(
-            self.path,
-            dump_dataclass_records(list(self._records.values()), key="records"),
-            prefix=".relay-ledger-",
-        )
+        with self._lock:
+            payload = dump_dataclass_records(list(self._records.values()), key="records")
+        atomic_write_json(self.path, payload, prefix=".relay-ledger-")

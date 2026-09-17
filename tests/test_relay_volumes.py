@@ -39,8 +39,57 @@ class VolumeLifecycleTest(unittest.TestCase):
             volume_id="vol-s1", vm_name="vm-1", index=0, size=40
         )
 
-        self.source_os.wait_snapshot_status.assert_called_once_with("snap-1")
-        self.source_os.wait_volume_status.assert_called_once_with("vol-d1")
+        snap_args, snap_kwargs = self.source_os.wait_snapshot_status.call_args
+        self.assertEqual(snap_args, ("snap-1",))
+        self.assertIn("mig-vm-1-0", snap_kwargs["context"])
+        self.assertIn("40GiB", snap_kwargs["context"])
+        clone_args, clone_kwargs = self.source_os.wait_volume_status.call_args
+        self.assertEqual(clone_args, ("vol-d1",))
+        self.assertIn("mig-vm-1-0", clone_kwargs["context"])
+        self.assertIn("40GiB", clone_kwargs["context"])
+
+    def test_derive_waits_scale_with_volume_size(self):
+        """大卷在商业存储上是全量拷贝，快照/派生等待必须按容量放大。"""
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.lifecycle.create_source_copy(
+                volume_id="vol-s1", vm_name="vm-1", index=0, size=2048
+            )
+
+        snap_kwargs = self.source_os.wait_snapshot_status.call_args.kwargs
+        clone_kwargs = self.source_os.wait_volume_status.call_args.kwargs
+        self.assertEqual(snap_kwargs["timeout"], 2048 * 20)
+        self.assertEqual(clone_kwargs["timeout"], 2048 * 20)
+
+    def test_small_volume_keeps_env_defaults(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.lifecycle.create_source_copy(
+                volume_id="vol-s1", vm_name="vm-1", index=0, size=10
+            )
+
+        self.assertEqual(
+            self.source_os.wait_snapshot_status.call_args.kwargs["timeout"], 600
+        )
+        self.assertEqual(
+            self.source_os.wait_volume_status.call_args.kwargs["timeout"], 1800
+        )
+
+    def test_job_level_timeout_overrides_size_scaling(self):
+        """作业表单填了超时就用它，别再按容量放大。"""
+        lifecycle = VolumeLifecycle(
+            self.source_os, self.target_os, ready_timeout=7200, snapshot_timeout=7200
+        )
+
+        with mock.patch.dict("os.environ", {}, clear=True):
+            lifecycle.create_source_copy(
+                volume_id="vol-s1", vm_name="vm-1", index=0, size=4096
+            )
+
+        self.assertEqual(
+            self.source_os.wait_snapshot_status.call_args.kwargs["timeout"], 7200
+        )
+        self.assertEqual(
+            self.source_os.wait_volume_status.call_args.kwargs["timeout"], 7200
+        )
 
     def test_attach_uses_role_cloud_and_waits_in_use(self):
         attachment = self.lifecycle.attach(
