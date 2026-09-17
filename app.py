@@ -1406,12 +1406,79 @@ def api_job_relay_rebuild(job_id: str, node_id: str):
     return jsonify({"ok": True, "node": node})
 
 
+def _existing_relay_pools(auth: dict[str, Any], role: str) -> list[dict[str, Any]]:
+    """该凭据下已有的常驻池参数，供作业表单直接沿用。
+
+    常驻池一旦建好，建机参数就已经存在池参数里（``PoolProfile``），作业表单
+    再填一遍既多余又容易跟池里不一致。这里按 ``source/target`` 侧的云指纹
+    查出已有池，前端据此隐藏建机参数、只留"选哪个 AZ 的池"。
+    """
+    layer = RELAY_RESOURCES
+    try:
+        if not layer.ensure():
+            return []
+    except Exception:  # noqa: BLE001 - 查不到已有池不影响目录加载
+        logging.exception("[MIGRATION] 读取常驻中转机池失败")
+        return []
+    tenant_key = _cloud_fingerprint(auth)
+    pools: list[dict[str, Any]] = []
+    try:
+        profiles = [item for item in layer.profiles.for_tenant(tenant_key) if item.role == role]
+        for profile in profiles:
+            nodes = layer.inventory.nodes_in_pool(tenant_key, role, profile.az)
+            pools.append(
+                {
+                    "az": profile.az,
+                    "image": profile.image,
+                    "flavor": profile.flavor,
+                    "network": profile.network,
+                    "subnet": profile.subnet,
+                    "system_volume_type": profile.system_volume_type,
+                    "data_floating_network": profile.data_floating_network,
+                    "slots_per_node": profile.slots_per_node,
+                    "max_nodes": profile.max_nodes,
+                    "min_nodes": profile.min_nodes,
+                    "data_port": profile.data_port,
+                    "platform_url": profile.platform_url,
+                    "ssh_public_key": profile.ssh_public_key,
+                    "nodes": len(nodes),
+                    "slots_total": sum(
+                        int(getattr(node, "slots_total", 0) or 0) for node in nodes
+                    ),
+                    "slots_used": sum(
+                        int(getattr(node, "slots_used", 0) or 0) for node in nodes
+                    ),
+                }
+            )
+    except Exception:  # noqa: BLE001 - 单个池读不出来不影响其它池
+        logging.exception("[MIGRATION] 汇总常驻中转机池失败 tenant=%s", tenant_key)
+        return []
+    return sorted(pools, key=lambda item: item["az"])
+
+
 @app.post("/api/relay/catalog")
 def api_relay_catalog():
-    """拉取两侧云的镜像/flavor/AZ/网络，供中转机池下拉使用。"""
+    """拉取两侧云的镜像/flavor/AZ/网络，供中转机池下拉使用。
+
+    顺带回一份"已有常驻池"清单：常驻模式下已有池的建机参数直接沿用，
+    作业表单不该再要求用户填一遍。
+    """
+    # 与 api_migrate 一样支持环境档案兜底：池的 tenant_key 是云指纹，
+    # 凭据来源不同（表单/档案）会算出不同指纹，必须用同一套解析规则。
+    profile_id = (request.form.get("profile_id") or "").strip()
+    profile: EnvironmentProfile | None = None
+    if profile_id:
+        profile = _environment_profile_store().get(profile_id)
+        if profile is None:
+            return (
+                jsonify({"ok": False, "error": f"环境档案不存在：{profile_id}"}),
+                400,
+            )
+    source_auth = _auth_args("source", _profile_auth(profile, "source"))
+    target_auth = _auth_args("target", _profile_auth(profile, "target"))
     try:
-        source_os = OpenStackUtils(_auth_args("source"))
-        target_os = OpenStackUtils(_auth_args("target"))
+        source_os = OpenStackUtils(source_auth)
+        target_os = OpenStackUtils(target_auth)
     except Exception as exc:  # noqa: BLE001
         logging.exception("[MIGRATION] 中转机目录鉴权失败")
         return jsonify({"ok": False, "error": str(exc)}), 400
@@ -1420,7 +1487,11 @@ def api_relay_catalog():
     except Exception as exc:  # noqa: BLE001
         logging.exception("[MIGRATION] 中转机目录加载失败")
         return jsonify({"ok": False, "error": str(exc)}), 400
-    return jsonify({"ok": True, "catalog": catalog})
+    pools = {
+        "source": _existing_relay_pools(source_auth, "source"),
+        "target": _existing_relay_pools(target_auth, "target"),
+    }
+    return jsonify({"ok": True, "catalog": catalog, "pools": pools})
 
 
 @app.post("/api/relay/preflight")

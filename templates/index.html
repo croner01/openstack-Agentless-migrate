@@ -225,6 +225,18 @@ button { font-family: inherit; font-size: 13px; cursor: pointer; }
 .form-grid .fld, .form-grid .sel, .form-grid select { width: 100%; min-width: 0; }
 .env-grid { gap: 14px; }
 .pool-cols { display: flex; gap: 14px; margin-top: 10px; align-items: flex-start; }
+.pool-reuse {
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--success);
+    border-radius: var(--radius-sm);
+    background: var(--surface-softer);
+    padding: 9px 12px;
+    font-size: 12px;
+    line-height: 1.6;
+}
+.pool-params { margin-top: 8px; }
+.pool-params > summary { font-size: 12px; color: var(--muted); cursor: pointer; }
+.pool-params > .form-grid { margin-top: 8px; }
 .pool-col {
     flex: 1 1 0; min-width: 0; padding: 12px;
     border: 1px solid var(--line); border-radius: var(--radius-sm);
@@ -825,7 +837,7 @@ body.wizard-view .toast-box { bottom: 92px; }
                                     <div class="pool-col" id="relay-target-pool"></div>
                                 </div>
                                 <div style="display:flex;gap:10px;margin-top:12px;align-items:center">
-                                    <button type="button" class="btn btn-sm" id="load-relay-catalog">载入两侧目录</button>
+                                    <button type="button" class="btn btn-sm" id="load-relay-catalog">载入两侧目录 / 检查常驻池</button>
                                     <button type="button" class="btn btn-sm btn-primary" id="relay-preflight">预检</button>
                                     <div id="relay-preflight-result" class="sec-note"></div>
                                 </div>
@@ -1197,6 +1209,11 @@ const state = {
     //: 当前向导内容来自哪个作业的参数回放（用弹窗里说明来源）。
     wizardOriginJobId: null,
     catalogLoaded: false,
+    //: 两侧已有的常驻中转机池（随「载入两侧目录」返回），用于沿用建机参数。
+    relayExistingPools: { source: [], target: [] },
+    //: 上次载入目录/常驻池时的凭据指纹；换云后必须失效重查，否则会沿用上一个云的池。
+    relayCatalogKey: '',
+    relayCatalogLoading: false,
     profiles: [],
     editingProfileId: '',
     statFilter: '',
@@ -3676,12 +3693,17 @@ function relayPoolFields(prefix, label) {
     return `
         <div class="env-col-head"><span class="env-side-tag ${prefix === 'source' ? 'src' : 'dst'}">${label}</span><b>${label}中转机</b></div>
         <div class="form-grid">
+            <div><label class="form-label" title="常驻模式下这个可用区决定沿用哪个已有池">可用区</label>
+                <select class="sel" name="relay_${prefix}_az" data-role="az"></select></div>
+        </div>
+        <div class="pool-reuse hidden" id="relay-${prefix}-reuse"></div>
+        <details class="pool-params" id="relay-${prefix}-params" open>
+            <summary id="relay-${prefix}-params-sum">建机参数</summary>
+            <div class="form-grid">
             <div class="full"><label class="form-label">镜像</label>
                 <select class="sel" name="relay_${prefix}_image" data-role="image"></select></div>
             <div><label class="form-label">Flavor</label>
                 <select class="sel" name="relay_${prefix}_flavor" data-role="flavor"></select></div>
-            <div><label class="form-label">可用区</label>
-                <select class="sel" name="relay_${prefix}_az" data-role="az"></select></div>
             <div><label class="form-label">网络</label>
                 <select class="sel" name="relay_${prefix}_network" data-role="network"></select></div>
             <div><label class="form-label">网段（子网）</label>
@@ -3706,7 +3728,74 @@ function relayPoolFields(prefix, label) {
                 </select></div>
             <div><label class="form-label">池大小</label>
                 <input class="fld mono" type="number" min="1" max="8" name="relay_${prefix}_size" value="2"></div>
-        </div>`;
+            </div>
+        </details>`;
+}
+
+/* 已有常驻池：把池里的建机参数回填到下拉，作业表单不再要求用户填一遍 */
+function setRelaySelectValue(root, role, value) {
+    const select = root.querySelector(`[data-role="${role}"]`);
+    if (!select) return;
+    // 池参数里的镜像/网络可能已经不在目录里（被删或换名），仍要保住等值提交，
+    // 否则预检会报"不存在"，用户还得手工再选一次。
+    if (value && !Array.from(select.options).some(option => option.value === value)) {
+        select.appendChild(new Option(value + '（池内参数，当前目录里没有）', value));
+    }
+    select.value = value || '';
+    syncSelectTitle(select);
+}
+
+function relayPoolForAz(side, az) {
+    const pools = (state.relayExistingPools && state.relayExistingPools[side]) || [];
+    return pools.find(pool => pool.az === az) || null;
+}
+
+function refreshRelayPoolPanel(side) {
+    const root = $('#relay-' + side + '-pool');
+    const details = $('#relay-' + side + '-params');
+    const box = $('#relay-' + side + '-reuse');
+    const summary = $('#relay-' + side + '-params-sum');
+    if (!root || !details || !box) return;
+    const modeSelect = $('[name="relay_node_mode"]');
+    const persistent = Boolean(modeSelect) && modeSelect.value === 'persistent';
+    const azSelect = root.querySelector('[data-role="az"]');
+    const pool = persistent ? relayPoolForAz(side, azSelect && azSelect.value) : null;
+    if (!pool) {
+        box.classList.add('hidden');
+        box.innerHTML = '';
+        details.open = true;
+        if (summary) {
+            summary.textContent = persistent
+                ? '建机参数（该可用区还没有常驻池，首次提交按这些参数建池）'
+                : '建机参数（作业级临时池必填）';
+        }
+        return;
+    }
+    setRelaySelectValue(root, 'image', pool.image);
+    setRelaySelectValue(root, 'flavor', pool.flavor);
+    setRelaySelectValue(root, 'network', pool.network);
+    fillRelaySubnets(side, pool.network);
+    setRelaySelectValue(root, 'subnet', pool.subnet);
+    setRelaySelectValue(root, 'system_volume_type', pool.system_volume_type);
+    setRelaySelectValue(root, 'data_floating_network', pool.data_floating_network);
+    box.innerHTML =
+        '<b>沿用已有常驻池</b>（可用区 ' + escapeHtml(pool.az || '—') + '）：' +
+        (pool.nodes || 0) + ' 节点 / ' + (pool.slots_total || 0) + ' 槽位，已用 ' + (pool.slots_used || 0) +
+        '<br>镜像 <b class="mono">' + escapeHtml(pool.image || '—') + '</b>' +
+        ' · flavor <b class="mono">' + escapeHtml(pool.flavor || '—') + '</b>' +
+        ' · 网络 <b class="mono">' + escapeHtml(pool.network || '—') +
+        (pool.subnet ? ' / ' + escapeHtml(pool.subnet) : '') + '</b>' +
+        ' · 系统盘 <b class="mono">' + escapeHtml(pool.system_volume_type || '—') + '</b>' +
+        (pool.data_floating_network
+            ? ' · 数据面 FIP 网络 <b class="mono">' + escapeHtml(pool.data_floating_network) + '</b>'
+            : '') +
+        '<br><span class="sec-note">作业表单不需要再填这些建机参数（已自动带入）。' +
+        '要长期修改池参数请到「中转机资源」页；这里覆盖只影响扩容出来的新节点。</span>';
+    box.classList.remove('hidden');
+    details.open = false;
+    if (summary) {
+        summary.textContent = '点开可覆盖建机参数（不推荐）';
+    }
 }
 
 function fillRelaySubnets(prefix, networkId) {
@@ -3730,7 +3819,7 @@ function fillRelaySelect(root, role, items) {
     const select = root.querySelector(`[data-role="${role}"]`);
     if (!select) return;
     select.innerHTML = '';
-    items.forEach(item => {
+    (items || []).forEach(item => {
         const option = document.createElement('option');
         option.value = item.id;
         option.textContent = item.name || item.id;
@@ -3739,11 +3828,23 @@ function fillRelaySelect(root, role, items) {
     syncSelectTitle(select);
 }
 
+/* 目录/常驻池缓存对应的凭据指纹：换了云就得重查，避免沿用上一个云的池。 */
+function relayCatalogKey() {
+    return ['source', 'target'].map(side => {
+        const auth = readAuth(side);
+        return [auth.auth_url, auth.project_name, auth.project_id, auth.username].join('|');
+    }).join('::');
+}
+
 function relayAuthForm() {
     const data = new FormData();
     ['source', 'target'].forEach(prefix => {
         Object.entries(readAuth(prefix)).forEach(([key, value]) => data.append(`${prefix}_${key}`, value));
     });
+    // 带上档案：服务端按"表单优先、档案兜底"解析凭据，池的 tenant 指纹
+    // 必须和提交迁移时一致，否则查不到已有常驻池。
+    const profileSelect = $('#profile-select');
+    if (profileSelect && profileSelect.value) data.append('profile_id', profileSelect.value);
     return data;
 }
 
@@ -3770,20 +3871,49 @@ function initRelayPanel() {
                 if (node.id === 'wiz-relay-sec') return;
                 node.classList.toggle('hidden', !persistent);
             });
+            ['source', 'target'].forEach(refreshRelayPoolPanel);
+            // 切到常驻模式时自动查一次已有池：有池就直接沿用，不必再填建机参数。
+            // 换云（凭据变了）时旧池必须失效，所以按指纹判断而不是"有没有池"。
+            if (persistent && !state.relayCatalogLoading
+                && readAuth('source').auth_url && readAuth('target').auth_url
+                && state.relayCatalogKey !== relayCatalogKey()) {
+                loadRelayCatalog();
+            }
         });
     }
 
-    $('#load-relay-catalog').addEventListener('click', async () => {
-        const res = await fetch('/api/relay/catalog', { method: 'POST', body: relayAuthForm() });
-        const json = await res.json();
+    async function loadRelayCatalog() {
+        if (state.relayCatalogLoading) return;
+        state.relayCatalogLoading = true;
+        let json;
+        try {
+            const res = await fetch('/api/relay/catalog', { method: 'POST', body: relayAuthForm() });
+            json = await res.json();
+        } catch (err) {
+            toast('目录载入失败：' + err.message, 'error');
+            return;
+        } finally {
+            state.relayCatalogLoading = false;
+        }
         if (!json.ok) { toast('目录载入失败：' + json.error, 'error'); return; }
         const zones = { source: $('#relay-source-pool'), target: $('#relay-target-pool') };
         state.relayCatalog = json.catalog;
+        state.relayCatalogKey = relayCatalogKey();
+        const existingPools = json.pools || { source: [], target: [] };
         ['source', 'target'].forEach(side => {
             const data = json.catalog[side];
+            const pools = existingPools[side] || [];
+            state.relayExistingPools[side] = pools;
+            const previousAz = $(`[name="relay_${side}_az"]`).value;
+            // 常驻池的可用区可能已经不在目录里（镜像/网络都没了也会保留池），
+            // 因此 AZ 选项取"目录 ∪ 已有池"。
+            const poolAzs = pools.map(pool => pool.az).filter(Boolean);
+            fillRelaySelect(zones[side], 'az', [
+                ...poolAzs.map(az => ({ id: az, name: az + '（常驻池）' })),
+                ...(data.azs || []).filter(az => !poolAzs.includes(az)).map(az => ({ id: az, name: az })),
+            ]);
             fillRelaySelect(zones[side], 'image', data.images);
             fillRelaySelect(zones[side], 'flavor', data.flavors);
-            fillRelaySelect(zones[side], 'az', data.azs.map(name => ({ id: name, name })));
             fillRelaySelect(zones[side], 'network', data.networks);
             fillRelaySelect(zones[side], 'system_volume_type', data.volume_types || []);
             fillRelaySelect(zones[side], 'data_floating_network', [
@@ -3798,9 +3928,24 @@ function initRelayPanel() {
                 ...(data.volume_types || []),
             ]);
             fillRelaySubnets(side, $(`[name="relay_${side}_network"]`).value);
+            const azSelect = $(`[name="relay_${side}_az"]`);
+            if (previousAz && Array.from(azSelect.options).some(o => o.value === previousAz)) {
+                azSelect.value = previousAz;
+            } else if (poolAzs.length) {
+                azSelect.value = poolAzs[0];
+            }
+            refreshRelayPoolPanel(side);
         });
-        toast('两侧目录已载入', 'success');
-    });
+        const poolCount = (existingPools.source || []).length + (existingPools.target || []).length;
+        toast(
+            poolCount
+                ? '两侧目录已载入；发现 ' + poolCount + ' 个已有常驻池，建机参数将直接沿用'
+                : '两侧目录已载入',
+            'success'
+        );
+    }
+
+    $('#load-relay-catalog').addEventListener('click', loadRelayCatalog);
 
     ['source', 'target'].forEach(side => {
         const networkSelect = $(`[name="relay_${side}_network"]`);
@@ -3808,6 +3953,10 @@ function initRelayPanel() {
             networkSelect.addEventListener('change', () => {
                 fillRelaySubnets(side, networkSelect.value);
             });
+        }
+        const azSelect = $(`[name="relay_${side}_az"]`);
+        if (azSelect) {
+            azSelect.addEventListener('change', () => refreshRelayPoolPanel(side));
         }
     });
 
