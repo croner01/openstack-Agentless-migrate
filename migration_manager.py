@@ -343,6 +343,9 @@ class MigrationManager:
                 "status": "pending",
                 "target_volume_id": "",
                 "error": "",
+                # 失败保留：中间卷保留到什么时候，前端据此提示并给释放入口。
+                "retained_until": 0.0,
+                "retain_reason": "",
             }
             for position, (_, entry) in enumerate(indexed_entries)
         ]
@@ -578,29 +581,39 @@ class MigrationManager:
                 logging.exception(
                     "[MIGRATION] VM %s 盘 %s 传输失败", vm.name, getattr(item, "index", "?")
                 )
+                volume_id = str(
+                    getattr(getattr(item, "volume", None), "source_volume_id", "")
+                    or ""
+                )
+                failure = {
+                    "index": index,
+                    "volume_id": volume_id,
+                    "error": str(exc)[:500],
+                    "target_volume_id": str(
+                        getattr(item, "target_volume_id", "") or ""
+                    ),
+                }
+                retained = self._relay_retained_info(mover, volume_id)
+                if retained:
+                    failure.update(retained)
                 with guard:
-                    failures.append(
-                        {
-                            "index": index,
-                            "volume_id": str(
-                                getattr(getattr(item, "volume", None), "source_volume_id", "")
-                                or ""
-                            ),
-                            "error": str(exc)[:500],
-                            "target_volume_id": str(
-                                getattr(item, "target_volume_id", "") or ""
-                            ),
-                        }
-                    )
+                    failures.append(failure)
                 if disk is not None:
                     disk["status"] = "failed"
                     disk["error"] = str(exc)[:500]
+                    disk["retained_until"] = 0.0
+                    disk["retain_reason"] = ""
+                    if retained:
+                        disk.update(retained)
                     self._persist()
                 return
             if disk is not None:
                 disk["target_volume_id"] = target_volume_id
                 disk["status"] = "success"
                 disk["error"] = ""
+                disk["retained_until"] = 0.0
+                disk["retain_reason"] = ""
+                disk["released"] = False
                 self._persist()
 
         if limit <= 1:
@@ -623,6 +636,23 @@ class MigrationManager:
             for future in concurrent.futures.as_completed(futures):
                 future.result()
         return failures
+
+    @staticmethod
+    def _relay_retained_info(mover: Any, volume_id: str) -> dict[str, Any]:
+        """搬运器的失败保留信息；不支持该接口的替身/旧实现返回空 dict。"""
+        if not volume_id:
+            return {}
+        getter = getattr(mover, "retained_info", None)
+        if not callable(getter):
+            return {}
+        try:
+            info = getter(volume_id)
+        except Exception:  # noqa: BLE001 - 展示信息取不到不影响失败处理
+            logging.exception(
+                "[MIGRATION] 读取失败保留信息失败 volume=%s", volume_id
+            )
+            return {}
+        return info if isinstance(info, dict) else {}
 
     def _await_relay_disk_retry(
         self, vm: VmTask, failed: list[dict[str, Any]]

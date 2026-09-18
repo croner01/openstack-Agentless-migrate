@@ -1006,6 +1006,7 @@ body.wizard-view .toast-box { bottom: 92px; }
                             <dt>rbd 命令超时</dt><dd id="set-rbd-timeout">—</dd>
                             <dt>拷贝停滞判定</dt><dd id="set-stall-timeout">—</dd>
                             <dt>上传上限 / 保留</dt><dd id="set-upload-limits">—</dd>
+                            <dt>失败盘中间卷保留</dt><dd id="set-derived-retention">—</dd>
                             <dt>提交前 mon 探测</dt><dd id="set-preflight">—</dd>
                             <dt>日志过滤</dt><dd id="set-log-filter">—</dd>
                             <dt>中转机心跳</dt><dd id="set-relay-heartbeat">—</dd>
@@ -1349,6 +1350,10 @@ function renderRuntimeInfo(rt) {
     setText('#set-rbd-timeout', rt.rbd_cmd_timeout_seconds + ' s（超时按失败处理并释放名额）');
     setText('#set-stall-timeout', rt.copy_stall_timeout_seconds + ' s 无进展即中断并释放名额');
     setText('#set-upload-limits', rt.max_upload_mb + ' MB / 上传目录保留 ' + rt.upload_retention_days + ' 天');
+    setText('#set-derived-retention', (rt.derived_retention_hours || 0) <= 0
+        ? '关闭：失败立即回收派生卷/快照'
+        : '失败后保留 ' + rt.derived_retention_hours + ' 小时，期间重试可跳过打快照派生'
+            + '（MIGRATION_DERIVED_RETENTION_HOURS）');
     setText('#set-preflight', rt.ceph_preflight ? '开启（不可达的 mon_host 提交时直接拒绝）' : '已关闭（MIGRATION_CEPH_PREFLIGHT=off）');
     setText('#set-log-filter', !rt.log_only_migration_configured
         ? '全量输出（MIGRATION_LOG_ONLY=off，第三方库 INFO 也会写入）'
@@ -1374,7 +1379,7 @@ async function loadRuntimeInfo() {
         renderRuntimeInfo(data.runtime);
     } catch (err) {
         ['#set-copy-slots', '#set-mem-water', '#set-rbd-timeout', '#set-stall-timeout',
-            '#set-upload-limits', '#set-preflight', '#set-log-filter',
+            '#set-upload-limits', '#set-derived-retention', '#set-preflight', '#set-log-filter',
             '#set-relay-heartbeat', '#set-relay-rebuild']
             .forEach(sel => setText(sel, '不可用：' + err.message));
     }
@@ -4356,7 +4361,7 @@ function relayCounters(relay, diskRows) {
     };
     if (relay) {
         const nodes = [...relay.source, ...relay.target];
-        const ledger = relay.ledger || { in_flight: 0, done: 0, cleaned: 0, failed: 0 };
+        const ledger = relay.ledger || { in_flight: 0, done: 0, cleaned: 0, failed: 0, retained: 0 };
         pill('节点', nodes.length);
         pill('忙碌', nodes.filter(node => node.state === 'busy').length);
         pill('异常', nodes.filter(node => node.state === 'unhealthy').length);
@@ -4364,6 +4369,7 @@ function relayCounters(relay, diskRows) {
         pill('已完成', ledger.done);
         pill('已清理', ledger.cleaned);
         pill('失败', ledger.failed, ledger.failed ? 'c-fail' : '');
+        pill('保留中', ledger.retained || 0, ledger.retained ? 'c-warn' : '');
         return;
     }
     // 运行时已回收：只报作业里留存的逐盘结果。
@@ -4394,6 +4400,7 @@ function relayDiskRows(vms) {
             const size = Number(disk.size) || 0;
             const bytes = size * 1024 * 1024 * 1024;
             const status = disk.status || 'pending';
+            const retainedUntil = Number(disk.retained_until) || 0;
             rows.push({
                 vm_id: vm.name,
                 volume_id: disk.volume_id,
@@ -4401,12 +4408,15 @@ function relayDiskRows(vms) {
                 role: disk.role === 'boot' ? '系统盘' : '数据盘',
                 disk_status: status,
                 phase: status === 'success' ? 'done'
-                    : (status === 'failed' ? 'failed'
+                    : (status === 'failed' ? (retainedUntil > 0 ? 'failed_retained' : 'failed')
                         : (status === 'copying' ? 'copying' : 'queued')),
-                progress_label: relayDiskLabel(status),
+                progress_label: (status === 'failed' && retainedUntil > 0)
+                    ? '失败（已保留中间卷）' : relayDiskLabel(status),
                 total_bytes: bytes,
                 copied_bytes: status === 'success' ? bytes : 0,
                 error: disk.error || '',
+                retained_until: retainedUntil,
+                retain_reason: disk.retain_reason || '',
             });
         });
     });
@@ -4447,7 +4457,8 @@ function relayVmDiskSummary(vms, relay) {
         hint.innerHTML = retryVms.length
             ? '有 ' + retryVms.length + ' 台 VM 的其余盘已完成，正在等待人工重试失败盘：'
                 + retryVms.map(item => escapeHtml(item.vm.name)).join('、')
-                + '。点「重试」会重新生成派生卷并按已拷字节续传目标卷；不处理可点「取消作业」。'
+                + '。失败盘的派生卷/快照在保留期内保留，点「重试」会复用它们并按已拷字节'
+                + '续传目标卷；不想继续占用存储点「释放中间卷」，不处理可点「取消作业」。'
             : '';
     }
     renderVmDiskSummary($('#relay-vm-disks'), items, { retry: true });
@@ -4465,7 +4476,7 @@ async function retryVmDisk(vmName, volumeIds) {
         title: '重试失败盘',
         html: '<ul class="impact-list" style="list-style:none;margin:0">'
             + '<li>VM <b class="mono">' + escapeHtml(vmName) + '</b>：重试 ' + label + '</li>'
-            + '<li>已完成的盘不会重传；目标卷按已拷字节续传，派生卷/快照重新生成</li>'
+            + '<li>已完成的盘不会重传；目标卷按已拷字节续传，保留了中间卷的盘会直接复用派生卷</li>'
             + '<li>源机在迁移期间保持关机，重试后仍会在全部盘完成后建目标机</li></ul>',
         okText: '开始重试',
         onOk: async () => {
@@ -4485,6 +4496,59 @@ async function retryVmDisk(vmName, volumeIds) {
                 if (!state.pollTimer) startPolling();
             } catch (err) {
                 toast('提交重试失败：' + err.message, 'error');
+            }
+        }
+    });
+}
+
+/* 保留期文案：给出"到什么时候为止还能快速重试"，避免用户以为一直留着。 */
+function relayRetainText(disk) {
+    const until = Number(disk.retained_until) || 0;
+    if (!until) return '';
+    const now = Number(state.relayNow) || Math.floor(Date.now() / 1000);
+    const at = new Date(until * 1000).toLocaleString();
+    if (until <= now) {
+        return '中间卷保留期已过（' + at + '），重试会重新打快照派生';
+    }
+    return '中间卷保留中：' + at + ' 前重试可跳过打快照/派生';
+}
+
+/* 立即释放失败盘的中间卷：只删源端派生卷/快照，目标卷已写入的字节保留。 */
+async function releaseVmDisk(vmName, volumeIds) {
+    const jobId = state.currentJob && state.currentJob.id;
+    if (!jobId) return;
+    const ids = Array.isArray(volumeIds) ? volumeIds.filter(Boolean) : [];
+    const label = ids.length
+        ? '<b class="mono">' + escapeHtml(ids.join('、')) + '</b>'
+        : '全部保留的中间卷';
+    openConfirm({
+        title: '释放中间卷',
+        html: '<ul class="impact-list" style="list-style:none;margin:0">'
+            + '<li>VM <b class="mono">' + escapeHtml(vmName) + '</b>：释放 ' + label + '</li>'
+            + '<li>将删除源端派生卷与快照，立即归还存储配额</li>'
+            + '<li>目标卷已写入的字节保留；之后再重试需要重新打快照派生，大盘会慢几小时</li></ul>',
+        okText: '立即释放',
+        onOk: async () => {
+            closeModal();
+            try {
+                const res = await fetch(
+                    '/api/jobs/' + encodeURIComponent(jobId) + '/vms/'
+                    + encodeURIComponent(vmName) + '/disks/release',
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ volume_ids: ids })
+                    });
+                const json = await res.json();
+                if (!json.ok) throw new Error(json.error || '释放失败');
+                const pending = (json.pending || []).length;
+                toast(pending
+                    ? '已释放部分中间卷，' + pending + ' 块未清掉，稍后会自动重试'
+                    : '已释放：' + ((json.released || []).join('、') || '全部保留卷'),
+                    pending ? '' : 'success');
+                if (!state.pollTimer) startPolling();
+            } catch (err) {
+                toast('释放失败：' + err.message, 'error');
             }
         }
     });
@@ -4531,24 +4595,45 @@ function diskRetryCell(vm, disks) {
         td.appendChild(text('span', 'sec-note', '—'));
         return td;
     }
-    if (vm.status !== 'awaiting_disk_retry') {
+    const retained = failed.filter(disk => Number(disk.retained_until) > 0);
+    const retryable = vm.status === 'awaiting_disk_retry';
+    const makeBtn = (label, cls, ids, handler, title) => {
+        const btn = text('button', 'btn btn-sm ' + cls, label);
+        if (title) btn.title = title;
+        btn.style.marginRight = '6px';
+        btn.style.marginBottom = '4px';
+        btn.addEventListener('click', () => handler(vm.name, ids));
+        return btn;
+    };
+    if (retryable) {
+        failed.forEach(disk => {
+            const label = disk.role === 'boot' ? '重试系统盘' : '重试数据盘';
+            td.appendChild(makeBtn(label, 'btn-primary', [disk.volume_id], retryVmDisk,
+                (disk.error ? disk.error + ' · ' : '') + disk.volume_id));
+        });
+        if (failed.length > 1) {
+            td.appendChild(makeBtn('全部重试', 'btn-primary',
+                failed.map(disk => disk.volume_id), retryVmDisk, '重试全部失败盘'));
+        }
+    } else if (!retained.length) {
         td.appendChild(text('span', 'sec-note', '等待其余盘完成'));
         return td;
     }
-    const makeBtn = (label, ids, title) => {
-        const btn = text('button', 'btn btn-sm btn-primary', label);
-        if (title) btn.title = title;
-        btn.style.marginRight = '6px';
-        btn.addEventListener('click', () => retryVmDisk(vm.name, ids));
-        return btn;
-    };
-    failed.forEach(disk => {
-        const label = disk.role === 'boot' ? '重试系统盘' : '重试数据盘';
-        td.appendChild(makeBtn(label, [disk.volume_id],
-            (disk.error ? disk.error + ' · ' : '') + disk.volume_id));
-    });
-    if (failed.length > 1) {
-        td.appendChild(makeBtn('全部重试', failed.map(disk => disk.volume_id), '重试全部失败盘'));
+    // 保留入口独立于"是否在等待重试"：即使作业已经停在这一步，用户也可以
+    // 立即把占用配额的大盘派生卷/快照释放掉，不必为了归还配额而取消任务。
+    if (retained.length) {
+        retained.forEach(disk => {
+            const label = disk.role === 'boot' ? '释放系统盘中间卷' : '释放数据盘中间卷';
+            td.appendChild(makeBtn(label, '', [disk.volume_id], releaseVmDisk,
+                relayRetainText(disk) || disk.volume_id));
+        });
+        if (retained.length > 1) {
+            td.appendChild(makeBtn('全部释放', '',
+                retained.map(disk => disk.volume_id), releaseVmDisk,
+                '释放全部保留的中间卷'));
+        }
+        const note = relayRetainText(retained[0]);
+        if (note) td.appendChild(text('div', 'sec-note', note));
     }
     return td;
 }
@@ -4586,6 +4671,10 @@ function relayPhaseBadge(volume) {
     const waited = relayWaitText(volume, state.relayNow);
     if (waited) {
         span.appendChild(text('span', 'sec-note', ' · ' + waited));
+    }
+    if (phase === 'failed_retained') {
+        const note = relayRetainText(volume);
+        if (note) span.appendChild(text('span', 'sec-note', ' · ' + note));
     }
     return span;
 }

@@ -26,8 +26,20 @@ class DiskRetryRenderTest(unittest.TestCase):
         self.assertIn("'/disks/retry'", html)
         self.assertIn("renderVmDiskSummary($('#relay-vm-disks'), items, { retry: true });", html)
         self.assertIn('id="relay-retry-hint"', html)
-        # 只有等待重试状态才给按钮，避免和正在跑的传输抢同一块盘。
-        self.assertIn("if (vm.status !== 'awaiting_disk_retry') {", html)
+        # 只有等待重试状态才给重试按钮，避免和正在跑的传输抢同一块盘。
+        self.assertIn("const retryable = vm.status === 'awaiting_disk_retry';", html)
+
+    def test_disk_table_exposes_retained_release_action(self):
+        html = self._html()
+
+        self.assertIn("function releaseVmDisk(vmName, volumeIds)", html)
+        self.assertIn("'/disks/release'", html)
+        self.assertIn("function relayRetainText(disk)", html)
+        self.assertIn("释放数据盘中间卷", html)
+        # 保留状态要在计数、卷状态标签里都能看到，而不是只藏在 tooltip。
+        self.assertIn("pill('保留中', ledger.retained || 0", html)
+        self.assertIn("失败（已保留中间卷）", html)
+        self.assertIn("'中间卷保留中", html)
 
     def test_relay_form_has_transfer_concurrency_and_wait(self):
         html = self._html()

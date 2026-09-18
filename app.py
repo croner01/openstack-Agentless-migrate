@@ -41,6 +41,7 @@ from relay_credentials import CredentialError, CredentialStore, Sealer
 from relay_inventory import NodeInventory
 from relay_ledger import Ledger
 from relay_lease import LeaseStore
+from relay_orchestrator import derived_retention_seconds
 from relay_resources import RelayResourceLayer, load_or_create_credentials
 from relay_registry import RelayState
 from relay_runtime import (
@@ -1717,6 +1718,14 @@ def api_migrate():
                         relay_runtime.finish()
                     finally:
                         drop_runtime(job_id)
+                # 运行时可回收后，盘上的保留信息已经没有对应的中间卷了：
+                # 清掉标记，避免页面继续显示"中间卷保留中"。
+                for vm in getattr(job, "vms", []) or []:
+                    for disk in getattr(vm, "relay_disks", []) or []:
+                        if disk.get("retained_until"):
+                            disk["retained_until"] = 0.0
+                            disk["retain_reason"] = ""
+                job_manager.save_now()
                 # 作业结束后回收该作业在内存注册表里的任务/结果缓存，
                 # 否则长跑进程里这些字典只增不减。
                 try:
@@ -1765,6 +1774,27 @@ def api_jobs():
     return jsonify({"ok": True, "jobs": [_serialize_job_summary(job) for job in jobs]})
 
 
+def _release_job_retained(job_id: str, *, reason: str) -> list[str]:
+    """立即回收某作业失败保留的中间卷；没有活跃运行时就交给后续对账。
+
+    只动 phase=failed_retained 的记录（已卸载、不在传输中），因此取消/删除
+    时提前回收不会和正在跑的拷贝抢卷。
+    """
+    runtime = get_runtime(job_id)
+    if runtime is None:
+        logging.warning(
+            "[MIGRATION] 作业 %s 没有活跃运行时（%s），保留的中间卷留给对账回收",
+            job_id,
+            reason,
+        )
+        return []
+    try:
+        return runtime.release_retained(reason=reason)
+    except Exception:  # noqa: BLE001 - 回收失败不能影响取消/删除本身
+        logging.exception("[MIGRATION] 立即回收中间卷失败 job=%s", job_id)
+        return []
+
+
 @app.post("/api/jobs/<job_id>/cancel")
 def api_job_cancel(job_id: str):
     """取消任务：标记作业停止，并通知其中转机 agent 中止正在进行的拷贝。"""
@@ -1775,7 +1805,15 @@ def api_job_cancel(job_id: str):
     for task in RELAY_STATE.tasks_for_job(job_id):
         RELAY_STATE.request_cancel(task["task_id"])
         notified += 1
-    return jsonify({"ok": True, "cancelled": cancelled, "relay_agents": notified})
+    released = _release_job_retained(job_id, reason="cancel")
+    return jsonify(
+        {
+            "ok": True,
+            "cancelled": cancelled,
+            "relay_agents": notified,
+            "retained_released": released,
+        }
+    )
 
 
 @app.post("/api/jobs/<job_id>/vms/<vm_name>/cutover")
@@ -1802,7 +1840,8 @@ def api_vm_disk_retry(job_id: str, vm_name: str):
 
     请求体可选 ``{"volume_ids": [...]}``：只重试指定的失败盘，省略/空表示
     重试全部失败盘。重试会尽量沿用已建好的目标卷（按已拷字节续传），
-    派生卷/快照则重新生成。
+    派生卷/快照若还在保留期内（phase=failed_retained）则校验后直接复用，
+    只有校验不过（已被删/类型不符/保留期已过）才重新打快照派生。
     """
     job = job_manager.get(job_id)
     if job is None:
@@ -1844,6 +1883,73 @@ def api_vm_disk_retry(job_id: str, vm_name: str):
     return jsonify({"ok": True})
 
 
+@app.post("/api/jobs/<job_id>/vms/<vm_name>/disks/release")
+def api_vm_disk_release(job_id: str, vm_name: str):
+    """中转机通道：立即释放失败盘保留的中间卷（派生卷 + 快照）。
+
+    请求体可选 ``{"volume_ids": [...]}``：只释放指定盘，省略/空表示释放该
+    VM 全部保留卷。释放只删源端中间产物、目标卷里已写入的字节保留；之后再
+    重试会重新打快照派生（大盘会慢几小时），因此这是"马上归还存储配额"与
+    "保留快速重试能力"之间的取舍。
+    """
+    job = job_manager.get(job_id)
+    if job is None:
+        return jsonify({"ok": False, "error": "job 不存在"}), 404
+    vm = next((item for item in job.vms if item.name == vm_name), None)
+    if vm is None:
+        return jsonify({"ok": False, "error": "VM 不存在"}), 404
+    payload = request.get_json(silent=True) or {}
+    raw_ids = payload.get("volume_ids") or []
+    if not isinstance(raw_ids, list):
+        return jsonify({"ok": False, "error": "volume_ids 必须是数组"}), 400
+    retained_ids = {
+        str(disk.get("volume_id") or "")
+        for disk in vm.relay_disks or []
+        if float(disk.get("retained_until") or 0) > 0
+    }
+    wanted = [str(item) for item in raw_ids if str(item)]
+    unknown = [item for item in wanted if item not in retained_ids]
+    if unknown:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "这些盘没有可释放的中间卷：" + "、".join(unknown),
+                }
+            ),
+            400,
+        )
+    runtime = get_runtime(job_id)
+    if runtime is None:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "任务已结束，中间卷已随任务回收，无需释放",
+                }
+            ),
+            409,
+        )
+    try:
+        released = runtime.release_retained(wanted, reason="manual")
+    except Exception as exc:  # noqa: BLE001 - 释放失败要给出可读原因
+        logging.exception("[MIGRATION] 释放中间卷失败 job=%s", job_id)
+        return jsonify({"ok": False, "error": f"释放失败：{exc}"}), 500
+    released_set = {str(item) for item in released}
+    for disk in vm.relay_disks or []:
+        if str(disk.get("volume_id") or "") in released_set:
+            disk["retained_until"] = 0.0
+            disk["retain_reason"] = ""
+            disk["released"] = True
+    if released:
+        job_manager.save_now()
+    targets = wanted or sorted(retained_ids)
+    pending = [item for item in targets if item not in released_set]
+    return jsonify(
+        {"ok": True, "released": sorted(released_set), "pending": pending}
+    )
+
+
 @app.post("/api/jobs/<job_id>/vms/<vm_name>/sync")
 def api_vm_sync(job_id: str, vm_name: str):
     """手动同步一轮增量（仅增量·手动模式）：源机不停机，只补一轮 diff。"""
@@ -1865,6 +1971,10 @@ def api_vm_sync(job_id: str, vm_name: str):
 @app.delete("/api/jobs/<job_id>")
 def api_job_delete(job_id: str):
     """删除任务记录与上传目录；运行中的任务必须先取消。"""
+    # 运行中的作业删不掉（job_manager 会返回 409），这里回收的是作业已结束
+    # 但运行时还没来得及收尾的保留卷，避免删除后配额一直被占。
+    if job_manager.get(job_id) is not None:
+        _release_job_retained(job_id, reason="delete")
     error = job_manager.delete(job_id)
     if error:
         status = 404 if error == "任务不存在" else 409
@@ -2396,6 +2506,10 @@ def api_runtime():
                 "max_upload_mb": env_int("MIGRATION_MAX_UPLOAD_MB", 20, minimum=1),
                 "upload_retention_days": env_int(
                     "MIGRATION_UPLOAD_RETENTION_DAYS", 7, minimum=1
+                ),
+                # 失败盘中间卷保留时长（小时），0 = 失败立即回收。
+                "derived_retention_hours": round(
+                    derived_retention_seconds() / 3600.0, 2
                 ),
                 "ceph_preflight": ceph_preflight_enabled(),
                 "relay_heartbeat_interval": RELAY_STATE.heartbeat_interval,

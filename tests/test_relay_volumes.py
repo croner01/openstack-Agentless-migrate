@@ -363,3 +363,103 @@ class VolumeLifecycleTest(unittest.TestCase):
             )
 
         self.assertEqual(str(ctx.exception), "disk full")
+
+
+class ParkAndValidateSourceCopyTest(unittest.TestCase):
+    def setUp(self):
+        self.source_os = mock.MagicMock()
+        self.target_os = mock.MagicMock()
+        self.lifecycle = VolumeLifecycle(self.source_os, self.target_os)
+        self.copy = SourceCopy(snapshot_id="snap-1", derived_volume_id="vol-d1")
+
+    def test_park_volume_detaches_without_deleting(self):
+        self.source_os.find_volume_attachment.return_value = "att-1"
+
+        self.lifecycle.park_volume(
+            role="source", server_id="relay-s", volume_id="vol-d1"
+        )
+
+        self.source_os.detach_volume.assert_called_once_with(
+            server_id="relay-s", volume_id="vol-d1"
+        )
+        self.source_os.delete_volume.assert_not_called()
+        self.source_os.delete_volume_snapshot.assert_not_called()
+
+    def test_park_volume_is_noop_without_attachment(self):
+        self.target_os.find_volume_attachment.return_value = None
+
+        self.lifecycle.park_volume(
+            role="target", server_id="relay-t", volume_id="vol-t1"
+        )
+
+        self.target_os.detach_volume.assert_not_called()
+
+    def test_park_volume_swallows_detach_errors(self):
+        """保留场景下卸载失败只记日志，不能覆盖调用方真正要抛的失败原因。"""
+        self.target_os.find_volume_attachment.return_value = "att-9"
+        self.target_os.detach_volume.side_effect = RuntimeError("boom")
+
+        self.lifecycle.park_volume(
+            role="target", server_id="relay-t", volume_id="vol-t1"
+        )
+
+        self.target_os.detach_volume.assert_called_once()
+
+    def test_validate_source_copy_accepts_matching_resources(self):
+        self.source_os.get_volume_snapshot.return_value = mock.Mock(status="available")
+        self.source_os.get_volume.return_value = mock.Mock(
+            status="available", size=40, volume_type="src-ssd"
+        )
+
+        ok, detail = self.lifecycle.validate_source_copy(
+            self.copy, volume_id="vol-s1", size=40, volume_type="src-ssd"
+        )
+
+        self.assertTrue(ok, detail)
+
+    def test_validate_source_copy_rejects_missing_derived_volume(self):
+        self.source_os.get_volume_snapshot.return_value = mock.Mock(status="available")
+        self.source_os.get_volume.side_effect = RuntimeError("404 not found")
+
+        ok, detail = self.lifecycle.validate_source_copy(
+            self.copy, volume_id="vol-s1", size=40
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("派生卷不可用", detail)
+
+    def test_validate_source_copy_rejects_size_mismatch(self):
+        self.source_os.get_volume_snapshot.return_value = mock.Mock(status="available")
+        self.source_os.get_volume.return_value = mock.Mock(
+            status="available", size=20, volume_type="src-ssd"
+        )
+
+        ok, detail = self.lifecycle.validate_source_copy(
+            self.copy, volume_id="vol-s1", size=40
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("容量", detail)
+
+    def test_validate_source_copy_rejects_volume_type_mismatch(self):
+        self.source_os.get_volume_snapshot.return_value = mock.Mock(status="available")
+        self.source_os.get_volume.return_value = mock.Mock(
+            status="available", size=40, volume_type="old-ssd"
+        )
+
+        ok, detail = self.lifecycle.validate_source_copy(
+            self.copy, volume_id="vol-s1", size=40, volume_type="new-ssd"
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("类型", detail)
+
+    def test_validate_source_copy_rejects_bad_snapshot_status(self):
+        self.source_os.get_volume_snapshot.return_value = mock.Mock(status="error")
+
+        ok, detail = self.lifecycle.validate_source_copy(
+            self.copy, volume_id="vol-s1", size=40
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("快照状态", detail)

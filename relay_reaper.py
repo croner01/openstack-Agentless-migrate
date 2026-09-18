@@ -11,7 +11,12 @@ from typing import Any, Callable
 
 from relay_volumes import SourceCopy
 
-TERMINAL_PHASES = {"done", "cleaned", "failed_retained"}
+#: 明确完结、对账不再碰的阶段。failed_retained 不是终态：它带着保留期，
+#: 到期后由对账回收，作业收尾/取消/删除时立即回收。
+TERMINAL_PHASES = {"done", "cleaned"}
+
+#: 失败保留阶段：派生卷/快照在保留期内留给人工重试复用。
+RETAINED_PHASE = "failed_retained"
 
 #: Nova 拒绝卸载实例根设备时的报错片段（400 Client Error）。
 ROOT_DEVICE_REFUSAL = "cannot detach a root device volume"
@@ -90,13 +95,21 @@ class RelayReaper:
                 or record.target_cloud != cloud_filter[1]
             ):
                 continue
+            # 失败保留：只在保留期过后回收；保留期内即使作业已经不在跑也先留着，
+            # 这正是"默认保留 N 小时，重试可直接复用派生卷"的兑现方式。
+            if record.phase == RETAINED_PHASE and not self._retention_expired(
+                record, current
+            ):
+                continue
             # 清理失败的记录用更短的间隔重试，避免残留卷长期占配额。
             stale_limit = (
                 RETRY_SECONDS
                 if record.phase == CLEANUP_FAILED_PHASE
                 else self.stale_seconds
             )
-            if current - float(record.updated_at or 0.0) < stale_limit:
+            if record.phase != RETAINED_PHASE and (
+                current - float(record.updated_at or 0.0) < stale_limit
+            ):
                 continue
             # 先记下回收前的阶段与静默时长：下面会覆盖 phase/updated_at，
             # 覆盖后再打日志就变成"phase=cleaned 静默 0s"，等于没记。
@@ -104,6 +117,7 @@ class RelayReaper:
             silent_seconds = max(current - float(record.updated_at or 0.0), 0.0)
             ok = self._cleanup(record)
             record.phase = "cleaned" if ok else CLEANUP_FAILED_PHASE
+            record.retained_until = 0.0
             record.updated_at = current
             self.ledger.upsert(record)
             if ok:
@@ -125,8 +139,52 @@ class RelayReaper:
             self.ledger.save()
         return cleaned
 
+    @staticmethod
+    def _retention_expired(record: Any, current: float) -> bool:
+        """保留期是否已过；没有写保留期的老记录按"已过期"回收。"""
+        deadline = float(getattr(record, "retained_until", 0.0) or 0.0)
+        if deadline <= 0:
+            return True
+        return current >= deadline
+
+    def release(self, records: list[Any], *, reason: str = "manual") -> list[str]:
+        """立即回收指定记录（不等保留期）：取消/删除/人工释放走这条路。
+
+        与 sweep 的区别是不看时间窗口，调用方已经确认这些资源可以回收。
+        返回真正回收成功的 key 列表；清理失败会落到 cleanup_failed 等下一轮重试。
+        """
+        released: list[str] = []
+        current = self._now()
+        for record in records:
+            ok = self._cleanup(record)
+            record.phase = "cleaned" if ok else CLEANUP_FAILED_PHASE
+            record.retained_until = 0.0
+            record.updated_at = current
+            self.ledger.upsert(record)
+            if not ok:
+                continue
+            released.append(record.key)
+            logging.warning(
+                "[MIGRATION] 立即回收中间卷 job=%s vm=%s volume=%s reason=%s "
+                "derived=%s snapshot=%s target=%s",
+                record.job_id,
+                record.vm_id,
+                record.volume_id,
+                reason,
+                record.derived_volume_id or "-",
+                record.snapshot_id or "-",
+                record.target_volume_id or "-",
+            )
+        if released:
+            self.ledger.save()
+        return released
+
     def reconcile_job(self, job_id: str) -> list[str]:
-        """作业收尾：不管是否超时，清理该作业所有未完成记录。"""
+        """作业收尾：不管是否超时，清理该作业所有未完成记录。
+
+        作业已经结束（正常结束/取消/删除）就不会再有人点重试，保留期的意义
+        不复存在，因此 failed_retained 也在这里立即回收。
+        """
         cleaned: list[str] = []
         current = self._now()
         for record in list(self.ledger.all()):
@@ -134,6 +192,7 @@ class RelayReaper:
                 continue
             ok = self._cleanup(record)
             record.phase = "cleaned" if ok else CLEANUP_FAILED_PHASE
+            record.retained_until = 0.0
             record.updated_at = current
             self.ledger.upsert(record)
             if ok:

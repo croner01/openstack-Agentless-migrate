@@ -78,6 +78,7 @@ class RuntimeInfoApiTest(unittest.TestCase):
                 "relay_rebuild_seconds",
                 "max_upload_mb",
                 "upload_retention_days",
+                "derived_retention_hours",
                 "ceph_preflight",
                 "log_only_migration",
                 "log_only_migration_configured",

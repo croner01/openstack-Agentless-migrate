@@ -22,6 +22,10 @@ from openstack_utils import (
 #: MIGRATION_ATTACH_READY_TIMEOUT 覆盖，0 = 不限时。
 ATTACH_READY_TIMEOUT_SECONDS = 1800.0
 
+#: 失败收尾时把卷从中转机卸下来的等待上限（秒）。这不是数据面操作，正常
+#: 几秒就完成；给一个短上限是为了不让"卸载卡住"拖慢失败/保留状态的呈现。
+PARK_DETACH_TIMEOUT_SECONDS = 300.0
+
 
 def attach_ready_timeout() -> float:
     """挂载 / 卸载卷的等待上限，MIGRATION_ATTACH_READY_TIMEOUT 可覆盖。"""
@@ -227,7 +231,13 @@ class VolumeLifecycle:
         return attachment_id
 
     def detach(
-        self, *, role: str, server_id: str, volume_id: str, force: bool = False
+        self,
+        *,
+        role: str,
+        server_id: str,
+        volume_id: str,
+        force: bool = False,
+        timeout: float | None = None,
     ) -> None:
         os_utils = self._os_for(role)
         if not force and os_utils.find_volume_attachment(server_id, volume_id) is None:
@@ -244,9 +254,86 @@ class VolumeLifecycle:
         os_utils.wait_volume_status(
             volume_id,
             target="available",
-            timeout=attach_ready_timeout(),
+            timeout=attach_ready_timeout() if timeout is None else float(timeout),
             should_stop=self.should_stop,
+            context=f"（卸载 {role} 卷 {volume_id}）",
         )
+
+    def park_volume(
+        self,
+        *,
+        role: str,
+        server_id: str,
+        volume_id: str,
+        timeout: float = PARK_DETACH_TIMEOUT_SECONDS,
+    ) -> None:
+        """失败收尾：把卷从中转机卸下来但保留卷本身，供后续重试复用。
+
+        与 ``cleanup_source_copy`` 的区别是不删除：卷回到 available 后重试
+        可以直接重新挂载；不卸载的话重试 attach 会被 Nova 以 409 拒绝。
+        卸载失败只记录，不覆盖调用方真正要抛的失败原因。
+        """
+        if not server_id or not volume_id:
+            return
+        try:
+            os_utils = self._os_for(role)
+            if os_utils.find_volume_attachment(server_id, volume_id):
+                self.detach(
+                    role=role,
+                    server_id=server_id,
+                    volume_id=volume_id,
+                    timeout=timeout,
+                )
+        except Exception:  # noqa: BLE001 - 保留场景下卸载失败不算致命
+            logging.exception(
+                "[MIGRATION] 保留卷前卸载失败 role=%s volume=%s server=%s",
+                role,
+                volume_id,
+                server_id,
+            )
+
+    def validate_source_copy(
+        self,
+        copy: SourceCopy,
+        *,
+        volume_id: str = "",
+        size: int = 0,
+        volume_type: str | None = None,
+    ) -> tuple[bool, str]:
+        """校验上次失败保留的派生卷/快照还能不能直接复用。
+
+        目标是"能省几小时的派生就省"：任何一项对不上都返回 False（附原因），
+        调用方回退到重新派生。检查项包括快照/派生卷是否还在、状态是否正常、
+        容量与卷类型是否与本次请求一致。读接口失败（含 404）同样按不可复用处理。
+        """
+        if not copy.snapshot_id or not copy.derived_volume_id:
+            return False, "台账未记录快照/派生卷"
+        try:
+            snapshot = self.source_os.get_volume_snapshot(copy.snapshot_id)
+        except Exception as exc:  # noqa: BLE001 - 查不到就重建
+            return False, f"快照不可用（{exc}）"
+        if snapshot is None:
+            return False, "快照已被删除"
+        snapshot_status = str(getattr(snapshot, "status", "") or "").lower()
+        if snapshot_status and snapshot_status != "available":
+            return False, f"快照状态 {snapshot_status} 不适合复用"
+        try:
+            derived = self.source_os.get_volume(copy.derived_volume_id)
+        except Exception as exc:  # noqa: BLE001 - 查不到就重建
+            return False, f"派生卷不可用（{exc}）"
+        if derived is None:
+            return False, "派生卷已被删除"
+        status = str(getattr(derived, "status", "") or "").lower()
+        if status not in {"available", "in-use"}:
+            return False, f"派生卷状态 {status or 'unknown'} 不适合复用"
+        derived_size = int(getattr(derived, "size", 0) or 0)
+        if size and derived_size and derived_size != int(size):
+            return False, f"派生卷容量 {derived_size}GiB 与源卷 {int(size)}GiB 不一致"
+        if volume_type:
+            actual = str(getattr(derived, "volume_type", "") or "").strip()
+            if actual and actual != str(volume_type):
+                return False, f"派生卷类型 {actual} 与本次要求的 {volume_type} 不一致"
+        return True, "可复用"
 
     def cleanup_source_copy(self, copy: SourceCopy, relay_server_id: str) -> None:
         """清理派生卷与快照；任一步失败只记录，不阻塞后续清理。"""

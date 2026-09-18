@@ -31,11 +31,21 @@ class VmDiskSummaryRenderTest(unittest.TestCase):
         html = self._html()
 
         self.assertIn("function diskRetryCell(vm, disks)", html)
-        self.assertIn("if (vm.status !== 'awaiting_disk_retry') {", html)
+        self.assertIn("const retryable = vm.status === 'awaiting_disk_retry';", html)
+        self.assertIn("if (retryable) {", html)
         self.assertIn("等待其余盘完成", html)
         self.assertIn("function retryVmDisk(vmName, volumeIds)", html)
         self.assertIn("/disks/retry", html)
         self.assertIn("function relayDiskFailed(disk)", html)
+
+    def test_relay_summary_offers_release_for_retained_copy(self):
+        """失败保留的中间卷要能在页面上立即释放，不必为了归还配额取消任务。"""
+        html = self._html()
+
+        self.assertIn("function releaseVmDisk(vmName, volumeIds)", html)
+        self.assertIn("/disks/release", html)
+        self.assertIn("function relayRetainText(disk)", html)
+        self.assertIn("全部释放", html)
 
     def test_disk_source_prefers_relay_results_then_volumes(self):
         html = self._html()

@@ -82,6 +82,95 @@ class RelayReaperTest(unittest.TestCase):
 
         self.assertEqual(self.reaper.sweep(now=2000.0), [])
 
+    def test_sweep_keeps_retained_copy_within_window(self):
+        """失败的派生卷/快照在保留期内不能被对账删掉，否则重试白等几小时。"""
+        self.ledger.all.return_value = [
+            self._record(
+                phase="failed_retained",
+                updated_at=1000.0,
+                retained_until=3000.0,
+            )
+        ]
+
+        cleaned = self.reaper.sweep(now=2000.0)
+
+        self.assertEqual(cleaned, [])
+        self.lifecycle.cleanup_source_copy.assert_not_called()
+
+    def test_sweep_cleans_retained_copy_after_window(self):
+        record = self._record(
+            phase="failed_retained", updated_at=1000.0, retained_until=1500.0
+        )
+        self.ledger.all.return_value = [record]
+
+        cleaned = self.reaper.sweep(now=2000.0)
+
+        self.assertEqual(cleaned, ["job-1:vol-s1"])
+        self.lifecycle.cleanup_source_copy.assert_called_once()
+        self.assertEqual(record.phase, "cleaned")
+        self.assertEqual(record.retained_until, 0.0)
+
+    def test_sweep_cleans_retained_copy_without_deadline(self):
+        """老记录/被手工清掉保留期的 failed_retained 不能永远留着占配额。"""
+        self.ledger.all.return_value = [
+            self._record(phase="failed_retained", updated_at=1000.0)
+        ]
+
+        self.assertEqual(self.reaper.sweep(now=2000.0), ["job-1:vol-s1"])
+
+    def test_sweep_keeps_retained_copy_of_running_job(self):
+        """作业还在等人工重试：保留期到了也先留着，由作业自己的流程负责回收。"""
+        self.ledger.all.return_value = [
+            self._record(
+                phase="failed_retained", updated_at=1000.0, retained_until=1100.0
+            )
+        ]
+        reaper = RelayReaper(
+            ledger=self.ledger,
+            lifecycle=self.lifecycle,
+            pools={"source": mock.MagicMock(), "target": mock.MagicMock()},
+            stale_seconds=600.0,
+            active_jobs=lambda: {"job-1"},
+        )
+
+        self.assertEqual(reaper.sweep(now=2000.0), [])
+        self.lifecycle.cleanup_source_copy.assert_not_called()
+
+    def test_release_cleans_immediately_without_waiting(self):
+        record = self._record(
+            phase="failed_retained", updated_at=1000.0, retained_until=9999999999.0
+        )
+
+        released = self.reaper.release([record], reason="manual")
+
+        self.assertEqual(released, ["job-1:vol-s1"])
+        self.lifecycle.cleanup_source_copy.assert_called_once()
+        self.assertEqual(record.phase, "cleaned")
+        self.assertEqual(record.retained_until, 0.0)
+        self.ledger.save.assert_called()
+
+    def test_release_marks_cleanup_failed_for_retry(self):
+        self.lifecycle.cleanup_source_copy.side_effect = RuntimeError("boom")
+        record = self._record(phase="failed_retained", updated_at=1000.0)
+
+        released = self.reaper.release([record], reason="manual")
+
+        self.assertEqual(released, [])
+        self.assertEqual(record.phase, "cleanup_failed")
+
+    def test_reconcile_job_cleans_retained_records_too(self):
+        """作业结束（正常/取消/删除）后没人再点重试，保留卷立即回收。"""
+        record = self._record(
+            phase="failed_retained", updated_at=1000.0, retained_until=9999999999.0
+        )
+        self.ledger.all.return_value = [record]
+
+        cleaned = self.reaper.reconcile_job("job-1")
+
+        self.assertEqual(cleaned, ["job-1:vol-s1"])
+        self.assertEqual(record.phase, "cleaned")
+        self.assertEqual(record.retained_until, 0.0)
+
     def test_sweep_continues_after_cleanup_error(self):
         self.lifecycle.cleanup_source_copy.side_effect = RuntimeError("boom")
         self.ledger.all.return_value = [

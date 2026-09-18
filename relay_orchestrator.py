@@ -7,12 +7,35 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from env_utils import env_float
+
 from relay_protocol import DEFAULT_CHUNK, agent_supports_sparse
 from relay_transfer import TAIL_WINDOW
-from relay_volumes import VolumeLifecycle
+from relay_volumes import SourceCopy, VolumeLifecycle
 from relay_wait import wait_for
 
 GIB = 1024 ** 3
+
+#: 传输失败后保留派生卷/快照的默认时长（小时）。派生一份大盘在商业存储上
+#: 常要几小时，失败就删掉会让每次重试都从头再来；保留期内人工重试可直接
+#: 复用，过期由对账回收。0 = 失败即回收（旧行为），用
+#: MIGRATION_DERIVED_RETENTION_HOURS 覆盖。
+DERIVED_RETENTION_HOURS = 24.0
+
+#: 保留原因截断长度，避免把整段堆栈写进台账把文件撑大。
+RETAIN_REASON_MAX = 200
+
+
+def derived_retention_seconds() -> float:
+    """失败中间产物保留时长（秒）；0 表示失败立即回收。"""
+    return (
+        env_float(
+            "MIGRATION_DERIVED_RETENTION_HOURS",
+            DERIVED_RETENTION_HOURS,
+            minimum=0.0,
+        )
+        * 3600.0
+    )
 
 
 def volume_bytes(volume: Any) -> int:
@@ -100,6 +123,9 @@ class RelayVolumeMover:
         hole_mode: str = "skip",
         stall_timeout: float = 300.0,
         slot_wait_timeout: float = 1800.0,
+        #: 失败后保留派生卷/快照的时长（秒）；None 时读
+        #: MIGRATION_DERIVED_RETENTION_HOURS（默认 24h），0 = 失败即回收。
+        derived_retention_window: float | None = None,
         clock: Callable[[], float] = time.monotonic,
     ):
         self.source_pool = source_pool
@@ -123,6 +149,11 @@ class RelayVolumeMover:
         self.hole_mode = hole_mode
         self.stall_timeout = stall_timeout
         self.slot_wait_timeout = slot_wait_timeout
+        self.derived_retention_window = (
+            derived_retention_seconds()
+            if derived_retention_window is None
+            else max(float(derived_retention_window), 0.0)
+        )
         self.clock = clock
 
     def _bounded_timeout(self) -> float:
@@ -187,6 +218,7 @@ class RelayVolumeMover:
         source_volume_type: str | None = None,
         target_volume_type: str | None = None,
         reuse_target_volume_id: str = "",
+        reuse_source_copy: bool = True,
     ) -> PreparedVolume:
         """只做「打快照 → 派生拷贝源 → 建目标空白卷」。
 
@@ -194,13 +226,21 @@ class RelayVolumeMover:
         派生卷回收，不留占配额的空壳。
 
         ``reuse_target_volume_id`` 供失败盘重试使用：目标空白卷是这台 VM 的
-        数据盘、里面可能已经写进了部分字节，重试时要沿用而不是再建一块。
+        数据盘、里面可能已经写进了部分字节，重试时要沿用而不是再建一块；
+        但云侧已删掉/状态异常/容量不符时校验不过，回退成新建一块。
+
+        ``reuse_source_copy`` 供失败盘重试使用：上一次传输失败时派生卷/快照
+        会按保留期留下（phase=failed_retained），校验通过就直接复用，省掉
+        几小时的存储侧打快照 + 派生；校验不过（卷被删/类型不符/保留期已过）
+        自动回退到重新派生。
         """
         record = self.record(volume)
         if not record.vm_id:
             # 台账里的 vm_id 就是页面展示用的 VM 名（relay 通道此前一直是空串）。
             record.vm_id = vm_name
         copy = None
+        reused = False
+        resolved_source_type = source_volume_type or self.source_volume_type or None
         self._save(record, phase="snapshotting")
 
         def touch(_waited: float = 0.0) -> None:
@@ -212,21 +252,46 @@ class RelayVolumeMover:
             self._save(record, phase=record.phase)
 
         try:
-            copy = self.lifecycle.create_source_copy(
-                volume_id=volume.source_volume_id,
-                vm_name=vm_name,
-                index=index,
-                size=int(volume.size or 0),
-                volume_type=source_volume_type or self.source_volume_type or None,
-                on_wait=touch,
-            )
+            if reuse_source_copy:
+                copy = self._reuse_source_copy(
+                    record,
+                    volume_id=volume.source_volume_id,
+                    size=int(volume.size or 0),
+                    volume_type=resolved_source_type,
+                )
+            if copy is None:
+                # 记录里可能还留着已失效的派生指针（云侧已删、类型不符等），
+                # 重新派生之前先把残留清掉，避免快照越积越多。
+                self._release_record_copy(record)
+                copy = self.lifecycle.create_source_copy(
+                    volume_id=volume.source_volume_id,
+                    vm_name=vm_name,
+                    index=index,
+                    size=int(volume.size or 0),
+                    volume_type=resolved_source_type,
+                    on_wait=touch,
+                )
+            else:
+                reused = True
+                logging.info(
+                    "[MIGRATION] 复用失败保留的派生卷 volume=%s derived=%s snapshot=%s",
+                    volume.source_volume_id,
+                    copy.derived_volume_id,
+                    copy.snapshot_id,
+                )
             self._save(
                 record,
                 phase="cloning",
                 snapshot_id=copy.snapshot_id,
                 derived_volume_id=copy.derived_volume_id,
+                retained_until=0.0,
+                retain_reason="",
             )
             target_volume_id = str(reuse_target_volume_id or "").strip()
+            if target_volume_id and not self._target_volume_reusable(
+                target_volume_id, int(volume.size or 0)
+            ):
+                target_volume_id = ""
             if target_volume_id:
                 logging.info(
                     "[MIGRATION] 失败盘重试沿用已有目标卷 volume=%s target=%s",
@@ -243,17 +308,27 @@ class RelayVolumeMover:
             self._save(
                 record, phase="attaching_target", target_volume_id=target_volume_id
             )
-        except Exception:
-            self._save(record, phase="failed")
-            self.discard(
-                PreparedVolume(
-                    volume=volume,
-                    record=record,
-                    copy=copy,
-                    target_volume_id="",
-                    index=index,
+        except Exception as exc:
+            retained = False
+            if reused and copy is not None:
+                # 复用的派生卷仍然有效：保留它，别让"建目标卷失败"把几小时的
+                # 派生结果一起删掉，下次重试还能直接用。
+                retained = self._retain_copy(
+                    record,
+                    copy,
+                    reason=f"准备阶段失败：{type(exc).__name__}: {exc}",
                 )
-            )
+            if not retained:
+                self._save(record, phase="failed")
+                self.discard(
+                    PreparedVolume(
+                        volume=volume,
+                        record=record,
+                        copy=copy,
+                        target_volume_id="",
+                        index=index,
+                    )
+                )
             raise
         return PreparedVolume(
             volume=volume,
@@ -272,6 +347,191 @@ class RelayVolumeMover:
         except Exception:  # noqa: BLE001 - 清理失败不覆盖原始错误
             logging.exception("[MIGRATION] 回收派生卷失败")
 
+    def _reuse_source_copy(
+        self,
+        record: Any,
+        *,
+        volume_id: str,
+        size: int,
+        volume_type: str | None,
+    ) -> Any | None:
+        """复用上次失败保留下来的派生卷/快照；任一检查不过返回 None。
+
+        返回 None 时调用方会走"清理残留 → 重新派生"，因此这里只负责判断，
+        不做任何删除动作。
+        """
+        snapshot_id = str(getattr(record, "snapshot_id", "") or "")
+        derived_volume_id = str(getattr(record, "derived_volume_id", "") or "")
+        if not snapshot_id or not derived_volume_id:
+            return None
+        if (
+            record.source_cloud
+            and self.source_cloud
+            and record.source_cloud != self.source_cloud
+        ):
+            logging.warning(
+                "[MIGRATION] 台账记录的云与本次不一致，不复用派生卷 volume=%s", volume_id
+            )
+            return None
+        deadline = float(getattr(record, "retained_until", 0.0) or 0.0)
+        if deadline and time.time() > deadline:
+            logging.warning(
+                "[MIGRATION] 派生卷保留期已过（%s），改为重新派生 volume=%s",
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(deadline)),
+                volume_id,
+            )
+            return None
+        validate = getattr(self.lifecycle, "validate_source_copy", None)
+        if not callable(validate):
+            return None
+        copy = SourceCopy(
+            snapshot_id=snapshot_id, derived_volume_id=derived_volume_id
+        )
+        try:
+            ok, detail = validate(
+                copy, volume_id=volume_id, size=size, volume_type=volume_type
+            )
+        except Exception:  # noqa: BLE001 - 校验异常按不可复用处理
+            logging.exception(
+                "[MIGRATION] 派生卷复用校验异常，改为重新派生 volume=%s", volume_id
+            )
+            return None
+        if not ok:
+            logging.warning(
+                "[MIGRATION] 派生卷复用校验失败，改为重新派生 volume=%s：%s",
+                volume_id,
+                detail,
+            )
+            return None
+        logging.info(
+            "[MIGRATION] 派生卷复用校验通过 volume=%s derived=%s（%s）",
+            volume_id,
+            derived_volume_id,
+            detail,
+        )
+        # 复用的卷必须先从中转机上卸干净：重试会重新 attach，残留挂载会被
+        # Nova 以 409 拒绝。已经 available 时 park_volume 是空操作。
+        self.lifecycle.park_volume(
+            role="source",
+            server_id=str(getattr(record, "source_relay_id", "") or ""),
+            volume_id=derived_volume_id,
+        )
+        return copy
+
+    def _release_record_copy(self, record: Any) -> None:
+        """清掉台账里已失效的派生卷/快照，并清空对应指针。"""
+        snapshot_id = str(getattr(record, "snapshot_id", "") or "")
+        derived_volume_id = str(getattr(record, "derived_volume_id", "") or "")
+        if not snapshot_id and not derived_volume_id:
+            return
+        try:
+            self.lifecycle.cleanup_source_copy(
+                SourceCopy(
+                    snapshot_id=snapshot_id, derived_volume_id=derived_volume_id
+                ),
+                str(getattr(record, "source_relay_id", "") or ""),
+            )
+        except Exception:  # noqa: BLE001 - 清理失败由对账兜底
+            logging.exception(
+                "[MIGRATION] 回收失效派生卷失败 volume=%s", record.volume_id
+            )
+        self._save(
+            record,
+            snapshot_id="",
+            derived_volume_id="",
+            retained_until=0.0,
+            retain_reason="",
+        )
+
+    def _target_volume_reusable(self, volume_id: str, size: int) -> bool:
+        """重试前核对上次建好的目标卷还能不能续传。
+
+        目标卷里可能已经写进部分字节，沿用能省一次全量拷贝；但云上被删掉后
+        继续沿用会每次重试都 404，所以查不到/状态异常/容量不符时回退成新建
+        一块（调用方会记日志，方便定位被放弃的那块盘）。
+        """
+        try:
+            volume = self.lifecycle.target_os.get_volume(volume_id)
+        except Exception as exc:  # noqa: BLE001 - 查不到就重建
+            logging.warning(
+                "[MIGRATION] 目标卷不可用（%s），改为新建一块 target=%s", exc, volume_id
+            )
+            return False
+        if volume is None:
+            logging.warning(
+                "[MIGRATION] 目标卷不存在，改为新建一块 target=%s", volume_id
+            )
+            return False
+        status = str(getattr(volume, "status", "") or "").lower()
+        if status in {"error", "error_deleting", "deleting"}:
+            logging.warning(
+                "[MIGRATION] 目标卷状态 %s，改为新建一块 target=%s", status, volume_id
+            )
+            return False
+        actual = int(getattr(volume, "size", 0) or 0)
+        if size and actual and actual != int(size):
+            logging.warning(
+                "[MIGRATION] 目标卷容量 %sGiB 与本次 %sGiB 不一致，"
+                "改为新建一块 target=%s",
+                actual,
+                int(size),
+                volume_id,
+            )
+            return False
+        return True
+
+    def _retain_copy(
+        self,
+        record: Any,
+        copy: Any,
+        *,
+        reason: str,
+        source_relay_id: str = "",
+    ) -> bool:
+        """失败保留派生卷/快照：卸载但不删除，写保留期与原因。
+
+        返回 False 表示没有保留（未建出派生卷或保留期关闭），调用方按原逻辑
+        立即回收。
+        """
+        window = float(self.derived_retention_window or 0.0)
+        if copy is None or window <= 0:
+            return False
+        self.lifecycle.park_volume(
+            role="source",
+            server_id=str(source_relay_id or record.source_relay_id or ""),
+            volume_id=copy.derived_volume_id,
+        )
+        deadline = time.time() + window
+        self._save(
+            record,
+            phase="failed_retained",
+            retained_until=deadline,
+            retain_reason=(reason or "")[:RETAIN_REASON_MAX],
+        )
+        logging.warning(
+            "[MIGRATION] 盘 %s 失败，保留派生卷 %s/快照 %s 供重试复用，保留至 %s",
+            record.volume_id,
+            copy.derived_volume_id,
+            copy.snapshot_id,
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(deadline)),
+        )
+        return True
+
+    def retained_info(self, volume_id: str) -> dict[str, Any]:
+        """失败保留信息，供作业层落到 relay_disks 给前端提示/释放入口。
+
+        没有保留（正常失败、已完成）时返回空 dict。
+        """
+        record = self.ledger.get(self.job_id, volume_id)
+        if record is None or getattr(record, "phase", "") != "failed_retained":
+            return {}
+        return {
+            "retained_until": float(getattr(record, "retained_until", 0.0) or 0.0),
+            "retain_reason": str(getattr(record, "retain_reason", "") or ""),
+            "snapshot_id": str(getattr(record, "snapshot_id", "") or ""),
+            "derived_volume_id": str(getattr(record, "derived_volume_id", "") or ""),
+        }
+
     def transfer(self, prepared: PreparedVolume) -> dict[str, Any]:
         """挂载两侧卷、搬数据、清理，返回目标卷信息。"""
         volume = prepared.volume
@@ -280,6 +540,7 @@ class RelayVolumeMover:
         target_volume_id = prepared.target_volume_id
         source_node = target_node = None
         cleaned = False
+        retained = False
         started_bytes = max(int(record.copied_bytes or 0), 0)
         try:
             source_node = self._acquire_with_wait(
@@ -353,19 +614,46 @@ class RelayVolumeMover:
             self._save(record, phase="cleaning")
             self.lifecycle.cleanup_source_copy(copy, source_node.server_id)
             cleaned = True
-            self._save(record, phase="done")
+            self._save(
+                record, phase="done", retained_until=0.0, retain_reason=""
+            )
             return {
                 "target_volume_id": target_volume_id,
                 "source_volume_id": volume.source_volume_id,
                 "size": int(volume.size or 0),
             }
-        except Exception:
-            self._save(record, phase="failed")
+        except Exception as exc:
+            if isinstance(exc, CopyCancelled):
+                # 取消（用户/停机）走"立即回收"：不占用保留配额。
+                self._save(record, phase="failed")
+            else:
+                retained = self._retain_copy(
+                    record,
+                    copy,
+                    reason=f"{type(exc).__name__}: {exc}",
+                    source_relay_id=(
+                        source_node.server_id if source_node is not None else ""
+                    ),
+                )
+                if not retained:
+                    self._save(record, phase="failed")
+            # 目标卷里可能已经写进了部分字节；先把挂载卸掉再保留，
+            # 否则重试时 attach 会被 Nova 拒绝。
+            self.lifecycle.park_volume(
+                role="target",
+                server_id=str(
+                    getattr(target_node, "server_id", "")
+                    or getattr(record, "target_relay_id", "")
+                    or ""
+                ),
+                volume_id=str(target_volume_id or ""),
+            )
             raise
         finally:
             # copy 一旦建出来就必须回收：取不到中转机槽位时 source_node 为 None，
             # 旧写法会跳过清理，把派生卷和快照留在源云里等作业收尾。
-            if copy is not None and not cleaned:
+            # 命中保留策略时例外：派生卷/快照留给重试复用，过期由对账回收。
+            if copy is not None and not cleaned and not retained:
                 try:
                     self.lifecycle.cleanup_source_copy(
                         copy, source_node.server_id if source_node is not None else ""

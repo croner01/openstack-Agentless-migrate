@@ -57,7 +57,8 @@ changes in `templates/index.html`.
 Tune behavior with `MIGRATION_*` environment variables
 (`MIGRATION_MAX_RBD_COPIES`, `MIGRATION_MEMORY_HIGH_WATER`,
 `MIGRATION_COPY_RESERVE_MB`, `MIGRATION_SHUTDOWN_GRACE_SECONDS`,
-`MIGRATION_MAX_UPLOAD_MB`, `MIGRATION_UPLOAD_RETENTION_DAYS`). Never commit
+`MIGRATION_MAX_UPLOAD_MB`, `MIGRATION_UPLOAD_RETENTION_DAYS`,
+`MIGRATION_DERIVED_RETENTION_HOURS`). Never commit
 credentials or Ceph configs; the app stores them under `uploads/` with `0600`
 permissions. Deploy by syncing the `migrate-vm-bin`/`migrate-vm-html` ConfigMaps
 and restarting the deployment, keeping a single replica so in-process

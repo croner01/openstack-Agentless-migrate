@@ -1,4 +1,5 @@
 import unittest
+import time
 from unittest import mock
 
 from relay_orchestrator import CopyCancelled, RelayVolumeMover
@@ -169,6 +170,8 @@ class RelayVolumeMoverTest(unittest.TestCase):
         旧实现把清理挂在 ``source_node is not None`` 上，池满直接失败时
         copy 已经建好却不会清理，留下 200G 派生卷 + 快照占配额。
         """
+        # 关掉失败保留：这里验证的是"保留期关闭时不留空壳"这条路径。
+        self.mover.derived_retention_window = 0.0
         self.mover.source_pool = _FakePool([])  # 源端没有可用中转机
         self.mover.target_pool = _FakePool([self.target_node])
 
@@ -632,6 +635,7 @@ class RelayVolumeMoverTest(unittest.TestCase):
         self.assertEqual(self.ledger.get("job-1", "vol-s1").phase, "done")
 
     def test_move_marks_ledger_failed_and_cleans_up(self):
+        self.mover.derived_retention_window = 0.0
         original_enqueue = self.state.enqueue
 
         def enqueue(task):
@@ -647,6 +651,218 @@ class RelayVolumeMoverTest(unittest.TestCase):
         self.assertEqual(self.ledger.get("job-1", "vol-s1").phase, "failed")
         self.lifecycle.cleanup_source_copy.assert_called_once()
         self.assertEqual(self.mover.source_pool.released, ["n-s"])
+
+    def test_transfer_failure_retains_derived_copy_within_window(self):
+        """失败后不删派生卷/快照：保留期内直接复用，省掉几小时的重新派生。"""
+        self.mover.derived_retention_window = 3600.0
+        original_enqueue = self.state.enqueue
+
+        def enqueue(task):
+            original_enqueue(task)
+            self.state.mark_task_ready(task["task_id"])
+            self.state.record_result(task["task_id"], "failed", 0)
+
+        self.state.enqueue = enqueue
+
+        with self.assertRaises(RuntimeError):
+            self._run()
+
+        record = self.ledger.get("job-1", "vol-s1")
+        self.assertEqual(record.phase, "failed_retained")
+        self.assertGreater(record.retained_until, time.time())
+        self.assertIn("RuntimeError", record.retain_reason)
+        self.lifecycle.cleanup_source_copy.assert_not_called()
+        # 派生卷与目标卷都要先从中转机卸下来，重试时才能重新 attach。
+        parked = [
+            call.kwargs
+            for call in self.lifecycle.park_volume.call_args_list
+        ]
+        self.assertIn(
+            {"role": "source", "server_id": "srv-s", "volume_id": "vol-d1"},
+            [{k: v for k, v in item.items()} for item in parked],
+        )
+        self.assertIn(
+            "target",
+            [item.get("role") for item in parked],
+        )
+
+    def test_retained_info_exposes_deadline_and_empty_when_not_retained(self):
+        self.assertEqual(self.mover.retained_info("vol-s1"), {})
+
+        from relay_ledger import VolumeTaskRecord
+
+        record = VolumeTaskRecord(
+            job_id="job-1",
+            vm_id="vm-1",
+            volume_id="vol-s1",
+            phase="failed_retained",
+            snapshot_id="snap-1",
+            derived_volume_id="vol-d1",
+            retained_until=12345.0,
+            retain_reason="TimeoutError: attach",
+        )
+        self.ledger.records[record.key] = record
+
+        info = self.mover.retained_info("vol-s1")
+
+        self.assertEqual(info["retained_until"], 12345.0)
+        self.assertEqual(info["snapshot_id"], "snap-1")
+        self.assertEqual(info["derived_volume_id"], "vol-d1")
+        self.assertEqual(info["retain_reason"], "TimeoutError: attach")
+
+    def test_prepare_reuses_retained_copy_when_validation_passes(self):
+        from relay_ledger import VolumeTaskRecord
+
+        record = VolumeTaskRecord(
+            job_id="job-1",
+            vm_id="vm-1",
+            volume_id="vol-s1",
+            phase="failed_retained",
+            snapshot_id="snap-old",
+            derived_volume_id="vol-d-old",
+            retained_until=time.time() + 3600,
+        )
+        self.ledger.records[record.key] = record
+        self.lifecycle.validate_source_copy.return_value = (True, "可复用")
+
+        prepared = self.mover.prepare(volume=_Volume(), vm_name="vm-1", index=0)
+
+        self.lifecycle.create_source_copy.assert_not_called()
+        self.assertEqual(prepared.copy.snapshot_id, "snap-old")
+        self.assertEqual(prepared.copy.derived_volume_id, "vol-d-old")
+        self.assertEqual(self.ledger.get("job-1", "vol-s1").retained_until, 0.0)
+        self.assertEqual(
+            self.lifecycle.validate_source_copy.call_args.kwargs["volume_id"],
+            "vol-s1",
+        )
+
+    def test_prepare_rebuilds_when_retained_copy_validation_fails(self):
+        """校验不过（卷被删/类型不符）时自动回退重建，并先清掉失效残留。"""
+        from relay_ledger import VolumeTaskRecord
+
+        record = VolumeTaskRecord(
+            job_id="job-1",
+            vm_id="vm-1",
+            volume_id="vol-s1",
+            phase="failed_retained",
+            snapshot_id="snap-stale",
+            derived_volume_id="vol-d-stale",
+            retained_until=time.time() + 3600,
+        )
+        self.ledger.records[record.key] = record
+        self.lifecycle.validate_source_copy.return_value = (False, "派生卷已被删除")
+
+        prepared = self.mover.prepare(volume=_Volume(), vm_name="vm-1", index=0)
+
+        self.lifecycle.create_source_copy.assert_called_once()
+        self.assertEqual(prepared.copy.derived_volume_id, "vol-d1")
+        self.lifecycle.cleanup_source_copy.assert_called_once()
+        stale = self.lifecycle.cleanup_source_copy.call_args.args[0]
+        self.assertEqual(stale.derived_volume_id, "vol-d-stale")
+        self.assertEqual(stale.snapshot_id, "snap-stale")
+
+    def test_prepare_rebuilds_after_retention_window_expired(self):
+        """保留期已过就不再复用，省得把过期指针当成有效缓存。"""
+        from relay_ledger import VolumeTaskRecord
+
+        record = VolumeTaskRecord(
+            job_id="job-1",
+            vm_id="vm-1",
+            volume_id="vol-s1",
+            phase="failed_retained",
+            snapshot_id="snap-old",
+            derived_volume_id="vol-d-old",
+            retained_until=time.time() - 10,
+        )
+        self.ledger.records[record.key] = record
+
+        prepared = self.mover.prepare(volume=_Volume(), vm_name="vm-1", index=0)
+
+        self.lifecycle.validate_source_copy.assert_not_called()
+        self.lifecycle.create_source_copy.assert_called_once()
+        self.assertEqual(prepared.copy.derived_volume_id, "vol-d1")
+
+    def test_prepare_failure_keeps_reused_copy_for_next_retry(self):
+        """复用的派生卷不会因为"建目标卷失败"被删掉，否则每一次重试都白等几小时。"""
+        from relay_ledger import VolumeTaskRecord
+
+        record = VolumeTaskRecord(
+            job_id="job-1",
+            vm_id="vm-1",
+            volume_id="vol-s1",
+            phase="failed_retained",
+            snapshot_id="snap-old",
+            derived_volume_id="vol-d-old",
+            retained_until=time.time() + 3600,
+        )
+        self.ledger.records[record.key] = record
+        self.lifecycle.validate_source_copy.return_value = (True, "可复用")
+        self.lifecycle.create_target_volume.side_effect = RuntimeError("quota exceeded")
+
+        with self.assertRaises(RuntimeError):
+            self.mover.prepare(volume=_Volume(), vm_name="vm-1", index=0)
+
+        self.lifecycle.cleanup_source_copy.assert_not_called()
+        self.assertEqual(record.phase, "failed_retained")
+        self.assertGreater(record.retained_until, time.time())
+        self.assertIn("准备阶段失败", record.retain_reason)
+
+    def test_prepare_reuses_existing_target_volume_when_valid(self):
+        self.target_os.get_volume.return_value = mock.Mock(
+            status="available", size=4096
+        )
+
+        prepared = self.mover.prepare(
+            volume=_Volume(),
+            vm_name="vm-1",
+            index=0,
+            reuse_target_volume_id="vol-t-old",
+        )
+
+        self.assertEqual(prepared.target_volume_id, "vol-t-old")
+        self.lifecycle.create_target_volume.assert_not_called()
+
+    def test_prepare_rebuilds_target_volume_when_it_disappeared(self):
+        """目标卷被云侧删掉后继续沿用会每次 404；校验失败要回退新建。"""
+        self.target_os.get_volume.side_effect = RuntimeError("404 not found")
+
+        prepared = self.mover.prepare(
+            volume=_Volume(),
+            vm_name="vm-1",
+            index=0,
+            reuse_target_volume_id="vol-t-gone",
+        )
+
+        self.assertEqual(prepared.target_volume_id, "vol-t1")
+        self.lifecycle.create_target_volume.assert_called_once()
+
+    def test_manual_retry_reuses_retained_copy_end_to_end(self):
+        """失败 → 人工重试：第二轮不再打快照/派生，直接复用后传完。"""
+        from relay_ledger import VolumeTaskRecord
+
+        self.mover.derived_retention_window = 3600.0
+        record = VolumeTaskRecord(
+            job_id="job-1",
+            vm_id="vm-1",
+            volume_id="vol-s1",
+            phase="failed_retained",
+            snapshot_id="snap-old",
+            derived_volume_id="vol-d-old",
+            retained_until=time.time() + 3600,
+        )
+        self.ledger.records[record.key] = record
+        self.lifecycle.validate_source_copy.return_value = (True, "可复用")
+        original_enqueue = self.state.enqueue
+        self.state.enqueue = lambda task: (
+            original_enqueue(task),
+            self._auto_complete(),
+        )
+
+        result = self._run()
+
+        self.lifecycle.create_source_copy.assert_not_called()
+        self.assertEqual(record.phase, "done")
+        self.assertEqual(result["target_volume_id"], "vol-t1")
 
     def test_move_raises_when_pool_exhausted(self):
         self.mover.source_pool = _FakePool([])
@@ -821,3 +1037,43 @@ class AttachmentDeviceTest(unittest.TestCase):
             self.os_utils.wait_attachment_device(
                 "srv-1", "vol-1", sleeper=self.sleeper, timeout=0
             )
+
+
+class DerivedRetentionWindowTest(unittest.TestCase):
+    def test_defaults_to_24_hours(self):
+        from relay_orchestrator import derived_retention_seconds
+
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(derived_retention_seconds(), 24 * 3600.0)
+
+    def test_env_override_and_invalid_value(self):
+        from relay_orchestrator import derived_retention_seconds
+
+        with mock.patch.dict(
+            "os.environ", {"MIGRATION_DERIVED_RETENTION_HOURS": "6"}, clear=True
+        ):
+            self.assertEqual(derived_retention_seconds(), 6 * 3600.0)
+        with mock.patch.dict(
+            "os.environ", {"MIGRATION_DERIVED_RETENTION_HOURS": "0"}, clear=True
+        ):
+            self.assertEqual(derived_retention_seconds(), 0.0)
+        with mock.patch.dict(
+            "os.environ", {"MIGRATION_DERIVED_RETENTION_HOURS": "6h"}, clear=True
+        ):
+            self.assertEqual(derived_retention_seconds(), 24 * 3600.0)
+
+    def test_mover_reads_env_when_no_override(self):
+        from relay_orchestrator import RelayVolumeMover
+
+        with mock.patch.dict(
+            "os.environ", {"MIGRATION_DERIVED_RETENTION_HOURS": "2"}, clear=True
+        ):
+            mover = RelayVolumeMover(
+                source_pool=_FakePool([]),
+                target_pool=_FakePool([]),
+                lifecycle=mock.MagicMock(),
+                state=_FakeState(),
+                ledger=_FakeLedger(),
+                job_id="job-1",
+            )
+        self.assertEqual(mover.derived_retention_window, 2 * 3600.0)

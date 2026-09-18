@@ -37,6 +37,12 @@ class VolumeTaskRecord:
     updated_at: float = 0.0
     source_cloud: str = ""
     target_cloud: str = ""
+    #: 失败保留：phase=failed_retained 时，派生卷/快照保留到的时间戳（秒）。
+    #: 保留期内人工重试可以直接复用，不必再等存储侧打快照 + 派生；0 表示
+    #: 没有保留期（老记录/已释放），由对账按静默时长兜底回收。
+    retained_until: float = 0.0
+    #: 保留原因（失败摘要），前端提示用，避免只看到一个"失败"。
+    retain_reason: str = ""
 
     @property
     def key(self) -> str:

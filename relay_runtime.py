@@ -48,6 +48,7 @@ RELAY_PHASE_LABELS = {
     "done": "完成",
     "cleaned": "已清理",
     "failed": "失败",
+    "failed_retained": "失败（已保留中间卷）",
 }
 
 # 采样窗口太短时（页面高频轮询、其他接口也在取快照）差分噪声极大，
@@ -749,13 +750,27 @@ class RelayRuntime:
                     # 打快照/派生卷这类阶段没有字节流动，页面靠 updated_at
                     # 显示"已等待多久"，否则只能看到"暂无在途卷"。
                     "updated_at": float(getattr(record, "updated_at", 0.0) or 0.0),
+                    # 失败保留：页面据此提示"保留到什么时候"并给释放入口。
+                    "retained_until": float(
+                        getattr(record, "retained_until", 0.0) or 0.0
+                    ),
+                    "retain_reason": str(
+                        getattr(record, "retain_reason", "") or ""
+                    ),
                 }
             )
         return items
 
     def ledger_summary(self) -> dict[str, int]:
         """在途与已清理计数，页面用它证明"没有堆积"。"""
-        summary = {"total": 0, "in_flight": 0, "done": 0, "cleaned": 0, "failed": 0}
+        summary = {
+            "total": 0,
+            "in_flight": 0,
+            "done": 0,
+            "cleaned": 0,
+            "failed": 0,
+            "retained": 0,
+        }
         for record in self.ledger.all():
             if record.job_id != self.job_id:
                 continue
@@ -764,11 +779,34 @@ class RelayRuntime:
                 summary["done"] += 1
             elif record.phase == "cleaned":
                 summary["cleaned"] += 1
-            elif record.phase in {"failed", "failed_retained"}:
+            elif record.phase == "failed_retained":
+                summary["retained"] += 1
+            elif record.phase == "failed":
                 summary["failed"] += 1
             else:
                 summary["in_flight"] += 1
         return summary
+
+    def release_retained(
+        self, volume_ids: list[str] | None = None, *, reason: str = "manual"
+    ) -> list[str]:
+        """立即回收本作业失败保留的派生卷/快照，返回被回收的源卷 id。
+
+        目标卷里已写入的字节保留（只卸载、不删除），因此释放后仍可重试，
+        只是要重新打快照派生。
+        """
+        wanted = {str(item) for item in (volume_ids or []) if str(item)}
+        records = [
+            record
+            for record in self.ledger.all()
+            if record.job_id == self.job_id
+            and record.phase == "failed_retained"
+            and (not wanted or record.volume_id in wanted)
+        ]
+        if not records:
+            return []
+        released_keys = set(self.reaper.release(records, reason=reason))
+        return [record.volume_id for record in records if record.key in released_keys]
 
     def sweep(self, *, now: float) -> list[str]:
         """周期巡检：标记心跳超时的中转机，并清理超时未完成的卷任务。"""

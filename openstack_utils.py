@@ -275,6 +275,10 @@ class OpenStackUtils:
     def get_volume(self, volume_id: str):
         return self.conn.block_storage.get_volume(volume_id)
 
+    def get_volume_snapshot(self, snapshot_id: str):
+        """按 id 取卷快照；不存在时抛 404（调用方据此判定复用指针已失效）。"""
+        return self.conn.block_storage.get_snapshot(snapshot_id)
+
     def get_server_volumes_with_device(
         self,
         server_id: str,

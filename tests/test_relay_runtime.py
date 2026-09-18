@@ -462,6 +462,80 @@ class RelayRuntimeTest(unittest.TestCase):
         self.assertEqual(volume["skipped_bytes"], 1024)
         self.assertEqual(volume["sent_bytes"], 2048)
 
+    def test_release_retained_cleans_only_retained_records(self):
+        from relay_ledger import VolumeTaskRecord
+
+        retained = VolumeTaskRecord(
+            job_id="job-1",
+            vm_id="vm-1",
+            volume_id="vol-a",
+            phase="failed_retained",
+            snapshot_id="snap-a",
+            derived_volume_id="vol-da",
+            retained_until=9999999999.0,
+        )
+        other = VolumeTaskRecord(
+            job_id="job-2",
+            vm_id="vm-1",
+            volume_id="vol-b",
+            phase="failed_retained",
+            retained_until=9999999999.0,
+        )
+        probing = VolumeTaskRecord(
+            job_id="job-1", vm_id="vm-1", volume_id="vol-c", phase="copying"
+        )
+        self.ledger.all.return_value = [retained, other, probing]
+
+        released = self.runtime.release_retained(["vol-a"], reason="manual")
+
+        self.assertEqual(released, ["vol-a"])
+        self.assertEqual(retained.phase, "cleaned")
+        self.assertEqual(retained.retained_until, 0.0)
+        self.assertEqual(other.phase, "failed_retained")
+        self.assertEqual(probing.phase, "copying")
+
+    def test_release_retained_without_ids_cleans_all_for_job(self):
+        from relay_ledger import VolumeTaskRecord
+
+        records = [
+            VolumeTaskRecord(
+                job_id="job-1",
+                vm_id="vm-1",
+                volume_id=f"vol-{index}",
+                phase="failed_retained",
+                snapshot_id=f"snap-{index}",
+                derived_volume_id=f"vol-d{index}",
+                retained_until=9999999999.0,
+            )
+            for index in range(2)
+        ]
+        self.ledger.all.return_value = records
+
+        released = self.runtime.release_retained(reason="cancel")
+
+        self.assertEqual(released, ["vol-0", "vol-1"])
+        self.assertTrue(all(record.phase == "cleaned" for record in records))
+
+    def test_volume_progress_exposes_retention_fields(self):
+        from relay_ledger import VolumeTaskRecord
+
+        self.ledger.all.return_value = [
+            VolumeTaskRecord(
+                job_id="job-1",
+                vm_id="vm-1",
+                volume_id="vol-a",
+                phase="failed_retained",
+                retained_until=12345.0,
+                retain_reason="TimeoutError: attach",
+            )
+        ]
+
+        volume = self.runtime.snapshot()["volumes"][0]
+
+        self.assertEqual(volume["retained_until"], 12345.0)
+        self.assertEqual(volume["retain_reason"], "TimeoutError: attach")
+        self.assertEqual(volume["progress_label"], "失败（已保留中间卷）")
+
     def test_finish_marks_unfinished_records_failed(self):
         """作业收尾后台账不能继续显示"在途卷"，否则页面永远停在拷贝中。"""
         from relay_ledger import VolumeTaskRecord
@@ -571,6 +645,13 @@ class RelayRuntimeTest(unittest.TestCase):
             VolumeTaskRecord(job_id="job-1", vm_id="v", volume_id="b", phase="done"),
             VolumeTaskRecord(job_id="job-1", vm_id="v", volume_id="c", phase="cleaned"),
             VolumeTaskRecord(job_id="job-1", vm_id="v", volume_id="d", phase="failed"),
+            VolumeTaskRecord(
+                job_id="job-1",
+                vm_id="v",
+                volume_id="d2",
+                phase="failed_retained",
+                retained_until=99999999999.0,
+            ),
             VolumeTaskRecord(job_id="job-2", vm_id="v", volume_id="e", phase="copying"),
         ]
 
@@ -578,7 +659,14 @@ class RelayRuntimeTest(unittest.TestCase):
 
         self.assertEqual(
             summary,
-            {"total": 4, "in_flight": 1, "done": 1, "cleaned": 1, "failed": 1},
+            {
+                "total": 5,
+                "in_flight": 1,
+                "done": 1,
+                "cleaned": 1,
+                "failed": 1,
+                "retained": 1,
+            },
         )
 
     def test_sweep_marks_stale_nodes_and_cleans_ledger(self):
