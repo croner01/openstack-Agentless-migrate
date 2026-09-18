@@ -34,6 +34,8 @@ spec:
           value: "540"
         - name: TZ
           value: Asia/Shanghai
+        - name: MIGRATION_LOG_ONLY
+          value: "off"
         volumeMounts:
         - name: uploads-volume
           mountPath: /app/uploads

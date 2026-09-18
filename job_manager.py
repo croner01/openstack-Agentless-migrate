@@ -278,6 +278,7 @@ class JobManager:
             if job.status != JobStatus.RUNNING:
                 return False
             job.cancelled = True
+            worker = self._workers.get(job_id)
         for vm in job.vms:
             if vm.status not in {
                 VmStatus.SUCCESS,
@@ -286,6 +287,13 @@ class JobManager:
                 VmStatus.CANCELLED,
             }:
                 vm.mark_cancelled()
+        # 没有执行线程的作业（例如提交校验失败留下的僵尸作业）不会自己收敛
+        # 状态：这里直接结算，否则状态永远停在 running，用户连删都删不掉。
+        if not (worker and worker.is_alive()):
+            job.refresh_status()
+            if job.status == JobStatus.RUNNING:
+                job.status = JobStatus.CANCELLED
+                job.error = job.error or "任务被用户取消，部分 VM 未执行"
         self._save()
         logging.info("[MIGRATION] 任务 %s 已标记取消", job_id)
         return True
@@ -730,6 +738,16 @@ class JobManager:
     def unregister_worker(self, job_id: str) -> None:
         with self._lock:
             self._workers.pop(job_id, None)
+
+    def is_worker_alive(self, job_id: str) -> bool:
+        """作业是否还有活跃的执行线程。
+
+        ``running`` 但没有线程的作业是"僵尸作业"：作业记录已注册，执行却没
+        起来，状态永远不会自己收敛。诊断接口用它提示用户取消后重提。
+        """
+        with self._lock:
+            thread = self._workers.get(job_id)
+        return bool(thread and thread.is_alive())
 
     def active_worker_threads(self) -> list[threading.Thread]:
         with self._lock:

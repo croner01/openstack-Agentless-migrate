@@ -1111,9 +1111,15 @@ def _diagnose_hints(
     gate: dict[str, Any],
     relay: dict[str, Any] | None,
     log_lines: list[str],
+    worker_alive: bool = True,
 ) -> list[str]:
     """把"卡在哪"翻译成几条可执行结论，省得对着原始数据猜。"""
     hints: list[str] = []
+    if job.status == JobStatus.RUNNING and not worker_alive:
+        hints.append(
+            "作业状态是「进行中」，但没有执行线程：提交时参数校验失败、作业却已注册"
+            "（历史遗留的僵尸作业）。它不会自己推进，请取消该作业后重新提交。"
+        )
     for line in reversed(log_lines):
         if "等待 RBD 拷贝名额" in line:
             hints.append(
@@ -1390,6 +1396,9 @@ def api_preview():
 
 @app.post("/api/migrate")
 def api_migrate():
+    # 校验失败时要知道作业/目录是否已经建出来，才能正确清理，别留僵尸作业。
+    job = None
+    job_dir: str | None = None
     try:
         if shutdown_coordinator.stopping:
             return (
@@ -1425,6 +1434,7 @@ def api_migrate():
             profile=profile,
             store=profile_store,
         )
+        job_dir = _job_dir
         reachability_error = _ceph_conf_reachability_error(
             source_conf_path, target_conf_path
         )
@@ -1438,9 +1448,8 @@ def api_migrate():
         source_auth = _auth_args("source", _profile_auth(profile, "source"))
         target_auth = _auth_args("target", _profile_auth(profile, "target"))
 
-        job = job_manager.create_job(rows, job_id=job_id)
-        # 表单自带的提交参数快照：作业详情页后续可用它「调整参数重新提交」。
-        _save_submit_params(job_id, request.form.get("submit_snapshot"))
+        # 先把 options 全部解析、校验完再注册作业。否则像 parse_relay_options
+        # 这类校验失败时，作业已经注册却没有执行线程，会永远停在 running。
         options = {
             "job_id": job_id,
             "source_auth_args": source_auth,
@@ -1505,7 +1514,13 @@ def api_migrate():
         try:
             relay_config = parse_relay_options(options)
         except ValueError as exc:
+            # 作业还没注册，只留下 _create_job_and_files 建的空目录，一并清掉。
+            shutil.rmtree(job_dir, ignore_errors=True)
             return jsonify({"ok": False, "error": str(exc)}), 400
+
+        job = job_manager.create_job(rows, job_id=job_id)
+        # 表单自带的提交参数快照：作业详情页后续可用它「调整参数重新提交」。
+        _save_submit_params(job_id, request.form.get("submit_snapshot"))
 
         def worker():
             relay_runtime = None
@@ -1591,6 +1606,13 @@ def api_migrate():
         return jsonify({"ok": True, "job_id": job.id})
     except Exception as exc:  # noqa: BLE001
         logging.exception("[MIGRATION] 创建任务失败")
+        if job is not None:
+            # 作业已注册但执行线程没起来：标记失败，别让它永远停在 running。
+            job.status = JobStatus.FAILED
+            job.error = f"提交失败：{exc}"
+            job_manager.save_now()
+        elif job_dir:
+            shutil.rmtree(job_dir, ignore_errors=True)
         return jsonify({"ok": False, "error": str(exc)}), 400
 
 
@@ -1740,10 +1762,12 @@ def api_job_diagnose(job_id: str):
     }
     relay = _relay_diagnose(job_id)
     log_lines, log_recent = _job_log_tail(job)
+    worker_alive = job_manager.is_worker_alive(job_id)
     return jsonify(
         {
             "ok": True,
             "diag_version": DIAG_VERSION,
+            "worker_alive": worker_alive,
             "job": {
                 "id": job.id,
                 "status": job.status.value,
@@ -1756,7 +1780,7 @@ def api_job_diagnose(job_id: str):
             "copy_gate": gate,
             "relay": relay,
             "hints": _diagnose_hints(
-                job, vms, gate, relay, log_lines + log_recent
+                job, vms, gate, relay, log_lines + log_recent, worker_alive
             ),
             "log_file": LOG_FILE,
             "log_lines": log_lines,

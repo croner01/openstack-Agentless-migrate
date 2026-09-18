@@ -1230,8 +1230,9 @@ const state = {
     //: 向导里是否有"用户编辑过但还没提交"的内容。只是回放过作业参数、或纯粹
     //: 浏览清单都不算，避免点「新建迁移」时对着没动过的旧内容弹确认框。
     wizardDirty: false,
-    //: 当前向导内容来自哪个作业的参数回放（用弹窗里说明来源）。
+    //: 当前向导内容来自哪个作业的参数回放（用弹窗里说明来源），以及它当时的状态。
     wizardOriginJobId: null,
+    wizardOriginJobStatus: null,
     catalogLoaded: false,
     //: 两侧已有的常驻中转机池（随「载入两侧目录」返回），用于沿用建机参数。
     relayExistingPools: { source: [], target: [] },
@@ -1491,6 +1492,35 @@ function captureWizardForm() {
     return form;
 }
 
+/* 中转机 AZ/镜像/网络这些下拉的 option 要等「载入两侧目录」才有。option 还没
+   到位时直接赋 value 会被浏览器清成空串，回放的参数就悄悄丢了（重提时后端会
+   报"中转机通道缺少必填项"）。所以先把目标值挂起，等 option 出现再补上。 */
+function setSelectValue(el, value) {
+    const wanted = String(value == null ? '' : value);
+    if (!wanted) {
+        el.value = '';
+        el.removeAttribute('data-pending-value');
+        return;
+    }
+    if (Array.from(el.options).some(option => option.value === wanted)) {
+        el.value = wanted;
+        el.removeAttribute('data-pending-value');
+        return;
+    }
+    el.dataset.pendingValue = wanted;
+}
+
+function reapplyPendingSelectValues(root) {
+    $$('select[data-pending-value]', root || document).forEach(el => {
+        const wanted = el.dataset.pendingValue || '';
+        if (!wanted) { el.removeAttribute('data-pending-value'); return; }
+        if (!Array.from(el.options).some(option => option.value === wanted)) return;
+        el.value = wanted;
+        el.removeAttribute('data-pending-value');
+        syncSelectTitle(el);
+    });
+}
+
 function applyWizardForm(form) {
     if (!form) return;
     $$('#view-wizard [name]').forEach(el => {
@@ -1499,6 +1529,7 @@ function applyWizardForm(form) {
             ? el.name + '#' + (el.value || '') : el.name;
         if (!(key in form)) return;
         if (el.type === 'checkbox' || el.type === 'radio') el.checked = Boolean(form[key]);
+        else if (el.tagName === 'SELECT') setSelectValue(el, form[key]);
         else el.value = form[key];
     });
 }
@@ -1508,6 +1539,7 @@ function resetWizard() {
     state.scheme = 'rbd_full';
     state.wizardDirty = false;
     state.wizardOriginJobId = null;
+    state.wizardOriginJobStatus = null;
     setPreviewRows([]);
     state.sourceServers = [];
     state.sourceServersNextMarker = null;
@@ -1521,7 +1553,11 @@ function resetWizard() {
     $$('#view-wizard [name]').forEach(el => {
         if (el.type === 'file') { el.value = ''; return; }
         if (el.type === 'checkbox' || el.type === 'radio') { el.checked = el.defaultChecked; return; }
-        if (el.tagName === 'SELECT') { el.selectedIndex = el.defaultIndex; return; }
+        if (el.tagName === 'SELECT') {
+            el.selectedIndex = el.defaultIndex;
+            el.removeAttribute('data-pending-value');
+            return;
+        }
         el.value = el.defaultValue;
     });
 
@@ -1663,6 +1699,7 @@ async function restoreLastSubmit() {
     // 回放出来的参数是"起点"而不是用户编辑：没有真正改动前不该吓唬用户。
     state.wizardDirty = false;
     state.wizardOriginJobId = job ? job.id : null;
+    state.wizardOriginJobStatus = job ? job.status : null;
     toast(
         fromServer
             ? '已载入该作业保存的提交参数（沿用上次验证的目录）；口令已从服务器快照中剔除，提交前请补填'
@@ -2791,6 +2828,46 @@ function applyBulkToSelected() {
     toast('已应用到 ' + count + ' 台 VM', 'success');
 }
 
+/* 重新提交时的说明：本次只新建作业，原作业（状态/记录）一律不动。 */
+function originJobNotice() {
+    if (!state.wizardOriginJobId) return '';
+    const id = escapeHtml(state.wizardOriginJobId);
+    if (state.wizardOriginJobStatus === 'running') {
+        return '<li>原作业 <b class="mono">' + id + '</b> 仍在运行：重新提交只新建作业，'
+            + '不会取消或改动它。若不想两个任务同时迁移同一批 VM，请先到原作业详情点「取消作业」。</li>';
+    }
+    return '<li>原作业 <b class="mono">' + id + '</b>（'
+        + escapeHtml(jobStatusLabel(state.wizardOriginJobStatus)) + '）的状态与记录不会被改动，'
+        + '本次会新建一个独立作业。</li>';
+}
+
+/* 中转机通道的建机参数只能从目录/常驻池里选，空着提交会被后端以
+   "中转机通道缺少必填项" 400 拒绝（参数回放后没重新载入目录时最容易踩到）。 */
+function relayChannelIssues() {
+    const channel = $('#data-channel');
+    if (!channel || channel.value !== 'relay') return [];
+    const persistent = ($('[name="relay_node_mode"]') || {}).value === 'persistent';
+    const required = persistent
+        ? [['relay_source_az', '源端中转机可用区'], ['relay_target_az', '目标端中转机可用区']]
+        : [
+            ['relay_platform_url', '中转机回连平台地址'],
+            ['relay_source_image', '源端中转机镜像'],
+            ['relay_source_flavor', '源端中转机 flavor'],
+            ['relay_source_az', '源端中转机可用区'],
+            ['relay_source_system_volume_type', '源端中转机系统盘类型'],
+            ['relay_target_image', '目标端中转机镜像'],
+            ['relay_target_flavor', '目标端中转机 flavor'],
+            ['relay_target_az', '目标端中转机可用区'],
+            ['relay_target_system_volume_type', '目标端中转机系统盘类型']
+        ];
+    return required
+        .filter(([name]) => {
+            const el = $('[name="' + name + '"]');
+            return !((el && el.value || '').trim());
+        })
+        .map(([, label]) => label);
+}
+
 async function startMigration() {
     const { vmOverrides, volumeOverrides } = collectPreviewValues();
     const excel = $('#excel_file').files[0];
@@ -2807,6 +2884,23 @@ async function startMigration() {
     if (issues.length) {
         const preview = issues.slice(0, 3).map(issue => issue.vm + '：' + issue.message).join('；');
         toast('仍有 ' + issues.length + ' 项未配置：' + preview + (issues.length > 3 ? '…' : ''), 'error');
+        return;
+    }
+    // 提交参数快照不落盘口令，从作业回放后这些字段是空的；不拦的话会建出一个
+    // 立刻以 "password is a required attribute" 失败的新作业。
+    if (!($('#profile-select') && $('#profile-select').value)) {
+        const missing = [];
+        if (!(($('[name="source_password"]') || {}).value || '').trim()) missing.push('源环境密码');
+        if (!(($('[name="target_password"]') || {}).value || '').trim()) missing.push('目标环境密码');
+        if (missing.length) {
+            toast('请先补填 ' + missing.join('、') + '：口令不进提交快照，重新提交时不会自动带回来（也可以选择环境档案自动填充）', 'error');
+            return;
+        }
+    }
+    const relayMissing = relayChannelIssues();
+    if (relayMissing.length) {
+        toast('中转机通道缺少：' + relayMissing.join('、')
+            + '。请在第 1 步点「载入两侧目录 / 检查常驻池」后再提交（参数回放后需重新载入目录才能选到值）', 'error');
         return;
     }
     const selectedRows = state.previewRows.map(row => ({
@@ -2924,6 +3018,7 @@ async function startMigration() {
             '<li>迁移模式：全量 ×' + (state.previewRows.length - incrCount) + ' · 增量 ×' + incrCount +
             ' · 切换方式：' + (manual ? '手动确认' : '自动') + '</li>' +
             '<li>' + (manual ? '手动切换：基线完成后需在作业详情逐台点「开始切换」' : '自动切换：增量收敛后自动停源切换') + '</li>' +
+            originJobNotice() +
             '<li>失败不自动删除目标资源，保留现场供排查</li></ul>',
         okText: '开始迁移',
         onOk: () => { closeModal(); doSubmit(); }
@@ -3587,16 +3682,21 @@ function stopPolling() {
 
 function startPolling() {
     stopPolling();
+    // 每次轮询锁定发起时的作业 id：切换到别的作业后，上一轮"在途"的响应
+    // 不能再把旧作业的 id/状态画回页面，更不能替新作业停掉轮询。
+    const jobId = state.jobId;
     const poll = async () => {
-        if (!state.jobId) return;
+        if (!state.jobId || state.jobId !== jobId) return;
         try {
-            const res = await fetch('/api/jobs/' + state.jobId);
+            const res = await fetch('/api/jobs/' + jobId);
             const json = await res.json();
             if (!json.ok) throw new Error(json.error || '查询失败');
+            if (state.jobId !== jobId) return;
             renderJob(json.job);
             await refreshRelayPool();
-            if (json.job.status !== 'running') stopPolling();
+            if (state.jobId === jobId && json.job.status !== 'running') stopPolling();
         } catch (err) {
+            if (state.jobId !== jobId) return;
             toast('状态查询失败：' + err.message, 'error');
             stopPolling();
         }
@@ -3994,6 +4094,7 @@ function fillRelaySubnets(prefix, networkId) {
             select.appendChild(new Option(subnet.name + ' (' + subnet.cidr + ')', subnet.id))
         );
     if (current) select.value = current;
+    reapplyPendingSelectValues();
     syncSelectTitle(select);
 }
 
@@ -4098,6 +4199,8 @@ function initRelayPanel() {
             fillRelaySelect(zones[side], 'image', data.images);
             fillRelaySelect(zones[side], 'flavor', data.flavors);
             fillRelaySelect(zones[side], 'network', data.networks);
+            // 先把回放的网络补上，下面的子网列表才能按它过滤。
+            reapplyPendingSelectValues(zones[side]);
             fillRelaySelect(zones[side], 'system_volume_type', data.volume_types || []);
             fillRelaySelect(zones[side], 'data_floating_network', [
                 { id: '', name: '（不使用浮动 IP）' },
@@ -4117,6 +4220,8 @@ function initRelayPanel() {
             } else if (poolAzs.length) {
                 azSelect.value = poolAzs[0];
             }
+            // 回放的 AZ 优先于"池默认 AZ"：挂起值到位后才算真正恢复。
+            reapplyPendingSelectValues(zones[side]);
             refreshRelayPoolPanel(side);
         });
         const poolCount = (existingPools.source || []).length + (existingPools.target || []).length;
