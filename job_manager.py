@@ -321,6 +321,63 @@ class JobManager:
         logging.info("[MIGRATION] 任务 %s 的 VM %s 收到切换指令", job_id, vm_name)
         return True
 
+    def request_disk_retry(
+        self, job_id: str, vm_name: str, volume_ids: list[str] | None = None
+    ) -> bool:
+        """请求重试该 VM 的失败盘；只在等待重试期间有效。
+
+        ``volume_ids`` 为空表示"重试全部失败盘"。返回 False 说明该 VM 当前不在
+        等待重试（可能已经开始重试、已失败或已结束），调用方据此提示用户。
+        """
+        wanted = [str(item) for item in (volume_ids or []) if str(item)]
+        found = False
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status != JobStatus.RUNNING:
+                return False
+            vm = next((item for item in job.vms if item.name == vm_name), None)
+            if vm is not None and vm.status == VmStatus.AWAITING_DISK_RETRY:
+                vm.disk_retry_requested = True
+                vm.disk_retry_volume_ids = wanted
+                found = True
+        if not found:
+            return False
+        # _save() 自己取锁，必须在锁外调用，否则死锁。
+        self._save()
+        logging.info(
+            "[MIGRATION] 任务 %s 的 VM %s 收到失败盘重试指令（%s）",
+            job_id,
+            vm_name,
+            "、".join(wanted) or "全部失败盘",
+        )
+        return True
+
+    def is_disk_retry_requested(self, job_id: str, vm_name: str) -> bool:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return False
+            return any(
+                vm.name == vm_name and vm.disk_retry_requested for vm in job.vms
+            )
+
+    def take_disk_retry_request(
+        self, job_id: str, vm_name: str
+    ) -> list[str] | None:
+        """取出并清空重试请求；None 表示没有请求，空列表表示重试全部失败盘。"""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            vm = next((item for item in job.vms if item.name == vm_name), None)
+            if vm is None or not vm.disk_retry_requested:
+                return None
+            vm.disk_retry_requested = False
+            targets = list(vm.disk_retry_volume_ids)
+            vm.disk_retry_volume_ids = []
+        self._save()
+        return targets
+
     def is_cutover_requested(self, job_id: str, vm_name: str) -> bool:
         with self._lock:
             job = self._jobs.get(job_id)

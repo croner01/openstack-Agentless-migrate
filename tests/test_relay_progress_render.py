@@ -23,8 +23,19 @@ class VmDiskSummaryRenderTest(unittest.TestCase):
 
         # 一套汇总渲染，三处入口：中转机页签、卷拷贝页签、VM 列表的「云盘」列。
         self.assertEqual(html.count("function renderVmDiskSummary"), 1)
-        self.assertIn("renderVmDiskSummary($('#relay-vm-disks'), items)", html)
+        self.assertIn("renderVmDiskSummary($('#relay-vm-disks'), items, { retry: true })", html)
         self.assertIn("function vmDiskCell", html)
+
+    def test_relay_summary_only_offers_retry_while_waiting(self):
+        """重试按钮只挂在"等待重试"的 VM 上，其它状态给提示，避免和传输抢盘。"""
+        html = self._html()
+
+        self.assertIn("function diskRetryCell(vm, disks)", html)
+        self.assertIn("if (vm.status !== 'awaiting_disk_retry') {", html)
+        self.assertIn("等待其余盘完成", html)
+        self.assertIn("function retryVmDisk(vmName, volumeIds)", html)
+        self.assertIn("/disks/retry", html)
+        self.assertIn("function relayDiskFailed(disk)", html)
 
     def test_disk_source_prefers_relay_results_then_volumes(self):
         html = self._html()

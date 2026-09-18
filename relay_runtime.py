@@ -158,6 +158,8 @@ _FORM_SCALAR_FIELDS = (
     "relay_copy_retries",
     "relay_stall_timeout",
     "relay_slot_wait_seconds",
+    "relay_transfer_concurrency",
+    "relay_disk_retry_wait_seconds",
     "relay_hole_mode",
     "relay_full_verify",
     "relay_node_mode",

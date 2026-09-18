@@ -21,6 +21,8 @@ class VmStatus(str, Enum):
     PRECOPYING = "precopying"
     AWAITING_CUTOVER = "awaiting_cutover"
     COPYING_VOLUMES = "copying_volumes"
+    #: 中转机通道专用：其余盘都传完了，只剩失败盘在等人工点「重试」。
+    AWAITING_DISK_RETRY = "awaiting_disk_retry"
     STARTING_TARGET = "starting_target"
     VERIFYING = "verifying"
     SUCCESS = "success"
@@ -160,6 +162,9 @@ class VmTask:
     target_ips: list = field(default_factory=list)
     cutover_requested: bool = False
     sync_requested: bool = False
+    #: 中转机通道：用户在页面点了「重试失败盘」。volume_ids 为空表示重试全部失败盘。
+    disk_retry_requested: bool = False
+    disk_retry_volume_ids: list[str] = field(default_factory=list)
     delta_rounds_done: int = 0
     delta_rounds_max: int = 0
     delta_last_bytes: int | None = None
@@ -240,6 +245,8 @@ class VmTask:
             "target_ips": self.target_ips,
             "cutover_requested": self.cutover_requested,
             "sync_requested": self.sync_requested,
+            "disk_retry_requested": self.disk_retry_requested,
+            "disk_retry_volume_ids": self.disk_retry_volume_ids,
             "delta_rounds_done": self.delta_rounds_done,
             "delta_rounds_max": self.delta_rounds_max,
             "delta_last_bytes": self.delta_last_bytes,
@@ -277,6 +284,10 @@ class VmTask:
             target_ips=data.get("target_ips") or [],
             cutover_requested=bool(data.get("cutover_requested")),
             sync_requested=bool(data.get("sync_requested")),
+            disk_retry_requested=bool(data.get("disk_retry_requested")),
+            disk_retry_volume_ids=[
+                str(item) for item in data.get("disk_retry_volume_ids") or []
+            ],
             delta_rounds_done=int(data.get("delta_rounds_done") or 0),
             delta_rounds_max=int(data.get("delta_rounds_max") or 0),
             delta_last_bytes=(

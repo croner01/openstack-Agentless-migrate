@@ -1,5 +1,6 @@
 import concurrent.futures
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -40,6 +41,7 @@ class MigrationManager:
         cancelled=None,
         cutover_requested=None,
         sync_requested=None,
+        disk_retry_take=None,
     ):
         self.source_os = source_os
         self.target_os = target_os
@@ -49,6 +51,10 @@ class MigrationManager:
         self._cancelled = cancelled or (lambda: False)
         self._cutover_requested = cutover_requested or (lambda: False)
         self._sync_requested = sync_requested or (lambda: False)
+        #: 中转机失败盘重试：返回用户点选的 volume_id 列表（None = 还没点）。
+        self._disk_retry_take = disk_retry_take or (lambda: None)
+        #: 失败盘等待人工重试的墙钟上限（秒），0 = 不限时（与等待切换一致）。
+        self._disk_retry_wait = 0.0
         self.copy_gate = copy_gate or COPY_GATE
         self._sessions: dict[str, Any] = {}
         #: 每个源卷重做基线全备的次数，用于给「暂存卷反复丢失」兜底
@@ -341,40 +347,67 @@ class MigrationManager:
             for position, (_, entry) in enumerate(indexed_entries)
         ]
         # relay_disks 与 indexed_entries 同序，PreparedVolume.index 就是这里的下标。
-        target_volume_ids: list[str] = []
+        self._disk_retry_wait = float(
+            options.get("relay_disk_retry_wait_seconds") or 0
+        )
+        entry_by_index = {index: entry for index, entry in indexed_entries}
+        transfer_workers = self._relay_transfer_workers(options)
+        prepare_workers = int(options.get("volume_concurrency") or 1)
+        active: list[Any] = []
+        failed: list[dict[str, Any]] = []
         try:
-            prepared = self._prepare_relay_volumes(
-                mover,
-                vm,
-                indexed_entries,
-                volume_types,
-                workers=int(options.get("volume_concurrency") or 1),
+            prepared, failed = self._prepare_relay_volumes(
+                mover, vm, indexed_entries, volume_types, workers=prepare_workers,
             )
-            for item in prepared:
-                disk = self._relay_disk(vm, item.index)
-                if disk is not None:
-                    disk["target_volume_id"] = str(item.target_volume_id)
+            self._sync_relay_disk_targets(vm, prepared)
+            active = list(prepared)
 
-            for index, item in enumerate(prepared):
-                disk = self._relay_disk(vm, item.index)
-                if disk is not None and disk.get("status") != "success":
-                    # 盘是串行传的：只有轮到它时才置"拷贝中"，排队的仍是"待拷贝"。
-                    disk["status"] = "copying"
-                result = mover.transfer(item)
-                target_volume_id = str(result["target_volume_id"])
-                disk = self._relay_disk(vm, item.index)
-                if disk is not None:
-                    disk["target_volume_id"] = target_volume_id
-                    disk["status"] = "success"
-                    disk["error"] = ""
-                if index == 0:
-                    # 空白启动盘默认不可启动，先置位再建机，否则 Nova 返回
-                    # "Block Device ... is not bootable"。
-                    mover.lifecycle.mark_bootable(volume_id=target_volume_id)
-                target_volume_ids.append(target_volume_id)
+            # 逐盘失败不再直接判死整台 VM：健康的盘先传完，失败盘进入等待重试。
+            while True:
+                failed = failed + self._relay_transfer_volumes(
+                    mover, vm, active, workers=transfer_workers
+                )
+                active = []
+                if not failed:
+                    break
+                for item in failed:
+                    self._mark_relay_disk_failed(vm, item["index"], item["error"])
+                self._persist()
+                chosen = self._await_relay_disk_retry(vm, failed)
+                retry_entries = [
+                    (item["index"], entry_by_index[item["index"]])
+                    for item in chosen
+                    if item["index"] in entry_by_index
+                ]
+                # 目标卷还留着就续传（offset = 已拷字节），丢了就重建一块。
+                reuse = {
+                    item["index"]: str(item.get("target_volume_id") or "")
+                    for item in chosen
+                }
+                prepared, failed = self._prepare_relay_volumes(
+                    mover,
+                    vm,
+                    retry_entries,
+                    volume_types,
+                    workers=prepare_workers,
+                    reuse_targets=reuse,
+                )
+                self._sync_relay_disk_targets(vm, prepared)
+                active = list(prepared)
         except Exception as exc:  # noqa: BLE001 - 失败原因要落在盘上再往上抛
+            # 准备/传输到一半的派生卷没人接手，必须先回收再抛。
+            self._discard_relay_prepared(mover, active)
             self._mark_relay_disks_failed(vm, str(exc))
             raise
+
+        target_volume_ids = [
+            str(disk.get("target_volume_id") or "") for disk in vm.relay_disks or []
+        ]
+        if not target_volume_ids or any(
+            disk.get("status") != "success" for disk in vm.relay_disks or []
+        ):
+            self._mark_relay_disks_failed(vm, "仍有云盘未完成，已跳过目标 VM 创建")
+            raise RuntimeError("仍有云盘未完成，已跳过目标 VM 创建")
 
         self._set_phase(vm, VmStatus.CREATING_TARGET_BFV, "relay_creating_target_vm")
         server = self.target_os.create_server_from_volumes(
@@ -428,17 +461,22 @@ class MigrationManager:
         volume_types: dict[str, Any],
         *,
         workers: int,
-    ) -> list[Any]:
+        reuse_targets: dict[int, str] | None = None,
+    ) -> tuple[list[Any], list[dict[str, Any]]]:
         """并发把每块盘的「打快照 → 派生拷贝源 → 建目标空白卷」做完。
 
         这一段只等存储侧拷贝，没有任何数据面流量：串行做的话，多盘 VM 的
         等待时间会随盘数线性叠加（每块大容量盘在商业存储上都要几小时）。
-        并发度沿用「单台卷拷贝并发」，默认 1（与原来的串行行为一致）。
+        并发度沿用「单台卷拷贝并发」，默认 1。
 
-        失败时不再继续传输，已建出来的派生卷/快照一律回收，避免占配额；
-        正在跑的其余准备任务会先跑完再抛错，防止后台线程留下孤儿资源。
+        单块盘失败只登记到该盘的失败条目上（交给人工重试），不再回收其余
+        已经准备好的盘，也不再把整台 VM 判死。
+        返回 ``(准备好的卷, 失败条目)``。
         """
         limit = max(1, min(int(workers or 1), len(indexed_entries)))
+        reuse = reuse_targets or {}
+        results: list[Any] = [None] * len(indexed_entries)
+        failures: list[dict[str, Any]] = []
 
         def prepare_one(index: int, entry: dict[str, Any]):
             override = volume_types.get(entry["volume_id"]) or {}
@@ -453,20 +491,36 @@ class MigrationManager:
                 index=index,
                 source_volume_type=str(override.get("source") or "").strip() or None,
                 target_volume_type=str(override.get("target") or "").strip() or None,
+                reuse_target_volume_id=str(reuse.get(index) or ""),
             )
 
-        if limit <= 1:
-            prepared: list[Any] = []
+        def collect(position: int, index: int, entry: dict[str, Any]) -> None:
             try:
-                for index, entry in indexed_entries:
-                    prepared.append(prepare_one(index, entry))
-            except Exception:
-                # 串行同样会"先全部准备、再逐块传输"，中途失败时前面已建好的
-                # 派生卷/目标卷还没人用上，必须回收。
-                for item in prepared:
-                    mover.discard(item)
-                raise
-            return prepared
+                item = prepare_one(index, entry)
+                # 搬运器返回的条目必须带盘序（relay_disks 的下标），否则
+                # 进度/结果会落到错误的盘上；不支持 index 的实现按调用顺序兜底。
+                try:
+                    int(getattr(item, "index"))
+                except (TypeError, ValueError):
+                    item.index = index
+                results[position] = item
+            except Exception as exc:  # noqa: BLE001 - 单盘失败不拖垮其余盘
+                logging.exception(
+                    "[MIGRATION] VM %s 盘 %s 准备失败", vm.name, entry.get("volume_id")
+                )
+                failures.append(
+                    {
+                        "index": index,
+                        "volume_id": str(entry.get("volume_id") or ""),
+                        "error": str(exc)[:500],
+                        "target_volume_id": str(reuse.get(index) or ""),
+                    }
+                )
+
+        if limit <= 1:
+            for position, (index, entry) in enumerate(indexed_entries):
+                collect(position, index, entry)
+            return [item for item in results if item is not None], failures
 
         logging.info(
             "[MIGRATION] VM %s 并发准备 %s 块盘（快照/派生并发 %s）",
@@ -474,35 +528,194 @@ class MigrationManager:
             len(indexed_entries),
             limit,
         )
-        results: list[Any] = [None] * len(indexed_entries)
-        failure: Exception | None = None
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=limit, thread_name_prefix="relay-prep"
         ) as pool:
             futures = {
-                pool.submit(prepare_one, index, entry): position
+                pool.submit(collect, position, index, entry): position
                 for position, (index, entry) in enumerate(indexed_entries)
             }
             for future in concurrent.futures.as_completed(futures):
-                position = futures[future]
-                try:
-                    results[position] = future.result()
-                except Exception as exc:  # noqa: BLE001 - 汇总成一次 VM 级失败
-                    if failure is None:
-                        failure = exc
-                        for pending in futures:
-                            pending.cancel()
-                    else:
-                        logging.warning(
-                            "[MIGRATION] VM %s 并发准备另有失败: %s", vm.name, exc
-                        )
-        if failure is not None:
-            # 已经建出来的派生卷/目标卷不能留：连同失败的那块一起回收。
-            for item in results:
-                if item is not None:
-                    mover.discard(item)
-            raise failure
-        return results
+                future.result()
+        return [item for item in results if item is not None], failures
+
+    def _relay_transfer_volumes(
+        self,
+        mover: Any,
+        vm: VmTask,
+        items: list[Any],
+        *,
+        workers: int,
+    ) -> list[dict[str, Any]]:
+        """按卷并发 attach + 拷贝；单盘失败只登记，不影响其余盘。
+
+        每路传输占源端/目标端各一个中转机槽位，并发度实际受池容量限制：
+        槽位不够时 ``_acquire_with_wait`` 会在槽位等待上限内排队。
+        """
+        if not items:
+            return []
+        limit = max(1, min(int(workers or 1), len(items)))
+        failures: list[dict[str, Any]] = []
+        guard = threading.Lock()
+
+        def run(position: int, item: Any) -> None:
+            index = self._relay_item_index(item, position)
+            disk = self._relay_disk(vm, index)
+            if disk is not None:
+                disk["status"] = "copying"
+                disk["error"] = ""
+                self._persist()
+            try:
+                result = mover.transfer(item)
+                target_volume_id = str(
+                    result.get("target_volume_id") or item.target_volume_id
+                )
+                if index == 0:
+                    # 空白启动盘默认不可启动，先置位再建机，否则 Nova 返回
+                    # "Block Device ... is not bootable"。
+                    mover.lifecycle.mark_bootable(volume_id=target_volume_id)
+            except Exception as exc:  # noqa: BLE001 - 单盘失败留给人工重试
+                logging.exception(
+                    "[MIGRATION] VM %s 盘 %s 传输失败", vm.name, getattr(item, "index", "?")
+                )
+                with guard:
+                    failures.append(
+                        {
+                            "index": index,
+                            "volume_id": str(
+                                getattr(getattr(item, "volume", None), "source_volume_id", "")
+                                or ""
+                            ),
+                            "error": str(exc)[:500],
+                            "target_volume_id": str(
+                                getattr(item, "target_volume_id", "") or ""
+                            ),
+                        }
+                    )
+                if disk is not None:
+                    disk["status"] = "failed"
+                    disk["error"] = str(exc)[:500]
+                    self._persist()
+                return
+            if disk is not None:
+                disk["target_volume_id"] = target_volume_id
+                disk["status"] = "success"
+                disk["error"] = ""
+                self._persist()
+
+        if limit <= 1:
+            for position, item in enumerate(items):
+                run(position, item)
+            return failures
+        logging.info(
+            "[MIGRATION] VM %s 并发传输 %s 块盘（传输并发 %s）",
+            vm.name,
+            len(items),
+            limit,
+        )
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=limit, thread_name_prefix="relay-xfer"
+        ) as pool:
+            futures = [
+                pool.submit(run, position, item)
+                for position, item in enumerate(items)
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+        return failures
+
+    def _await_relay_disk_retry(
+        self, vm: VmTask, failed: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """失败盘进入等待人工重试；返回用户点选要重试的失败盘条目。
+
+        与「等待切换」同一套语义：状态停在 running，页面给按钮，取消作业能
+        立刻中断等待。``relay_disk_retry_wait_seconds`` 给了上限就按时失败，
+        0（默认）表示等到人工处理为止。
+        """
+        self._set_phase(vm, VmStatus.AWAITING_DISK_RETRY, "awaiting_disk_retry")
+        logging.warning(
+            "[MIGRATION] VM %s 有 %s 块盘失败，等待人工重试：%s",
+            vm.name,
+            len(failed),
+            "、".join(str(item.get("volume_id") or "?") for item in failed),
+        )
+        deadline = (
+            time.time() + self._disk_retry_wait if self._disk_retry_wait > 0 else None
+        )
+        while True:
+            self._check_stop()
+            targets = self._disk_retry_take()
+            if targets is not None:
+                wanted = {str(item) for item in targets if str(item)}
+                chosen = [
+                    item
+                    for item in failed
+                    if not wanted or str(item.get("volume_id")) in wanted
+                ]
+                if not chosen:
+                    chosen = list(failed)
+                logging.info(
+                    "[MIGRATION] VM %s 收到失败盘重试指令，重试 %s 块盘",
+                    vm.name,
+                    len(chosen),
+                )
+                return chosen
+            if deadline is not None and time.time() >= deadline:
+                raise RuntimeError(
+                    f"失败盘等待人工重试超过 {int(self._disk_retry_wait)}s，已按失败结束；"
+                    "重新提交本任务时把「失败盘等待重试」调大或留 0（0=不限时）即可"
+                )
+            self._sleep_with_stop(2.0)
+
+    @staticmethod
+    def _relay_transfer_workers(options: dict[str, Any]) -> int:
+        """传输并发度：``relay_transfer_concurrency`` 缺省时沿用卷拷贝并发。"""
+        raw = options.get("relay_transfer_concurrency")
+        if raw is None or str(raw).strip() == "":
+            raw = options.get("volume_concurrency") or 1
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 1
+        return max(1, min(value, 8))
+
+    @staticmethod
+    def _relay_item_index(item: Any, fallback: int) -> int:
+        """取盘序：搬运器没给出可用 index 时按批次内的顺序兜底。"""
+        try:
+            return int(getattr(item, "index"))
+        except (TypeError, ValueError):
+            return int(fallback)
+
+    @staticmethod
+    def _sync_relay_disk_targets(vm: VmTask, prepared: list[Any]) -> None:
+        """把准备阶段拿到的目标卷 id 落到盘上；重试的盘回到"待拷贝"。"""
+        for item in prepared or []:
+            disk = MigrationManager._relay_disk(vm, getattr(item, "index", None))
+            if disk is None:
+                continue
+            disk["target_volume_id"] = str(getattr(item, "target_volume_id", "") or "")
+            if disk.get("status") == "failed":
+                disk["status"] = "pending"
+                disk["error"] = ""
+
+    @staticmethod
+    def _mark_relay_disk_failed(vm: VmTask, index: Any, error: str) -> None:
+        disk = MigrationManager._relay_disk(vm, index)
+        if disk is None or disk.get("status") == "success":
+            return
+        disk["status"] = "failed"
+        disk["error"] = (error or "迁移失败")[:500]
+
+    @staticmethod
+    def _discard_relay_prepared(mover: Any, items: list[Any]) -> None:
+        """回收准备好了但没人接手传输的派生卷/快照。"""
+        for item in items or []:
+            try:
+                mover.discard(item)
+            except Exception:  # noqa: BLE001 - 回收失败不覆盖原始错误
+                logging.exception("[MIGRATION] 回收未传输的派生卷失败")
 
     def _resolve_source_server(self, vm: VmTask):
         if vm.source_server_id:

@@ -279,7 +279,7 @@ class RelayPathBranchTest(unittest.TestCase):
         self.assertEqual([d["error"] for d in disks], ["", ""])
 
     def test_relay_path_marks_failed_and_pending_disks(self):
-        """失败那块带错误，后面还没轮到的也要落成失败，不能一直显示"待拷贝"。"""
+        """失败那块带错误，成功那块保持成功；没人点重试时按等待超时收尾。"""
         self.mover.transfer.side_effect = [
             {"target_volume_id": "vol-t0", "size": 40, "source_volume_id": "vol-s1"},
             RuntimeError("目标存储写超时"),
@@ -292,6 +292,7 @@ class RelayPathBranchTest(unittest.TestCase):
                     "job_id": "job-1",
                     "data_channel": "relay",
                     "relay_mover_factory": self.mover_factory,
+                    "relay_disk_retry_wait_seconds": 0.05,
                 },
             )
 
@@ -301,7 +302,7 @@ class RelayPathBranchTest(unittest.TestCase):
         self.assertEqual(self.vm.relay_disks[0]["error"], "")
 
     def test_relay_path_marks_every_disk_failed_when_prepare_fails(self):
-        """准备阶段就挂了（快照/派生失败）时，所有盘都要有结论。"""
+        """准备阶段全挂（快照/派生失败）时，所有盘都要有结论。"""
         self.mover.prepare.side_effect = RuntimeError("快照创建超时")
 
         with self.assertRaises(RuntimeError):
@@ -311,6 +312,7 @@ class RelayPathBranchTest(unittest.TestCase):
                     "job_id": "job-1",
                     "data_channel": "relay",
                     "relay_mover_factory": self.mover_factory,
+                    "relay_disk_retry_wait_seconds": 0.05,
                 },
             )
 
@@ -422,10 +424,10 @@ class RelayPathBranchTest(unittest.TestCase):
 
         self.assertEqual(peak[0], 1)
 
-    def test_relay_path_discards_prepared_volumes_when_one_fails(self):
-        """一块盘准备失败就不能继续传输，已准备好的派生卷要回收。"""
+    def test_relay_path_keeps_healthy_disks_when_one_fails(self):
+        """一块盘准备失败不再拖垮整台 VM：健康的盘照常传完，失败盘等人工重试。"""
         self.mover.prepare.side_effect = [
-            mock.Mock(target_volume_id="vol-t0"),
+            mock.Mock(index=0, target_volume_id="vol-t0"),
             RuntimeError("快照超时"),
         ]
 
@@ -437,11 +439,58 @@ class RelayPathBranchTest(unittest.TestCase):
                     "data_channel": "relay",
                     "relay_mover_factory": self.mover_factory,
                     "volume_concurrency": 1,
+                    # 不注入人工重试：给一个很短的上限，等待超时后按失败结束。
+                    "relay_disk_retry_wait_seconds": 0.05,
                 },
             )
 
-        self.mover.transfer.assert_not_called()
-        self.mover.discard.assert_called_once()
+        # 健康的盘先传完了；失败盘一直没等到重试指令。
+        self.assertEqual(self.mover.transfer.call_count, 1)
+        statuses = [disk["status"] for disk in self.vm.relay_disks]
+        self.assertEqual(statuses, ["success", "failed"])
+        # 目标机不能带着缺盘建起来。
+        self.manager.target_os.create_server_from_volumes.assert_not_called()
+
+    def test_relay_path_retries_failed_disk_and_finishes(self):
+        """人工点重试后：失败盘沿用已有目标卷重建派生卷并续传，最后正常建机。"""
+        self.mover.prepare.side_effect = [
+            mock.Mock(index=0, target_volume_id="vol-t0"),
+            mock.Mock(index=1, target_volume_id="vol-t1"),
+            # 重试只会准备失败的那块盘，并沿用已建好的目标卷。
+            mock.Mock(index=1, target_volume_id="vol-t1"),
+        ]
+        self.mover.transfer.side_effect = [
+            {"target_volume_id": "vol-t0", "size": 40, "source_volume_id": "vol-s1"},
+            # 数据盘挂载时目标卷被删（正是 205 上遇到过的 404）。
+            RuntimeError("404 Volume vol-t1 could not be found"),
+            {"target_volume_id": "vol-t1", "size": 20, "source_volume_id": "vol-s2"},
+        ]
+        # 空列表 = 用户点了"重试全部失败盘"。
+        self.manager._disk_retry_take = lambda: []
+
+        self.manager._migrate_vm_inner(
+            self.vm,
+            {
+                "job_id": "job-1",
+                "data_channel": "relay",
+                "relay_mover_factory": self.mover_factory,
+                "volume_concurrency": 1,
+            },
+        )
+
+        self.assertEqual(self.mover.prepare.call_count, 3)
+        retry_call = self.mover.prepare.call_args_list[2].kwargs
+        self.assertEqual(retry_call["index"], 1)
+        self.assertEqual(retry_call["reuse_target_volume_id"], "vol-t1")
+        self.assertEqual(self.mover.transfer.call_count, 3)
+        # 第一次传输失败时盘要落"失败"，重试成功后回到"成功"。
+        self.assertEqual(
+            [disk["status"] for disk in self.vm.relay_disks], ["success", "success"]
+        )
+        self.assertEqual(self.vm.relay_disks[1]["error"], "")
+        kwargs = self.manager.target_os.create_server_from_volumes.call_args.kwargs
+        self.assertEqual(kwargs["boot_volume_id"], "vol-t0")
+        self.assertEqual(kwargs["data_volume_ids"], ["vol-t1"])
 
     def test_relay_path_waits_instead_of_starting_immediately(self):
         """create 返回后实例可能还不可见，立刻 os-start 会拿到 404 并把建机判失败。"""
@@ -611,3 +660,137 @@ class RelayPathBranchTest(unittest.TestCase):
         )
 
         self.manager.target_os.create_port_with_fixed_ip.assert_called_once()
+
+
+class RelayTransferConcurrencyTest(unittest.TestCase):
+    """传输段（挂载+拷贝）也要按卷并发，且单盘失败不拖垮其余盘。"""
+
+    def setUp(self):
+        from migration_manager import MigrationManager
+        from state_machine import MigrationMode, VmTask
+
+        self.manager = MigrationManager(
+            source_os=mock.MagicMock(),
+            target_os=mock.MagicMock(),
+            ceph_utils=mock.MagicMock(),
+        )
+        self.vm = VmTask(name="vm-1", target_az="az2", mode=MigrationMode.FULL)
+        self.manager._resolve_source_server = mock.Mock(
+            side_effect=lambda target_vm: mock.Mock(id="srv-src")
+        )
+        self.manager.source_os.get_server_flavor_spec.return_value = {"name": "m1.small"}
+        self.manager._resolve_flavor_id = mock.Mock(return_value="flv-1")
+        self.manager._create_target_ports = mock.Mock(return_value=["port-1"])
+        self.manager.source_os.get_server_volumes_with_device.return_value = [
+            {
+                "volume_id": f"vol-s{i}",
+                "size": 10,
+                "device": f"/dev/vd{chr(97 + i)}",
+                "is_bootable": i == 0,
+                "bootable": i == 0,
+            }
+            for i in range(4)
+        ]
+        self.manager._stop_and_wait = mock.Mock()
+        self.mover = mock.MagicMock()
+        self.mover.prepare.side_effect = lambda **kwargs: mock.Mock(
+            index=kwargs["index"], target_volume_id=f"vol-t{kwargs['index']}"
+        )
+        self.mover_factory = mock.Mock(return_value=self.mover)
+
+    def _run(self, **extra):
+        options = {
+            "job_id": "job-1",
+            "data_channel": "relay",
+            "relay_mover_factory": self.mover_factory,
+        }
+        options.update(extra)
+        self.manager._migrate_vm_inner(self.vm, options)
+
+    def test_transfer_runs_concurrently_when_configured(self):
+        lock = threading.Lock()
+        inflight: list[int] = []
+        peak = [0]
+
+        def fake_transfer(item):
+            index = int(item.index)
+            with lock:
+                inflight.append(index)
+                peak[0] = max(peak[0], len(inflight))
+            time.sleep(0.05)
+            with lock:
+                inflight.remove(index)
+            return {"target_volume_id": item.target_volume_id, "size": 10}
+
+        self.mover.transfer.side_effect = fake_transfer
+
+        self._run(relay_transfer_concurrency=3)
+
+        self.assertEqual(peak[0], 3)
+        self.assertEqual(self.mover.transfer.call_count, 4)
+
+    def test_transfer_stays_serial_by_default(self):
+        lock = threading.Lock()
+        inflight: list[int] = []
+        peak = [0]
+
+        def fake_transfer(item):
+            index = int(item.index)
+            with lock:
+                inflight.append(index)
+                peak[0] = max(peak[0], len(inflight))
+            time.sleep(0.05)
+            with lock:
+                inflight.remove(index)
+            return {"target_volume_id": item.target_volume_id, "size": 10}
+
+        self.mover.transfer.side_effect = fake_transfer
+
+        self._run()
+
+        self.assertEqual(peak[0], 1)
+
+    def test_one_disk_failure_lets_others_finish(self):
+        """一块盘挂载失败时，其余盘照常传完；重试一次后整机继续建目标机。"""
+        fail_index = 2
+        attempts: dict[int, int] = {}
+
+        def fake_transfer(item):
+            index = int(item.index)
+            attempts[index] = attempts.get(index, 0) + 1
+            if index == fail_index and attempts[index] == 1:
+                raise RuntimeError("404 Volume vol-t2 could not be found")
+            return {"target_volume_id": item.target_volume_id, "size": 10}
+
+        self.mover.transfer.side_effect = fake_transfer
+        # 只点一次「全部重试」：取过一次就没有新请求了。
+        pending = [[]]
+
+        def take():
+            return pending.pop(0) if pending else None
+
+        self.manager._disk_retry_take = take
+
+        self._run(relay_transfer_concurrency=2)
+
+        statuses = [disk["status"] for disk in self.vm.relay_disks]
+        self.assertEqual(statuses, ["success", "success", "success", "success"])
+        # 重试时沿用已有的目标卷，而不是再建一块。
+        reuse = self.mover.prepare.call_args_list[-1].kwargs
+        self.assertEqual(reuse["index"], fail_index)
+        self.assertEqual(reuse["reuse_target_volume_id"], "vol-t2")
+
+    def test_transfer_workers_falls_back_to_volume_concurrency(self):
+        self.assertEqual(
+            self.manager._relay_transfer_workers({"volume_concurrency": 4}), 4
+        )
+        self.assertEqual(
+            self.manager._relay_transfer_workers(
+                {"volume_concurrency": 4, "relay_transfer_concurrency": 2}
+            ),
+            2,
+        )
+        self.assertEqual(self.manager._relay_transfer_workers({}), 1)
+        self.assertEqual(
+            self.manager._relay_transfer_workers({"relay_transfer_concurrency": 99}), 8
+        )

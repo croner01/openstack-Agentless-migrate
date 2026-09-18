@@ -928,6 +928,7 @@ _PHASE_TEXT = {
     "precopying": "增量预拷贝",
     "syncing": "增量同步",
     "awaiting_cutover": "待切换",
+    "awaiting_disk_retry": "等待重试失败盘",
     "relay_stopping_source": "中转机·停源",
     "relay_copying": "中转机·拷贝",
     "relay_creating_target_vm": "中转机·建目标机",
@@ -1139,6 +1140,13 @@ def _diagnose_hints(
             f"当前占用：{holders}；后面的卷要等前面的卷释放名额。"
         )
     for vm in vms:
+        if vm["status"] == "awaiting_disk_retry":
+            failed = int((vm.get("disks") or {}).get("failed") or 0)
+            hints.append(
+                f"VM {vm['name']} 有 {failed} 块盘失败、其余盘已完成，正在等待人工"
+                "在作业详情点「重试失败盘」（源机在等待期间保持关机）。"
+            )
+            continue
         if vm["status"] in _VM_TERMINAL_STATUSES or not vm["phase_seconds"]:
             continue
         if vm["phase_seconds"] >= 600:
@@ -1562,6 +1570,9 @@ def api_migrate():
                         sync_requested=lambda: job_manager.is_sync_requested(
                             job.id, vm.name
                         ),
+                        disk_retry_take=lambda: job_manager.take_disk_retry_request(
+                            job.id, vm.name
+                        ),
                         persist=lambda: job_manager.save_now(),
                     )
                     manager.migrate_vm(vm, options)
@@ -1657,6 +1668,54 @@ def api_vm_cutover(job_id: str, vm_name: str):
                 {
                     "ok": False,
                     "error": "该 VM 不在等待切换状态（可能仍在预拷贝或已结束）",
+                }
+            ),
+            409,
+        )
+    return jsonify({"ok": True})
+
+
+@app.post("/api/jobs/<job_id>/vms/<vm_name>/disks/retry")
+def api_vm_disk_retry(job_id: str, vm_name: str):
+    """中转机通道：重试该 VM 的失败盘（其余盘已经在正常迁移）。
+
+    请求体可选 ``{"volume_ids": [...]}``：只重试指定的失败盘，省略/空表示
+    重试全部失败盘。重试会尽量沿用已建好的目标卷（按已拷字节续传），
+    派生卷/快照则重新生成。
+    """
+    job = job_manager.get(job_id)
+    if job is None:
+        return jsonify({"ok": False, "error": "job 不存在"}), 404
+    vm = next((item for item in job.vms if item.name == vm_name), None)
+    if vm is None:
+        return jsonify({"ok": False, "error": "VM 不存在"}), 404
+    payload = request.get_json(silent=True) or {}
+    raw_ids = payload.get("volume_ids") or []
+    if not isinstance(raw_ids, list):
+        return jsonify({"ok": False, "error": "volume_ids 必须是数组"}), 400
+    failed_ids = {
+        str(disk.get("volume_id") or "")
+        for disk in vm.relay_disks or []
+        if disk.get("status") == "failed"
+    }
+    wanted = [str(item) for item in raw_ids if str(item)]
+    unknown = [item for item in wanted if item not in failed_ids]
+    if unknown:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "这些盘不在失败列表中：" + "、".join(unknown),
+                }
+            ),
+            400,
+        )
+    if not job_manager.request_disk_retry(job_id, vm_name, wanted):
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "该 VM 当前不在等待失败盘重试（可能正在重试或已结束）",
                 }
             ),
             409,

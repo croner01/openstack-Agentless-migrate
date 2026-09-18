@@ -626,9 +626,10 @@ body.wizard-view .toast-box { bottom: 92px; }
                         <div class="card-body">
                             <div class="vm-count-row" id="relay-counters" style="padding:0 0 10px"></div>
                             <div class="section-lbl" style="margin-top:0">每台虚拟机的云盘</div>
+                            <div class="sec-note hidden" id="relay-retry-hint" style="margin-bottom:6px"></div>
                             <table class="vol-table" style="width:100%">
-                                <thead><tr><th>VM</th><th>VM 状态</th><th>云盘</th><th>完成</th><th>失败</th><th title="未落终态的盘：排队中 / 拷贝中 / 增量已就绪待切换">进行中</th><th>合计容量</th></tr></thead>
-                                <tbody id="relay-vm-disks"><tr><td colspan="7" class="empty-box">暂无数据</td></tr></tbody>
+                                <thead><tr><th>VM</th><th>VM 状态</th><th>云盘</th><th>完成</th><th>失败</th><th title="未落终态的盘：排队中 / 拷贝中 / 增量已就绪待切换">进行中</th><th>合计容量</th><th>操作</th></tr></thead>
+                                <tbody id="relay-vm-disks"><tr><td colspan="8" class="empty-box">暂无数据</td></tr></tbody>
                             </table>
                             <div class="section-lbl">卷拷贝进度（中转机通道）</div>
                             <table class="vol-table" style="width:100%">
@@ -845,6 +846,8 @@ body.wizard-view .toast-box { bottom: 92px; }
                                     <div><label class="form-label">停滞判死 (秒)</label><input class="fld mono" type="number" min="30" name="relay_stall_timeout" value="300"></div>
                                     <div><label class="form-label" title="打快照与快照派生卷的等待上限。0 = 不限制等待（默认，每 60s 打点记录进度）；商业存储上这一步常是存储侧全量拷贝，大卷几小时都正常，强行判死会让平台在云上还在建盘时就把任务标失败。填正数时按卷大小自适应放宽。">卷/快照就绪超时 (秒)</label><input class="fld mono" type="number" min="0" name="volume_ready_timeout" value="0" placeholder="0 = 不限制（默认）"></div>
                                     <div><label class="form-label" title="池里没有空闲中转机时的等待上限">等待空闲槽位 (秒)</label><input class="fld mono" type="number" min="0" name="relay_slot_wait_seconds" value="1800"></div>
+                                    <div><label class="form-label" title="同时挂载并拷贝几块盘。每块盘占源端/目标端各一个中转机槽位，实际并发受池容量限制；限速是每块盘各自计的，并发调大等于总带宽翻倍。留空则沿用「单台卷拷贝并发」。">传输并发（挂载+拷贝）</label><input class="fld mono" type="number" min="1" max="8" name="relay_transfer_concurrency" placeholder="沿用卷拷贝并发"></div>
+                                    <div><label class="form-label" title="出现失败盘时，其余盘先传完，然后等人工在作业详情点「重试」。0 = 等到人工处理为止（可按「取消作业」中断）。">失败盘等待重试 (秒)</label><input class="fld mono" type="number" min="0" name="relay_disk_retry_wait_seconds" value="0" placeholder="0 = 不限时"></div>
                                     <div><label class="form-label">空洞模式</label>
                                         <select class="sel" name="relay_hole_mode" style="width:100%">
                                             <option value="skip" selected>skip（空盘最快，依赖空白卷）</option>
@@ -2954,6 +2957,7 @@ async function startMigration() {
             ['relay_admin_password', 'relay_ssh_public_key', 'relay_ready_timeout',
              'relay_heartbeat_interval', 'relay_heartbeat_timeout', 'relay_copy_retries',
              'relay_stall_timeout', 'relay_slot_wait_seconds',
+             'relay_transfer_concurrency', 'relay_disk_retry_wait_seconds',
              'volume_ready_timeout'].forEach(name => {
                 const el = $('[name="' + name + '"]');
                 if (el) data.append(name, el.value);
@@ -3057,6 +3061,7 @@ function vmStatusInfo(status) {
         verifying: ['badge-warn', '验证中'],
         awaiting_flavor: ['badge-warn', '待选 flavor'],
         awaiting_cutover: ['badge-warn', '待切换'],
+        awaiting_disk_retry: ['badge-warn', '待重试'],
         cancelled: ['badge-warn', '已取消']
     };
     return map[status] || ['badge-muted', status];
@@ -3108,6 +3113,7 @@ function phaseLabel(phase) {
         precopying: '增量预拷贝',
         syncing: '增量同步',
         awaiting_cutover: '待切换',
+        awaiting_disk_retry: '等待重试失败盘',
         relay_stopping_source: '中转机·停源',
         relay_copying: '中转机·拷贝',
         relay_creating_target_vm: '中转机·建目标机',
@@ -3227,19 +3233,20 @@ function renderJob(job) {
 
     renderLifecycle(job);
 
-    const counts = { success: 0, failed: 0, running: 0, queued: 0, cutover: 0 };
+    const counts = { success: 0, failed: 0, running: 0, queued: 0, cutover: 0, retry: 0 };
     vms.forEach(vm => {
         if (vm.status === 'success') counts.success++;
         else if (vm.status === 'failed' || vm.status === 'preflight_failed') counts.failed++;
         else if (vm.status === 'awaiting_cutover') counts.cutover++;
+        else if (vm.status === 'awaiting_disk_retry') counts.retry++;
         else if (vm.status === 'queued' || vm.status === 'awaiting_flavor') counts.queued++;
         else counts.running++;
     });
     const countRow = $('#vm-count-row');
     countRow.innerHTML = '';
     [['c-success', '成功 ', counts.success], ['c-fail', '失败 ', counts.failed],
-     ['c-warn', '待切换 ', counts.cutover], ['c-busy', '进行中 ', counts.running],
-     ['', '等待 ', counts.queued]].forEach(([cls, label, num]) => {
+     ['c-warn', '待重试 ', counts.retry], ['c-warn', '待切换 ', counts.cutover],
+     ['c-busy', '进行中 ', counts.running], ['', '等待 ', counts.queued]].forEach(([cls, label, num]) => {
         const pill = text('span', 'count-pill ' + cls);
         pill.appendChild(document.createTextNode(label));
         pill.appendChild(text('b', '', String(num)));
@@ -4420,14 +4427,64 @@ function relayVmDiskSummary(vms, relay) {
             items.push({ vm: byName[name] || { name, status: '' }, disks: byVm[name] });
         });
     }
-    renderVmDiskSummary($('#relay-vm-disks'), items);
+    const retryVms = items.filter(
+        item => item.vm && item.vm.status === 'awaiting_disk_retry');
+    const hint = $('#relay-retry-hint');
+    if (hint) {
+        hint.classList.toggle('hidden', !retryVms.length);
+        hint.innerHTML = retryVms.length
+            ? '有 ' + retryVms.length + ' 台 VM 的其余盘已完成，正在等待人工重试失败盘：'
+                + retryVms.map(item => escapeHtml(item.vm.name)).join('、')
+                + '。点「重试」会重新生成派生卷并按已拷字节续传目标卷；不处理可点「取消作业」。'
+            : '';
+    }
+    renderVmDiskSummary($('#relay-vm-disks'), items, { retry: true });
+}
+
+/* 失败盘重试：只在 VM 处于"等待重试"时可点，避免和正在跑的传输抢同一块盘。 */
+async function retryVmDisk(vmName, volumeIds) {
+    const jobId = state.currentJob && state.currentJob.id;
+    if (!jobId) return;
+    const ids = Array.isArray(volumeIds) ? volumeIds.filter(Boolean) : [];
+    const label = ids.length
+        ? '<b class="mono">' + escapeHtml(ids.join('、')) + '</b>'
+        : '全部失败盘';
+    openConfirm({
+        title: '重试失败盘',
+        html: '<ul class="impact-list" style="list-style:none;margin:0">'
+            + '<li>VM <b class="mono">' + escapeHtml(vmName) + '</b>：重试 ' + label + '</li>'
+            + '<li>已完成的盘不会重传；目标卷按已拷字节续传，派生卷/快照重新生成</li>'
+            + '<li>源机在迁移期间保持关机，重试后仍会在全部盘完成后建目标机</li></ul>',
+        okText: '开始重试',
+        onOk: async () => {
+            closeModal();
+            try {
+                const res = await fetch(
+                    '/api/jobs/' + encodeURIComponent(jobId) + '/vms/'
+                    + encodeURIComponent(vmName) + '/disks/retry',
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ volume_ids: ids })
+                    });
+                const json = await res.json();
+                if (!json.ok) throw new Error(json.error || '提交重试失败');
+                toast('已提交重试：' + (ids.length ? ids.join('、') : '全部失败盘'), 'success');
+                if (!state.pollTimer) startPolling();
+            } catch (err) {
+                toast('提交重试失败：' + err.message, 'error');
+            }
+        }
+    });
 }
 
 /* items: [{vm, disks}]，disk 既可以是 relay_disks 的条目，也可以是 VolumeTask。 */
-function renderVmDiskSummary(tb, items) {
+function renderVmDiskSummary(tb, items, opts) {
     if (!tb) return;
+    const withRetry = Boolean(opts && opts.retry);
     if (!items.length) {
-        tb.innerHTML = '<tr><td colspan="7" class="empty-box">暂无数据</td></tr>';
+        tb.innerHTML = '<tr><td colspan="' + (withRetry ? 8 : 7)
+            + '" class="empty-box">暂无数据</td></tr>';
         return;
     }
     tb.innerHTML = '';
@@ -4450,8 +4507,38 @@ function renderVmDiskSummary(tb, items) {
         tr.appendChild(text('td', 'mono', String(disks.length - done - failed)));
         // size 是 GiB（上面按两种来源归一过），formatGiB 收字节。
         tr.appendChild(text('td', 'mono', size ? formatGiB(Math.round(size * 1024 ** 3)) : '—'));
+        if (withRetry) tr.appendChild(diskRetryCell(vm, disks));
         tb.appendChild(tr);
     });
+}
+
+function diskRetryCell(vm, disks) {
+    const td = text('td');
+    const failed = disks.filter(disk => relayDiskFailed(disk) && disk.volume_id);
+    if (!failed.length) {
+        td.appendChild(text('span', 'sec-note', '—'));
+        return td;
+    }
+    if (vm.status !== 'awaiting_disk_retry') {
+        td.appendChild(text('span', 'sec-note', '等待其余盘完成'));
+        return td;
+    }
+    const makeBtn = (label, ids, title) => {
+        const btn = text('button', 'btn btn-sm btn-primary', label);
+        if (title) btn.title = title;
+        btn.style.marginRight = '6px';
+        btn.addEventListener('click', () => retryVmDisk(vm.name, ids));
+        return btn;
+    };
+    failed.forEach(disk => {
+        const label = disk.role === 'boot' ? '重试系统盘' : '重试数据盘';
+        td.appendChild(makeBtn(label, [disk.volume_id],
+            (disk.error ? disk.error + ' · ' : '') + disk.volume_id));
+    });
+    if (failed.length > 1) {
+        td.appendChild(makeBtn('全部重试', failed.map(disk => disk.volume_id), '重试全部失败盘'));
+    }
+    return td;
 }
 
 function relayDiskDone(disk) {

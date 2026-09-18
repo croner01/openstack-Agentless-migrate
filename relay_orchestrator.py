@@ -186,11 +186,15 @@ class RelayVolumeMover:
         index: int,
         source_volume_type: str | None = None,
         target_volume_type: str | None = None,
+        reuse_target_volume_id: str = "",
     ) -> PreparedVolume:
         """只做「打快照 → 派生拷贝源 → 建目标空白卷」。
 
         没有数据面流量，多块盘可以并发准备；失败时把已经建出来的快照与
         派生卷回收，不留占配额的空壳。
+
+        ``reuse_target_volume_id`` 供失败盘重试使用：目标空白卷是这台 VM 的
+        数据盘、里面可能已经写进了部分字节，重试时要沿用而不是再建一块。
         """
         record = self.record(volume)
         if not record.vm_id:
@@ -222,12 +226,20 @@ class RelayVolumeMover:
                 snapshot_id=copy.snapshot_id,
                 derived_volume_id=copy.derived_volume_id,
             )
-            target_volume_id = self.lifecycle.create_target_volume(
-                name=f"{vm_name}-vol-{index}",
-                size=int(volume.size or 0),
-                volume_type=target_volume_type or self.target_volume_type or None,
-                on_wait=touch,
-            )
+            target_volume_id = str(reuse_target_volume_id or "").strip()
+            if target_volume_id:
+                logging.info(
+                    "[MIGRATION] 失败盘重试沿用已有目标卷 volume=%s target=%s",
+                    volume.source_volume_id,
+                    target_volume_id,
+                )
+            else:
+                target_volume_id = self.lifecycle.create_target_volume(
+                    name=f"{vm_name}-vol-{index}",
+                    size=int(volume.size or 0),
+                    volume_type=target_volume_type or self.target_volume_type or None,
+                    on_wait=touch,
+                )
             self._save(
                 record, phase="attaching_target", target_volume_id=target_volume_id
             )
