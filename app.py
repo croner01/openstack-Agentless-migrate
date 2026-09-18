@@ -109,7 +109,26 @@ if not os.path.exists(UPLOAD_FOLDER):
 
 # 中转机 agent 控制面：签名密钥必须持久化，否则平台重启后常驻节点全部失联。
 RELAY_SECRET_PATH = os.path.join(UPLOAD_FOLDER, "relay-secret")
-RELAY_STATE = RelayState(secret=load_or_create_secret(RELAY_SECRET_PATH))
+
+
+def relay_heartbeat_settings() -> tuple[int, int]:
+    """常驻中转机的心跳间隔/超时（平台级，不受单次作业表单影响）。
+
+    timeout 至少留 3 个心跳周期：只容一次抖动的参数会把正常网络波动判成
+    节点死亡，10 分钟后触发自动重建。改这两个值需要重启进程（agent 的
+    心跳间隔是注册响应下发的，只在那时生效）。
+    """
+    interval = env_int("MIGRATION_RELAY_HEARTBEAT_INTERVAL", 10, minimum=1)
+    timeout = env_int("MIGRATION_RELAY_HEARTBEAT_TIMEOUT", 30, minimum=1)
+    return interval, max(timeout, interval * 3)
+
+
+_RELAY_HB_INTERVAL, _RELAY_HB_TIMEOUT = relay_heartbeat_settings()
+RELAY_STATE = RelayState(
+    secret=load_or_create_secret(RELAY_SECRET_PATH),
+    heartbeat_interval=_RELAY_HB_INTERVAL,
+    heartbeat_timeout=_RELAY_HB_TIMEOUT,
+)
 
 
 def _load_store_or_empty(store_cls, path: str, label: str):
@@ -403,30 +422,84 @@ def sweep_relay_resources(*, now: float | None = None) -> list[str]:
     if not RELAY_RESOURCES.ready:
         return results
 
+    # 兜底清理：agent 进程消失后会话不该只增不减（同名旧会话已在注册时作废）。
+    stale_agents = RELAY_STATE.prune_stale(
+        now=current, max_age=RELAY_STATE.heartbeat_timeout * 10
+    )
+    if stale_agents:
+        logging.warning(
+            "[MIGRATION] 清理 %s 条陈旧 agent 会话", len(stale_agents)
+        )
+
     for agent_id in RELAY_STATE.sweep(now=current):
         agent = RELAY_STATE.by_id(agent_id)
         if agent is None:
             continue
-        for record in RELAY_INVENTORY.all():
-            if record.name != agent.name:
-                continue
+        for record in _inventory_records_for_agent(agent):
             record.state = "unhealthy"
             record.updated_at = current
             RELAY_INVENTORY.upsert(record)
             results.append(record.node_id)
+            # 现场必须留下"谁被判死、什么时候"：否则只能靠代码猜。
+            logging.warning(
+                "[MIGRATION] 常驻中转机心跳超时 node=%s name=%s agent=%s"
+                "（%.0fs 内仍不健康才自动重建，期间恢复即撤销）",
+                record.node_id,
+                record.name,
+                agent.agent_id,
+                relay_rebuild_seconds(),
+            )
 
     for record in list(RELAY_INVENTORY.all()):
         if record.state != "unhealthy":
             continue
-        if current - float(record.updated_at or 0.0) < relay_rebuild_seconds():
+        due = max(
+            float(record.updated_at or 0.0) + relay_rebuild_seconds(),
+            float(getattr(record, "rebuild_backoff_until", 0.0) or 0.0),
+        )
+        if current < due:
+            continue
+        # 二次确认"此刻仍不健康"：标记之后心跳可能已经恢复（agent 自愈、
+        # 网络恢复、controller 抖动）。这时撤销误判即可，绝不能删一台正在
+        # 健康服务的机器——这正是"中转机经常自己删掉重建"的主因之一。
+        if _live_agent_for(record, now=current) is not None:
+            record.state = "busy" if int(record.slots_used or 0) else "ready"
+            record.updated_at = current
+            record.rebuild_backoff_until = 0.0
+            RELAY_INVENTORY.upsert(record)
+            logging.warning(
+                "[MIGRATION] 常驻中转机心跳已恢复，撤销重建 node=%s name=%s",
+                record.node_id,
+                record.name,
+            )
+            continue
+        # 正在服务（有槽位占用或活动租约）的机器绝不能删：删了会打断在跑的
+        # 迁移，还会让后续挂载/派生报 404。等它空下来再重建。
+        if _relay_node_busy(record):
+            logging.warning(
+                "[MIGRATION] 常驻中转机不健康但仍在服务，暂不重建 node=%s slots=%s",
+                record.node_id,
+                record.slots_used,
+            )
             continue
         try:
             RELAY_RESOURCES.node_manager.rebuild(record.node_id)
             results.append(f"rebuild:{record.node_id}")
-        except Exception:  # noqa: BLE001 - 重建失败只告警，等人工介入
-            logging.exception(
-                "[MIGRATION] 自动重建常驻中转机失败 node=%s", record.node_id
+            logging.warning(
+                "[MIGRATION] 已自动重建常驻中转机 node=%s name=%s",
+                record.node_id,
+                record.name,
             )
+        except Exception:  # noqa: BLE001 - 重建失败按退避重试，不每分钟打云
+            logging.exception(
+                "[MIGRATION] 自动重建常驻中转机失败 node=%s（%.0fs 后重试）",
+                record.node_id,
+                relay_rebuild_seconds(),
+            )
+            failed = RELAY_INVENTORY.get(record.node_id)
+            if failed is not None:
+                failed.rebuild_backoff_until = current + relay_rebuild_seconds()
+                RELAY_INVENTORY.upsert(failed)
 
     # 建机后从未注册成功的残留（cloud-init 失败、平台重启打断）不会自己变成
     # unhealthy，只能按创建时间回收，否则会永久占着建机额度。
@@ -464,6 +537,54 @@ def sweep_relay_resources(*, now: float | None = None) -> list[str]:
 
     RELAY_INVENTORY.save()
     return results
+
+
+def _inventory_records_for_agent(agent: Any) -> list[Any]:
+    """把心跳超时的会话映射到库存记录。
+
+    优先按 node_id 精确匹配（agent 会带 RELAY_NODE_ID）：按名字匹配时，
+    agent 重新注册留下的僵尸会话会把同名那台在跑的中转机一起判死。
+    老版本 agent 不上报 node_id，只能退回按名字匹配。
+    """
+    node_id = str(getattr(agent, "node_id", "") or "")
+    if node_id:
+        record = RELAY_INVENTORY.get(node_id)
+        return [record] if record is not None else []
+    name = str(getattr(agent, "name", "") or "")
+    return [record for record in RELAY_INVENTORY.all() if record.name == name]
+
+
+def _live_agent_for(record: Any, *, now: float) -> Any | None:
+    """该清单记录对应的 agent 会话此刻是否还活着（心跳在超时窗口内）。
+
+    只用于"救回来"：返回非 None 表示不重建。所以这里按名字兜底查询是安全的
+    —— 误判只会推迟一次重建，不会删掉在服务的机器。
+    """
+    try:
+        agent = RELAY_STATE.find_by_name(record.name)
+    except Exception:  # noqa: BLE001 - 查不到就按没恢复处理
+        logging.exception(
+            "[MIGRATION] 查询 agent 会话失败 node=%s", getattr(record, "node_id", "")
+        )
+        return None
+    if agent is None or getattr(agent, "state", "") == "unhealthy":
+        return None
+    timeout = float(getattr(RELAY_STATE, "heartbeat_timeout", 0.0) or 0.0)
+    last = float(getattr(agent, "last_heartbeat", 0.0) or 0.0)
+    return agent if now - last <= timeout else None
+
+
+def _relay_node_busy(record: Any) -> bool:
+    """节点是否正在服务：有槽位占用或活动租约就不能删。"""
+    if int(getattr(record, "slots_used", 0) or 0) > 0:
+        return True
+    try:
+        return bool(RELAY_LEASES.active_for_node(record.node_id))
+    except Exception:  # noqa: BLE001 - 判断不了就当占用，宁可晚点重建
+        logging.exception(
+            "[MIGRATION] 读取节点租约失败，按占用处理 node=%s", record.node_id
+        )
+        return True
 
 
 def relay_rebuild_seconds() -> float:
@@ -2277,6 +2398,9 @@ def api_runtime():
                     "MIGRATION_UPLOAD_RETENTION_DAYS", 7, minimum=1
                 ),
                 "ceph_preflight": ceph_preflight_enabled(),
+                "relay_heartbeat_interval": RELAY_STATE.heartbeat_interval,
+                "relay_heartbeat_timeout": RELAY_STATE.heartbeat_timeout,
+                "relay_rebuild_seconds": relay_rebuild_seconds(),
                 "log_only_migration": _LOG_FILTER_ACTIVE,
                 "log_only_migration_configured": log_only_migration(),
                 "log_file": LOG_FILE,

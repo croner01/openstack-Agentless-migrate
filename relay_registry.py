@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 import time
 import uuid
 from collections import defaultdict, deque
@@ -42,6 +43,8 @@ class AgentRecord:
     version: str
     address: str
     session_id: str
+    #: 常驻节点的 node_id（清单主键）。老版本 agent 不上报，留空时只能按名字匹配。
+    node_id: str = ""
     state: str = "ready"
     last_heartbeat: float = 0.0
     cancel_requested: bool = False
@@ -100,9 +103,14 @@ class RelayState:
         data_port: int = 9200,
         ssh_public_key: str = "",
         slots_total: int = 1,
+        node_id: str = "",
     ) -> AgentRecord:
         if version not in SUPPORTED_AGENT_VERSIONS:
             raise ValueError(f"unsupported agent version: {version}")
+        # 一个 name 只允许有一条活会话：agent 进程重启/重新注册后，旧会话的
+        # last_heartbeat 会永远停在过去，而巡检是按名字把库存记录标 unhealthy 的
+        # （app.sweep_relay_resources），留着它就会把同名那台在跑的中转机判死。
+        self._supersede_locked(name)
         agent = AgentRecord(
             agent_id=uuid.uuid4().hex,
             job_id=job_id,
@@ -111,6 +119,7 @@ class RelayState:
             version=version,
             address=address,
             session_id=uuid.uuid4().hex,
+            node_id=node_id,
             last_heartbeat=now,
             data_address=data_address,
             data_port=int(data_port or 9200),
@@ -138,13 +147,45 @@ class RelayState:
                 latest = agent
         return latest
 
+    def _supersede_locked(self, name: str) -> list[str]:
+        """作废同名旧会话；调用方必须持有 self._lock。返回被清掉的 agent_id。"""
+        dropped: list[str] = []
+        for agent_id, agent in list(self._agents.items()):
+            if agent.name != name:
+                continue
+            self._sessions.pop(agent.session_id, None)
+            self._agents.pop(agent_id, None)
+            dropped.append(agent_id)
+        if dropped:
+            logging.warning(
+                "[MIGRATION] 中转机 %s 重新注册，作废 %s 条旧会话", name, len(dropped)
+            )
+        return dropped
+
     @_locked
     def drop_by_name(self, name: str) -> None:
         """重建中转机时清掉旧 agent 记录，避免同名旧会话被误用。"""
+        self._supersede_locked(name)
+
+    @_locked
+    def prune_stale(self, *, now: float, max_age: float) -> list[str]:
+        """清掉长时间没心跳且没在跑任务的会话。
+
+        正常情况下同名旧会话已在注册时作废，这里只是兜底：避免 agent 进程
+        消失后记录只增不减，也避免巡检反复扫到陈年僵尸。
+        """
+        if max_age <= 0:
+            return []
+        dropped: list[str] = []
         for agent_id, agent in list(self._agents.items()):
-            if agent.name == name:
-                self._sessions.pop(agent.session_id, None)
-                self._agents.pop(agent_id, None)
+            if agent.running_tasks:
+                continue
+            if now - float(agent.last_heartbeat or 0.0) < max_age:
+                continue
+            self._sessions.pop(agent.session_id, None)
+            self._agents.pop(agent_id, None)
+            dropped.append(agent_id)
+        return dropped
 
     @_locked
     def agents(self) -> list[AgentRecord]:

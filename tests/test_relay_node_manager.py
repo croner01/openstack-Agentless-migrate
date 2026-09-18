@@ -155,15 +155,35 @@ class NodeManagerTest(unittest.TestCase):
 
         self.assertIsNone(self.inventory.get(record.node_id))
 
-    def test_rebuild_reuses_name_but_issues_new_server(self):
+    def test_rebuild_creates_replacement_before_deleting_old(self):
         record = self._create()
-        self.os_utils.create_relay_server.return_value = FakeServer("server-2")
+        calls = []
+        self.os_utils.create_relay_server.side_effect = (
+            lambda **kwargs: (calls.append("create"), FakeServer("server-2"))[1]
+        )
+        self.os_utils.delete_server.side_effect = (
+            lambda *args, **kwargs: calls.append("delete")
+        )
 
         rebuilt = self.manager.rebuild(record.node_id)
 
-        self.assertEqual(rebuilt.name, record.name)
+        # 先建后删：建机被配额挡住时旧机还在，池容量不会凭空少一台。
+        self.assertEqual(calls, ["create", "delete"])
         self.assertEqual(rebuilt.server_id, "server-2")
         self.assertNotEqual(rebuilt.token_enc, record.token_enc)
+        self.assertIsNotNone(self.inventory.get(rebuilt.node_id))
+        self.assertIsNone(self.inventory.get(record.node_id))
+
+    def test_rebuild_failure_keeps_old_node(self):
+        """建机失败（配额/接口）不能把旧机删掉：记录还在，退避后还能再试。"""
+        record = self._create()
+        self.os_utils.create_relay_server.side_effect = RuntimeError("quota exceeded")
+
+        with self.assertRaises(RuntimeError):
+            self.manager.rebuild(record.node_id)
+
+        self.assertIsNotNone(self.inventory.get(record.node_id))
+        self.os_utils.delete_server.assert_not_called()
 
     def test_drain_and_resume(self):
         record = self._create()

@@ -1008,6 +1008,8 @@ body.wizard-view .toast-box { bottom: 92px; }
                             <dt>上传上限 / 保留</dt><dd id="set-upload-limits">—</dd>
                             <dt>提交前 mon 探测</dt><dd id="set-preflight">—</dd>
                             <dt>日志过滤</dt><dd id="set-log-filter">—</dd>
+                            <dt>中转机心跳</dt><dd id="set-relay-heartbeat">—</dd>
+                            <dt>中转机重建判定</dt><dd id="set-relay-rebuild">—</dd>
                         </div>
                         <p class="sec-note" style="margin-top:8px">这些值来自容器环境变量（<span class="mono">MIGRATION_*</span>），改值后重启服务才生效；「RBD 并发名额」被占满时新任务会在「等待 RBD 拷贝名额」排队。</p>
                     </div>
@@ -1353,6 +1355,15 @@ function renderRuntimeInfo(rt) {
         : (rt.log_only_migration
             ? '只输出迁移相关日志（ERROR 及以上仍输出）'
             : '迁移日志过滤未生效：MIGRATION_HTTP_DEBUG=1 保留 HTTP 调试日志'));
+    setText('#set-relay-heartbeat', rt.relay_heartbeat_interval == null
+        ? '—'
+        : '每 ' + rt.relay_heartbeat_interval + ' s 一次 / 超时 '
+            + rt.relay_heartbeat_timeout + ' s 判为不健康（平台级，'
+            + 'MIGRATION_RELAY_HEARTBEAT_INTERVAL/TIMEOUT）');
+    setText('#set-relay-rebuild', rt.relay_rebuild_seconds == null
+        ? '—'
+        : '心跳超时后 ' + rt.relay_rebuild_seconds
+            + ' s 仍不健康且无槽位占用才自动重建（MIGRATION_RELAY_REBUILD_SECONDS）');
 }
 
 async function loadRuntimeInfo() {
@@ -1363,7 +1374,8 @@ async function loadRuntimeInfo() {
         renderRuntimeInfo(data.runtime);
     } catch (err) {
         ['#set-copy-slots', '#set-mem-water', '#set-rbd-timeout', '#set-stall-timeout',
-            '#set-upload-limits', '#set-preflight', '#set-log-filter']
+            '#set-upload-limits', '#set-preflight', '#set-log-filter',
+            '#set-relay-heartbeat', '#set-relay-rebuild']
             .forEach(sel => setText(sel, '不可用：' + err.message));
     }
 }

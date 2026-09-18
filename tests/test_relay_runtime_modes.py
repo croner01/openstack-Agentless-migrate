@@ -109,6 +109,35 @@ class RelayRuntimeModeTest(unittest.TestCase):
         runtime.source_pool.provision.assert_not_called()
         runtime.target_pool.provision.assert_not_called()
 
+    def test_persistent_start_keeps_platform_heartbeat_settings(self):
+        """作业表单的心跳参数不能覆盖进程级 registry。
+
+        RELAY_STATE 是共享的，而 agent 的心跳间隔只在注册时下发一次：用单次
+        作业的 timeout 覆盖它，会让整池节点被周期性判死并自动重建。
+        """
+        state = mock.MagicMock()
+        state.heartbeat_interval = 10
+        state.heartbeat_timeout = 30
+        config = _config("persistent")
+        config.heartbeat_interval = 60
+        config.heartbeat_timeout = 15
+        runtime = RelayRuntime(
+            config=config,
+            source_os=mock.MagicMock(),
+            target_os=mock.MagicMock(),
+            state=state,
+            ledger=mock.MagicMock(),
+            job_id="job-1",
+            inventory=self.inventory,
+            leases=self.leases,
+            registry=FakeRegistry(),
+        )
+
+        runtime.start()
+
+        self.assertEqual(state.heartbeat_interval, 10)
+        self.assertEqual(state.heartbeat_timeout, 30)
+
     def test_persistent_start_requires_inventory(self):
         runtime = RelayRuntime(
             config=_config("persistent"),

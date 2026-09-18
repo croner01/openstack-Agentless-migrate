@@ -476,8 +476,10 @@ class RelayRuntime:
             if self.inventory is None or self.leases is None:
                 raise ValueError("persistent 模式缺少平台级节点清单或租约存储")
             # 常驻节点由调度器按需扩容，作业启动不建机、不删机。
-            self.state.heartbeat_interval = self.config.heartbeat_interval
-            self.state.heartbeat_timeout = self.config.heartbeat_timeout
+            # 心跳参数也不在这里覆盖：RELAY_STATE 是进程级共享的，用单次作业的
+            # 表单值改它会影响所有常驻节点，而 agent 的间隔只在注册时下发一次，
+            # 一旦 timeout 比 agent 的间隔还小，整池节点会被周期性判死并重建。
+            # 平台级取值见 app.relay_heartbeat_settings（MIGRATION_RELAY_HEARTBEAT_*）。
             return
 
         # 用当前这对云的凭据，先把上一轮遗留的中间产物收掉（平台重启后尤其重要）。

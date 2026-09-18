@@ -10,6 +10,7 @@ from pathlib import Path
 
 from flask import Blueprint, Response, jsonify, request
 
+from relay_inventory import touch_node
 from relay_ledger import Ledger, VolumeTaskRecord
 from relay_protocol import ProtocolError, verify_node_token, verify_token
 from relay_registry import RelayState
@@ -141,6 +142,21 @@ def create_blueprint(
             return
         verify_token(state.secret, token, now=time.time())
 
+    def _touch_inventory(agent, *, now: float | None = None):
+        """按 node_id（回退名字）刷新清单：写 last_seen，并把误标的 unhealthy 复位。
+
+        心跳恢复不能只复位内存里的会话状态：清单记录才是巡检判死的依据，
+        不复位就会在 600s 后被自动重建掉。
+        """
+        if inventory is None or agent is None:
+            return None
+        return touch_node(
+            inventory,
+            node_id=str(getattr(agent, "node_id", "") or ""),
+            name=str(getattr(agent, "name", "") or ""),
+            now=time.time() if now is None else now,
+        )
+
     @blueprint.post("/register")
     def register():
         body = request.get_json(force=True, silent=True) or {}
@@ -166,9 +182,13 @@ def create_blueprint(
                 data_port=_as_int(body, "data_port", 9200) or 9200,
                 ssh_public_key=str(body.get("ssh_public_key", "")),
                 slots_total=_as_int(body, "slots_total", 1) or 1,
+                node_id=str(body.get("node_id", "")),
             )
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 409
+        # 注册是状态跃迁，顺手把库存记录落盘（心跳只改内存）。
+        if _touch_inventory(agent) is not None and inventory is not None:
+            inventory.save()
         return jsonify(
             {
                 "session_id": agent.session_id,
@@ -181,9 +201,12 @@ def create_blueprint(
     def heartbeat():
         body = request.get_json(force=True, silent=True) or {}
         session_id = str(body.get("session_id", ""))
-        agent = state.heartbeat(session_id, now=time.time())
+        now = time.time()
+        agent = state.heartbeat(session_id, now=now)
         if agent is None:
             return jsonify({"error": "unknown session"}), 404
+        # 只改内存：巡检线程每分钟会统一 save()，避免每 10s 写一次清单。
+        _touch_inventory(agent, now=now)
         cancels = state.cancels_for(session_id)
         return jsonify({"cancel": bool(cancels), "cancel_tasks": cancels})
 

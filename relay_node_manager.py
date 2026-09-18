@@ -281,15 +281,27 @@ class RelayNodeManager:
         return True
 
     def rebuild(self, node_id: str) -> RelayNodeRecord | None:
+        """重建一台常驻中转机：先建新机，成功后再删旧机。
+
+        顺序不能反：删机成功后建机失败（配额不足、Nova 抖动）会让池子凭空
+        少一台，而且旧记录已被删掉、连重试的锚点都没有。先建后删最坏情况是
+        短暂多占一台的额度，旧机仍在、清单记录也还在，退避后可以再试。
+        """
         record = self.inventory.get(node_id)
         if record is None:
             return None
         tenant_key, role, az = record.tenant_key, record.role, record.az
         slots_total = record.slots_total
-        self.delete_node(node_id)
-        return self.create_node(
+        new_record = self.create_node(
             tenant_key=tenant_key, role=role, az=az, slots_total=slots_total
         )
+        if new_record is None:
+            return None
+        logging.info(
+            "[MIGRATION] 中转机重建完成 old=%s new=%s", record.name, new_record.name
+        )
+        self.delete_node(node_id)
+        return new_record
 
     def drain(self, node_id: str) -> bool:
         return self._set_state(node_id, "draining")

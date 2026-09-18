@@ -70,7 +70,13 @@ class RelayModuleWiringTest(unittest.TestCase):
 
     def test_sweep_relay_resources_marks_unhealthy_and_scales_down(self):
         # 注意：Mock(name=...) 的 name 是保留参数，必须构造后再赋值。
-        record = mock.Mock(node_id="n1", state="ready", updated_at=0.0)
+        record = mock.Mock(
+            node_id="n1",
+            state="ready",
+            updated_at=0.0,
+            slots_used=0,
+            rebuild_backoff_until=0.0,
+        )
         record.name = "relay-source-1"
         agent = mock.Mock(name="agent")
         scheduler = mock.MagicMock()
@@ -90,17 +96,61 @@ class RelayModuleWiringTest(unittest.TestCase):
         ), mock.patch.object(
             app_module.RELAY_INVENTORY, "all", return_value=[record]
         ), mock.patch.object(
+            app_module.RELAY_INVENTORY, "get", return_value=record
+        ), mock.patch.object(
             app_module.RELAY_INVENTORY, "upsert"
         ) as upsert, mock.patch.object(
             app_module.RELAY_INVENTORY, "save"
         ):
             agent.name = "relay-source-1"
+            agent.node_id = "n1"
             result = app_module.sweep_relay_resources(now=100.0)
 
         self.assertEqual(record.state, "unhealthy")
-        upsert.assert_called_once()
+        self.assertIn("n1", result)
         self.assertIn("n2", result)
         self.assertIn("vol-orphan", result)
+
+    def test_sweep_does_not_kill_node_with_mismatched_agent_node_id(self):
+        """巡检按 node_id 匹配：同名僵尸会话不能把在跑的节点判死。"""
+        record = mock.Mock(
+            node_id="n1",
+            state="ready",
+            updated_at=0.0,
+            slots_used=0,
+            rebuild_backoff_until=0.0,
+        )
+        record.name = "relay-source-1"
+        zombie = mock.Mock(name="zombie")
+        zombie.name = "relay-source-1"      # 名字相同
+        zombie.node_id = "already-deleted"  # 但属于另一台（已删）机器
+        scheduler = mock.MagicMock()
+        scheduler.scale_down.return_value = []
+        with mock.patch.object(
+            app_module.RELAY_RESOURCES, "scheduler", scheduler
+        ), mock.patch.object(
+            app_module.RELAY_RESOURCES, "reconciler", None
+        ), mock.patch.object(
+            app_module.RELAY_STATE, "sweep", return_value=["a1"]
+        ), mock.patch.object(
+            app_module.RELAY_STATE, "by_id", return_value=zombie
+        ), mock.patch.object(
+            app_module.RELAY_STATE, "prune_stale", return_value=[]
+        ), mock.patch.object(
+            app_module.RELAY_INVENTORY, "get",
+            side_effect=lambda node_id: record if node_id == "n1" else None,
+        ), mock.patch.object(
+            app_module.RELAY_INVENTORY, "all", return_value=[record]
+        ), mock.patch.object(
+            app_module.RELAY_INVENTORY, "upsert"
+        ) as upsert, mock.patch.object(
+            app_module.RELAY_INVENTORY, "save"
+        ):
+            result = app_module.sweep_relay_resources(now=100.0)
+
+        self.assertEqual(record.state, "ready")
+        upsert.assert_not_called()
+        self.assertNotIn("n1", result)
 
     def test_sweep_reaps_nodes_stuck_in_provisioning(self):
         """从未注册成功的建机残留不会自己变 unhealthy，必须按创建时间回收。"""
