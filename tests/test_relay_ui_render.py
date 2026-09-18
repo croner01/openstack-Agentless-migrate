@@ -201,6 +201,44 @@ class RelayPageRenderTest(unittest.TestCase):
         self.assertIn('id="relay-reconcile"', html)
         self.assertIn('id="relay-counters"', html)
 
+    def test_vm_table_has_disk_column(self):
+        """VM 列表要直接看得到这台机器几块盘完成、几块失败。"""
+        html = self._html()
+
+        self.assertIn("<th>云盘</th>", html)
+        self.assertIn("function vmDiskCell", html)
+        self.assertIn('colspan="7" class="empty-box">暂无数据', html)
+        # 中转机通道读 relay_disks，RBD 通道读 volumes，两边都要认。
+        self.assertIn("(vm.relay_disks && vm.relay_disks.length)", html)
+
+    def test_relay_tab_shows_per_vm_disk_summary(self):
+        """中转机通道要能按 VM 看到"几块盘完成、几块失败"。"""
+        html = self._html()
+
+        self.assertIn('id="relay-vm-disks"', html)
+        for header in ("<th>云盘</th>", "<th>完成</th>", "<th>失败</th>", ">进行中</th>"):
+            self.assertIn(header, html)
+        self.assertIn("function relayVmDiskSummary", html)
+        self.assertIn("function relayDiskRows", html)
+
+    def test_relay_tab_survives_runtime_teardown(self):
+        """作业结束后运行时会被回收（relay 为 null），云盘信息不能跟着消失。"""
+        html = self._html()
+
+        self.assertIn("const diskRows = relayDiskRows(vms)", html)
+        self.assertIn("if (!relay && !diskRows.length)", html)
+        self.assertIn("relay ? relayLiveVolumeRows(relay.volumes) : diskRows", html)
+        self.assertIn("任务已结束（中转机运行时已回收）", html)
+
+    def test_relay_disk_rows_use_persisted_results(self):
+        """逐盘结果来自作业里的 relay_disks，字段要与后端一致。"""
+        html = self._html()
+
+        self.assertIn("(vm.relay_disks || []).forEach(disk => {", html)
+        self.assertIn("disk.volume_id", html)
+        self.assertIn("disk.target_volume_id", html)
+        self.assertIn("disk.error", html)
+
     def test_step3_renders_relay_volume_progress(self):
         """中转机通道不看 vm.volumes，进度必须单独渲染，否则一直只显示"拷贝中"。"""
         html = self._html()
@@ -409,8 +447,9 @@ class RelayPageRenderTest(unittest.TestCase):
 
         self.assertIn("function relayWaitText", html)
         self.assertIn("RELAY_WAIT_PHASES", html)
-        self.assertIn("state.relayNow = json.relay.now", html)
+        self.assertIn("state.relayNow = (relay && relay.now) || 0", html)
         self.assertIn("finished.indexOf(volume.phase || '') < 0", html)
+        self.assertIn("relayLiveVolumeRows", html)
 
     def test_resubmit_button_is_not_gated_by_browser_session(self):
         """刷新/换浏览器后「调整参数重新提交」不能消失。

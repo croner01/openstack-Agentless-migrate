@@ -6,6 +6,7 @@ import shutil
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
@@ -49,6 +50,7 @@ from relay_runtime import (
     parse_relay_options,
     register_runtime,
     relay_options_from_form,
+    relay_phase_label,
     sweep_all_runtimes,
 )
 from relay_secret import load_or_create_secret
@@ -795,11 +797,14 @@ def _serialize_vm(vm) -> dict[str, Any]:
         "target_flavor": vm.target_flavor,
         "status": vm.status.value,
         "phase": vm.phase,
+        "phase_since": getattr(vm, "phase_since", None),
         "error": vm.error,
         "source_server_id": vm.source_server_id,
         "target_server_id": vm.target_server_id,
         "created_resources": vm.created_resources,
         "volumes": [_serialize_volume(volume) for volume in vm.volumes],
+        # 中转机通道的逐盘结果（运行结束后运行时会被回收，只能靠这里留存）。
+        "relay_disks": getattr(vm, "relay_disks", []) or [],
         "started_at": vm.started_at,
         "finished_at": vm.finished_at,
         "duration_seconds": vm.duration_seconds,
@@ -842,6 +847,256 @@ def _serialize_job_summary(job) -> dict[str, Any]:
         "vm_count": len(job.vms),
         "vm_status_counts": counts,
     }
+
+
+#: 诊断文本里的阶段名，与 templates/index.html 的 phaseLabel 保持一致；只用于
+#: 拼人读的提示，接口同时回传原始 phase，前端仍按自己的映射渲染。
+_PHASE_TEXT = {
+    "queued": "等待",
+    "preparing_source": "准备源环境",
+    "collecting_volumes": "收集卷信息",
+    "stopping_target": "停止目标机",
+    "stopping_source": "停止源机",
+    "copying_volumes": "拷贝卷",
+    "starting_target": "启动目标机",
+    "verifying": "校验中",
+    "precopying": "增量预拷贝",
+    "syncing": "增量同步",
+    "awaiting_cutover": "待切换",
+    "relay_stopping_source": "中转机·停源",
+    "relay_copying": "中转机·拷贝",
+    "relay_creating_target_vm": "中转机·建目标机",
+    "success": "成功",
+    "failed": "失败",
+    "cancelled": "已取消",
+}
+
+
+#: 已经落终态的 VM 状态：诊断时只有非终态才值得提示"停留了多久"。
+_VM_TERMINAL_STATUSES = frozenset(
+    {"success", "failed", "cancelled", "preflight_failed"}
+)
+
+
+def _phase_text(phase: str) -> str:
+    return _PHASE_TEXT.get(phase or "", phase or "")
+
+
+def _iso_age_seconds(iso: str | None) -> float | None:
+    """ISO 时间戳距离现在的秒数；解析不了返回 None。"""
+    if not iso:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(iso))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return round((datetime.now(timezone.utc) - parsed).total_seconds(), 1)
+
+
+def _humanize_seconds(seconds: float) -> str:
+    total = int(max(0.0, float(seconds or 0.0)))
+    if total >= 3600:
+        return f"{total // 3600}h{(total % 3600) // 60}m"
+    if total >= 60:
+        return f"{total // 60}m{total % 60}s"
+    return f"{total}s"
+
+
+def _vm_disk_progress(vm) -> dict[str, Any]:
+    """逐盘完成/失败计数：中转机看 relay_disks，RBD 直连看 volumes。"""
+    relay_disks = list(getattr(vm, "relay_disks", None) or [])
+    if relay_disks:
+        done = sum(1 for disk in relay_disks if disk.get("status") == "success")
+        failed = sum(1 for disk in relay_disks if disk.get("status") == "failed")
+        in_flight = [
+            disk
+            for disk in relay_disks
+            if disk.get("status") not in ("success", "failed")
+        ]
+        current = in_flight[0] if in_flight else None
+        return {
+            "channel": "relay",
+            "total": len(relay_disks),
+            "done": done,
+            "failed": failed,
+            "in_flight": len(in_flight),
+            "current": (
+                {
+                    "volume_id": current.get("volume_id"),
+                    "role": current.get("role"),
+                    "status": current.get("status"),
+                }
+                if current
+                else None
+            ),
+        }
+    volumes = list(getattr(vm, "volumes", None) or [])
+    if not volumes:
+        return {
+            "channel": "",
+            "total": 0,
+            "done": 0,
+            "failed": 0,
+            "in_flight": 0,
+            "current": None,
+        }
+    statuses = [volume.status.value for volume in volumes]
+    in_flight = [
+        volume
+        for volume in volumes
+        if volume.status.value in ("pending", "copying", "ready")
+    ]
+    current = next(
+        (volume for volume in volumes if volume.status.value in ("copying", "ready")),
+        None,
+    )
+    return {
+        "channel": "rbd",
+        "total": len(volumes),
+        "done": statuses.count("success"),
+        "failed": statuses.count("failed"),
+        "in_flight": len(in_flight),
+        "current": (
+            {
+                "volume_id": current.source_volume_id,
+                "rbd": current.source_rbd_name,
+                "status": current.status.value,
+                "progress_percent": round(float(current.progress_percent or 0.0), 1),
+                "progress_label": current.progress_label,
+            }
+            if current
+            else None
+        ),
+    }
+
+
+def _relay_diagnose(job_id: str) -> dict[str, Any] | None:
+    """中转机通道的卡点视图：节点状态 + 在途卷台账（含各阶段停留时长）。"""
+    runtime = get_runtime(job_id)
+    if runtime is None:
+        return None
+    now = time.time()
+    nodes: list[dict[str, Any]] = []
+    for role, pool in (("source", runtime.source_pool), ("target", runtime.target_pool)):
+        for node in pool.nodes:
+            nodes.append(
+                {
+                    "role": role,
+                    "node_id": node.node_id,
+                    "state": node.state,
+                    "server_id": node.server_id,
+                    "current_task_id": node.current_task_id,
+                }
+            )
+    volumes: list[dict[str, Any]] = []
+    for record in runtime.ledger.all():
+        if record.job_id != job_id:
+            continue
+        volumes.append(
+            {
+                "volume_id": record.volume_id,
+                "vm_id": record.vm_id,
+                "phase": record.phase,
+                "phase_label": relay_phase_label(record.phase),
+                "waited_seconds": round(
+                    now - float(record.updated_at or record.created_at or now), 1
+                ),
+                "snapshot_id": record.snapshot_id,
+                "derived_volume_id": record.derived_volume_id,
+                "target_volume_id": record.target_volume_id,
+                "copied_bytes": int(record.copied_bytes or 0),
+                "total_bytes": int(record.total_bytes or 0),
+                "retry_count": int(record.retry_count or 0),
+            }
+        )
+    volumes.sort(
+        key=lambda item: (item["phase"] in ("done", "cleaned"), -item["waited_seconds"])
+    )
+    return {"nodes": nodes, "volumes": volumes, "ledger": runtime.ledger_summary()}
+
+
+def _job_log_tail(
+    job, limit: int = 80, recent: int = 20
+) -> tuple[list[str], list[str]]:
+    """日志尾部：``(与本作业相关的行, 服务最近若干行)``。
+
+    并发排队这类日志（"等待 RBD 拷贝名额"）不写 job id，只有服务最近行
+    里才看得到，所以两种都回传，省掉上机器 grep。
+    """
+    if not LOG_FILE or not os.path.isfile(LOG_FILE):
+        return [], []
+    try:
+        size = os.path.getsize(LOG_FILE)
+        with open(LOG_FILE, "rb") as handle:
+            handle.seek(max(0, size - 2 * 1024 * 1024))
+            text = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return [], []
+    lines = text.splitlines()
+    keys = [job.id] + [vm.name for vm in job.vms if vm.name]
+    matched = [line for line in lines if any(key in line for key in keys)]
+    return matched[-limit:], lines[-recent:]
+
+
+def _diagnose_hints(
+    job,
+    vms: list[dict[str, Any]],
+    gate: dict[str, Any],
+    relay: dict[str, Any] | None,
+    log_lines: list[str],
+) -> list[str]:
+    """把"卡在哪"翻译成几条可执行结论，省得对着原始数据猜。"""
+    hints: list[str] = []
+    for line in reversed(log_lines):
+        if "等待 RBD 拷贝名额" in line:
+            hints.append(
+                "日志显示任务在排队等 RBD 拷贝名额（不是卡死）：" + line.strip()
+            )
+            break
+    if job.status == JobStatus.RUNNING and gate["active"] >= gate["concurrency"]:
+        holders = (
+            "、".join(
+                f"{holder['owner']}({holder['seconds']:.0f}s)"
+                for holder in gate["holders"]
+            )
+            or "无"
+        )
+        hints.append(
+            f"RBD 拷贝名额已满 {gate['active']}/{gate['concurrency']}，"
+            f"当前占用：{holders}；后面的卷要等前面的卷释放名额。"
+        )
+    for vm in vms:
+        if vm["status"] in _VM_TERMINAL_STATUSES or not vm["phase_seconds"]:
+            continue
+        if vm["phase_seconds"] >= 600:
+            hints.append(
+                f"VM {vm['name']} 停留在「{_phase_text(vm['phase'])}」已 "
+                f"{_humanize_seconds(vm['phase_seconds'])}。"
+            )
+    if relay:
+        for volume in relay["volumes"][:5]:
+            if volume["phase"] in ("done", "cleaned", "failed", "failed_retained"):
+                continue
+            if volume["waited_seconds"] >= 600:
+                hints.append(
+                    f"中转卷 {volume['volume_id']}（VM {volume['vm_id']}）处于"
+                    f"「{volume['phase_label']}」已 "
+                    f"{_humanize_seconds(volume['waited_seconds'])}；"
+                    "打快照/派生大盘没有字节流动，慢是常见现象，不是死锁。"
+                )
+        for node in relay["nodes"]:
+            if node["state"] in ("unhealthy", "error"):
+                hints.append(
+                    f"中转机 {node['node_id']} 状态异常（{node['state']}），"
+                    "可在「中转机通道」页重建。"
+                )
+    if job.status != JobStatus.RUNNING:
+        hints.append(f"任务已不是运行中状态（{job.status.value}），无需继续等待。")
+    if not hints:
+        hints.append("没有发现明显的排队或异常等待，请结合下方日志尾部与在途卷判断。")
+    return hints
 
 
 def _read_excel_rows(file_path: str):
@@ -1376,6 +1631,73 @@ def api_job_params(job_id: str):
             404,
         )
     return jsonify({"ok": True, "params": params})
+
+
+@app.get("/api/jobs/<job_id>/diagnose")
+def api_job_diagnose(job_id: str):
+    """只读卡点诊断：一次拿到"停在哪个阶段、多久、在等谁"。
+
+    不返回任何凭据；日志只回传与该作业/VM 相关的尾部行。
+    """
+    job = job_manager.get(job_id)
+    if job is None:
+        return jsonify({"ok": False, "error": "job 不存在"}), 404
+    vms: list[dict[str, Any]] = []
+    for vm in job.vms:
+        phase_seconds = _iso_age_seconds(getattr(vm, "phase_since", None))
+        if phase_seconds is None:
+            # 老作业没有 phase_since，退回 started_at，至少能看出开始多久了。
+            phase_seconds = _iso_age_seconds(vm.started_at)
+        vms.append(
+            {
+                "name": vm.name,
+                "status": vm.status.value,
+                "phase": vm.phase,
+                "phase_since": getattr(vm, "phase_since", None),
+                "phase_seconds": phase_seconds,
+                "error": vm.error,
+                "target_server_id": vm.target_server_id,
+                "disks": _vm_disk_progress(vm),
+            }
+        )
+    holders = [
+        {"owner": owner, "seconds": round(seconds)}
+        for owner, seconds in COPY_GATE.holders()
+    ]
+    gate = {
+        "concurrency": COPY_GATE.max_active_copies,
+        "active": COPY_GATE.active_copies,
+        "holders": holders,
+        "memory_high_water": COPY_GATE.high_water,
+        "reserve_mb": int(COPY_GATE.reserve_bytes / MiB),
+        "rbd_cmd_timeout_seconds": rbd_cmd_timeout_seconds(),
+        "copy_stall_timeout_seconds": copy_stall_timeout_seconds(),
+    }
+    relay = _relay_diagnose(job_id)
+    log_lines, log_recent = _job_log_tail(job)
+    return jsonify(
+        {
+            "ok": True,
+            "diag_version": DIAG_VERSION,
+            "job": {
+                "id": job.id,
+                "status": job.status.value,
+                "error": job.error,
+                "created_at": job.created_at,
+                "elapsed_seconds": _iso_age_seconds(job.created_at),
+                "vm_count": len(job.vms),
+            },
+            "vms": vms,
+            "copy_gate": gate,
+            "relay": relay,
+            "hints": _diagnose_hints(
+                job, vms, gate, relay, log_lines + log_recent
+            ),
+            "log_file": LOG_FILE,
+            "log_lines": log_lines,
+            "log_recent": log_recent,
+        }
+    )
 
 
 @app.get("/api/jobs/<job_id>/relay")

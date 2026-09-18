@@ -62,7 +62,7 @@ class MigrationManager:
     @staticmethod
     def _set_phase(vm: VmTask, status: VmStatus, phase: str) -> None:
         vm.status = status
-        vm.phase = phase
+        vm.set_phase(phase)
         logging.info("[MIGRATION] VM %s 阶段 -> %s (%s)", vm.name, phase, status.value)
 
     def migrate_vm(
@@ -327,22 +327,54 @@ class MigrationManager:
         ) or {}
         self._set_phase(vm, VmStatus.COPYING_VOLUMES, "relay_copying")
         indexed_entries = list(enumerate([boot_entries[0]] + data_entries))
-        prepared = self._prepare_relay_volumes(
-            mover,
-            vm,
-            indexed_entries,
-            volume_types,
-            workers=int(options.get("volume_concurrency") or 1),
-        )
+        # 逐块登记结果：中转机的运行时会在作业结束后被回收，这里不落一份的话
+        # 页面就再也看不到"这台 VM 完成了几块盘、失败了几块盘"。
+        vm.relay_disks = [
+            {
+                "volume_id": str(entry["volume_id"]),
+                "size": int(entry.get("size") or 0),
+                "role": "boot" if position == 0 else "data",
+                "status": "pending",
+                "target_volume_id": "",
+                "error": "",
+            }
+            for position, (_, entry) in enumerate(indexed_entries)
+        ]
+        # relay_disks 与 indexed_entries 同序，PreparedVolume.index 就是这里的下标。
         target_volume_ids: list[str] = []
-        for index, item in enumerate(prepared):
-            result = mover.transfer(item)
-            target_volume_id = str(result["target_volume_id"])
-            if index == 0:
-                # 空白启动盘默认不可启动，先置位再建机，否则 Nova 返回
-                # "Block Device ... is not bootable"。
-                mover.lifecycle.mark_bootable(volume_id=target_volume_id)
-            target_volume_ids.append(target_volume_id)
+        try:
+            prepared = self._prepare_relay_volumes(
+                mover,
+                vm,
+                indexed_entries,
+                volume_types,
+                workers=int(options.get("volume_concurrency") or 1),
+            )
+            for item in prepared:
+                disk = self._relay_disk(vm, item.index)
+                if disk is not None:
+                    disk["target_volume_id"] = str(item.target_volume_id)
+
+            for index, item in enumerate(prepared):
+                disk = self._relay_disk(vm, item.index)
+                if disk is not None and disk.get("status") != "success":
+                    # 盘是串行传的：只有轮到它时才置"拷贝中"，排队的仍是"待拷贝"。
+                    disk["status"] = "copying"
+                result = mover.transfer(item)
+                target_volume_id = str(result["target_volume_id"])
+                disk = self._relay_disk(vm, item.index)
+                if disk is not None:
+                    disk["target_volume_id"] = target_volume_id
+                    disk["status"] = "success"
+                    disk["error"] = ""
+                if index == 0:
+                    # 空白启动盘默认不可启动，先置位再建机，否则 Nova 返回
+                    # "Block Device ... is not bootable"。
+                    mover.lifecycle.mark_bootable(volume_id=target_volume_id)
+                target_volume_ids.append(target_volume_id)
+        except Exception as exc:  # noqa: BLE001 - 失败原因要落在盘上再往上抛
+            self._mark_relay_disks_failed(vm, str(exc))
+            raise
 
         self._set_phase(vm, VmStatus.CREATING_TARGET_BFV, "relay_creating_target_vm")
         server = self.target_os.create_server_from_volumes(
@@ -364,6 +396,29 @@ class MigrationManager:
         self.target_os.wait_server_booted(server.id)
         self._stop_target_if_requested(vm)
         self._set_phase(vm, VmStatus.VERIFYING, "verifying")
+
+    @staticmethod
+    def _relay_disk(vm: VmTask, index: Any) -> dict[str, Any] | None:
+        """按盘序取登记项：`prepare` 的 index 就是 relay_disks 的下标。"""
+        try:
+            position = int(index)
+        except (TypeError, ValueError):
+            return None
+        disks = vm.relay_disks or []
+        return disks[position] if 0 <= position < len(disks) else None
+
+    @staticmethod
+    def _mark_relay_disks_failed(vm: VmTask, error: str) -> None:
+        """把还没落终态的盘标成失败：拷贝还没轮到它，页面不能一直显示"待拷贝"。
+
+        已经成功的盘保持成功——卷都拷完了才失败，说明问题出在建目标机那一步。
+        """
+        message = (error or "迁移失败")[:500]
+        for disk in vm.relay_disks or []:
+            if disk.get("status") in {"success", "failed"}:
+                continue
+            disk["status"] = "failed"
+            disk["error"] = disk.get("error") or message
 
     def _prepare_relay_volumes(
         self,

@@ -119,6 +119,32 @@ class VmTaskTest(unittest.TestCase):
 
 
 class MigrationJobTest(unittest.TestCase):
+    def test_relay_disks_survive_dict_round_trip(self):
+        """中转机逐盘结果要跟着作业持久化，否则重启/收尾后就查不到了。"""
+        vm = VmTask(name="vm-1", target_az="az1")
+        vm.relay_disks = [
+            {
+                "volume_id": "vol-s1",
+                "size": 40,
+                "role": "boot",
+                "status": "success",
+                "target_volume_id": "vol-t1",
+                "error": "",
+            }
+        ]
+
+        restored = VmTask.from_dict(vm.to_dict())
+
+        self.assertEqual(restored.relay_disks, vm.relay_disks)
+
+    def test_relay_disks_default_for_legacy_payload(self):
+        """老作业的 JSON 里没有这个字段，加载时不能报错。"""
+        vm = VmTask(name="vm-1", target_az="az1")
+        payload = vm.to_dict()
+        payload.pop("relay_disks")
+
+        self.assertEqual(VmTask.from_dict(payload).relay_disks, [])
+
     def test_job_completed_when_all_vms_terminal(self):
         job = MigrationJob(id="j1")
         job.vms = [

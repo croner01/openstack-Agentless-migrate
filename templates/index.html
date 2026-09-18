@@ -306,6 +306,8 @@ details.form-sec .sec-body { padding: 4px 14px 14px; }
 .count-pill b { font-family: var(--mono); }
 .count-pill.c-success { color: var(--success); border-color: var(--tint-success-border); background: var(--tint-success-bg); }
 .count-pill.c-fail { color: var(--danger); border-color: var(--tint-danger-border); background: var(--tint-danger-bg); }
+td.c-fail { color: var(--danger); font-weight: 600; }
+.sec-note.c-fail { color: var(--danger); }
 .count-pill.c-warn { color: var(--warn); border-color: var(--tint-warn-border); background: var(--tint-warn-bg); }
 .count-pill.c-busy { color: var(--accent); border-color: var(--tint-accent-border); background: var(--tint-accent-bg); }
 .tabs { display: flex; gap: 2px; padding: 8px 18px 0; border-bottom: 1px solid var(--line); }
@@ -447,6 +449,7 @@ body.modal-open .modal-mask { display: grid; }
 .conn.ok { color: var(--success); }
 .conn.fail { color: var(--danger); }
 .conn.none { color: var(--muted); }
+.diag-hint { font-size: 12.5px; color: var(--text); background: var(--surface-soft); border-left: 3px solid var(--warn); border-radius: var(--radius-sm); padding: 6px 10px; margin-bottom: 6px; }
 .diag-panel { background: var(--surface-soft); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 10px 14px; font-size: 12px; font-family: var(--mono); white-space: pre-wrap; max-height: 260px; overflow: auto; }
 .submit-summary { display: flex; gap: 18px; flex-wrap: wrap; align-items: center; background: var(--tint-accent-bg); border: 1px solid var(--tint-accent-border); border-radius: var(--radius-md); padding: 10px 16px; font-size: 12px; }
 .submit-summary b { font-family: var(--mono); }
@@ -571,6 +574,7 @@ body.wizard-view .toast-box { bottom: 92px; }
                         <p class="page-desc" id="job-desc-lbl"></p>
                     </div>
                     <div style="display:flex;gap:10px">
+                        <button class="btn btn-sm" id="job-diag-btn">诊断卡点</button>
                         <button class="btn btn-sm" id="job-resubmit-btn" style="display:none">调整参数重新提交</button>
                         <button class="btn btn-sm" id="job-cancel-btn">取消作业</button>
                         <button class="btn btn-sm btn-danger-ghost" id="job-delete-btn">删除</button>
@@ -599,13 +603,19 @@ body.wizard-view .toast-box { bottom: 92px; }
                         <table class="table">
                             <thead><tr>
                                 <th style="width:28px"><input type="checkbox" id="vm-ck-all"></th>
-                                <th>VM 名称</th><th>阶段</th><th style="min-width:190px">进度</th><th>状态</th><th style="text-align:right">操作</th>
+                                <th>VM 名称</th><th>阶段</th><th style="min-width:190px">进度</th><th>云盘</th><th>状态</th><th style="text-align:right">操作</th>
                             </tr></thead>
-                            <tbody id="vm-rows"><tr><td colspan="6" class="empty-box">暂无数据</td></tr></tbody>
+                            <tbody id="vm-rows"><tr><td colspan="7" class="empty-box">暂无数据</td></tr></tbody>
                         </table>
                     </div>
                     <div id="jobtab-vols" class="hidden">
                         <div class="card-body">
+                            <div class="section-lbl" style="margin-top:0">每台虚拟机的云盘</div>
+                            <table class="vol-table" style="width:100%">
+                                <thead><tr><th>VM</th><th>VM 状态</th><th>云盘</th><th>完成</th><th>失败</th><th title="未落终态的盘：排队中 / 拷贝中 / 增量已就绪待切换">进行中</th><th>合计容量</th></tr></thead>
+                                <tbody id="vols-vm-disks"><tr><td colspan="7" class="empty-box">暂无数据</td></tr></tbody>
+                            </table>
+                            <div class="section-lbl">卷明细</div>
                             <table class="vol-table" style="width:100%">
                                 <thead><tr><th>VM</th><th>源 RBD</th><th>目标 RBD</th><th>模式</th><th>状态</th><th style="min-width:190px">进度</th><th>快照清理</th><th>错误</th></tr></thead>
                                 <tbody id="vols-body"><tr><td colspan="8" class="empty-box">暂无数据</td></tr></tbody>
@@ -615,16 +625,29 @@ body.wizard-view .toast-box { bottom: 92px; }
                     <div id="jobtab-relay" class="hidden">
                         <div class="card-body">
                             <div class="vm-count-row" id="relay-counters" style="padding:0 0 10px"></div>
-                            <div class="section-lbl" style="margin-top:0">卷拷贝进度（中转机通道）</div>
+                            <div class="section-lbl" style="margin-top:0">每台虚拟机的云盘</div>
+                            <table class="vol-table" style="width:100%">
+                                <thead><tr><th>VM</th><th>VM 状态</th><th>云盘</th><th>完成</th><th>失败</th><th title="未落终态的盘：排队中 / 拷贝中 / 增量已就绪待切换">进行中</th><th>合计容量</th></tr></thead>
+                                <tbody id="relay-vm-disks"><tr><td colspan="7" class="empty-box">暂无数据</td></tr></tbody>
+                            </table>
+                            <div class="section-lbl">卷拷贝进度（中转机通道）</div>
                             <table class="vol-table" style="width:100%">
                                 <thead><tr><th>VM</th><th>卷</th><th>状态</th><th style="min-width:190px">进度</th><th>数据量</th></tr></thead>
                                 <tbody id="relay-volume-progress"><tr><td colspan="5" class="empty-box">暂无在途卷</td></tr></tbody>
                             </table>
+                            <div class="sec-note hidden" id="relay-disks-note" style="margin-top:8px"></div>
                             <div style="margin-top:14px;display:flex;gap:10px">
                                 <button class="btn btn-sm" id="relay-reconcile">立即对账清理</button>
-                                <span class="sec-note">对账会回收不属于运行中任务的残留节点/卷记录</span>
+                                <span class="sec-note" id="relay-reconcile-note">对账只回收不属于运行中任务的残留节点/卷记录；任务运行中不可用（会删掉正在拷贝的卷）</span>
                             </div>
                         </div>
+                    </div>
+                </div>
+                <div class="card hidden" id="job-diag-result">
+                    <div class="card-body">
+                        <div class="section-lbl" style="margin-top:0">卡点诊断 <span class="sec-note" id="job-diag-version"></span></div>
+                        <div id="job-diag-hints"></div>
+                        <div id="job-diag-body"></div>
                     </div>
                 </div>
             </section>
@@ -2944,6 +2967,32 @@ function vmStatusBadge(status) {
     return span;
 }
 
+/* 中转机通道读 relay_disks，RBD 全量/增量读 volumes：一套汇总两个通道通用。 */
+function vmDisksOf(vm) {
+    return (vm.relay_disks && vm.relay_disks.length) ? vm.relay_disks : (vm.volumes || []);
+}
+
+/* 每台 VM 的云盘完成/失败块数。中转机迁移结束后运行时会被回收，
+   只有在 VM 上留一份（relay_disks）才看得到这块信息。 */
+function vmDiskCell(vm) {
+    const td = text('td');
+    const disks = vmDisksOf(vm);
+    if (!disks.length) {
+        td.appendChild(text('span', 'sec-note', '—'));
+        return td;
+    }
+    const done = disks.filter(disk => relayDiskDone(disk)).length;
+    const failed = disks.filter(disk => relayDiskFailed(disk)).length;
+    const box = text('span', 'mono');
+    box.appendChild(text('b', '', String(done) + '/' + String(disks.length)));
+    td.appendChild(box);
+    if (failed) td.appendChild(text('span', 'sec-note c-fail', ' · 失败 ' + failed));
+    if (disks.length - done - failed > 0) {
+        td.appendChild(text('span', 'sec-note', ' · 进行中 ' + (disks.length - done - failed)));
+    }
+    return td;
+}
+
 function phaseLabel(phase) {
     const map = {
         queued: '等待',
@@ -3120,7 +3169,7 @@ function renderVmTable(vms) {
         return true;
     });
     if (!filtered.length) {
-        tb.innerHTML = '<tr><td colspan="6" class="empty-box">' + (vms.length ? '没有符合筛选条件的 VM' : '暂无 VM 任务') + '</td></tr>';
+        tb.innerHTML = '<tr><td colspan="7" class="empty-box">' + (vms.length ? '没有符合筛选条件的 VM' : '暂无 VM 任务') + '</td></tr>';
         return;
     }
     filtered.forEach(vm => {
@@ -3151,6 +3200,8 @@ function renderVmTable(vms) {
         if (vol) progTd.innerHTML = volumeProgressHTML(vol);
         else progTd.appendChild(text('span', 'sec-note', '—'));
         tr.appendChild(progTd);
+
+        tr.appendChild(vmDiskCell(vm));
 
         const stTd = text('td');
         stTd.appendChild(vmStatusBadge(vm.status));
@@ -3183,6 +3234,8 @@ function renderVmTable(vms) {
 }
 
 function renderVolumeTable(vms) {
+    // RBD 全量/增量同样按 VM 汇总"几块盘完成、几块失败"。
+    renderVmDiskSummary($('#vols-vm-disks'), vmDiskSummaryItems(vms));
     const tb = $('#vols-body');
     tb.innerHTML = '';
     let any = false;
@@ -3568,6 +3621,129 @@ function cancelJob(jobId) {
         }
     });
 }
+
+/* ═══════════ 卡点诊断 ═══════════ */
+async function jobDiagnose() {
+    if (!state.jobId) { toast('还没有选中的任务', 'error'); return; }
+    const btn = $('#job-diag-btn');
+    const wrap = $('#job-diag-result');
+    if (!btn || !wrap) return;
+    btn.disabled = true;
+    const label = btn.textContent;
+    btn.textContent = '诊断中…';
+    wrap.classList.remove('hidden');
+    try {
+        const res = await fetch(`/api/jobs/${state.jobId}/diagnose`);
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || '诊断失败');
+        renderJobDiagnose(data);
+    } catch (err) {
+        $('#job-diag-hints').innerHTML = '';
+        $('#job-diag-body').innerHTML = '';
+        $('#job-diag-body').appendChild(text('pre', 'diag-panel', '诊断失败：' + err.message));
+    } finally {
+        btn.disabled = false;
+        btn.textContent = label;
+    }
+}
+
+function fmtDuration(seconds) {
+    if (seconds === null || seconds === undefined) return '—';
+    const total = Math.max(0, Math.floor(seconds));
+    if (total >= 3600) return Math.floor(total / 3600) + 'h' + Math.floor((total % 3600) / 60) + 'm';
+    if (total >= 60) return Math.floor(total / 60) + 'm' + (total % 60) + 's';
+    return total + 's';
+}
+
+function renderJobDiagnose(data) {
+    $('#job-diag-version').textContent = 'diag ' + (data.diag_version || '—');
+    const hints = $('#job-diag-hints');
+    hints.innerHTML = '';
+    (data.hints || []).forEach(line => hints.appendChild(text('div', 'diag-hint', '• ' + line)));
+
+    const body = $('#job-diag-body');
+    body.innerHTML = '';
+    const job = data.job || {};
+    const gate = data.copy_gate || {};
+    body.appendChild(text('div', 'sec-note',
+        '任务 ' + job.id + ' · 状态 ' + (job.status || '—') + ' · 已运行 ' + fmtDuration(job.elapsed_seconds)
+        + ' · VM ' + (job.vm_count || 0) + ' 台'
+        + ' · RBD 拷贝名额 ' + (gate.active ?? '—') + '/' + (gate.concurrency ?? '—')
+        + (gate.copy_stall_timeout_seconds ? ' · 停滞判定 ' + gate.copy_stall_timeout_seconds + 's' : '')));
+
+    const vmTable = document.createElement('table');
+    vmTable.className = 'vol-table';
+    vmTable.style.width = '100%';
+    vmTable.style.marginTop = '10px';
+    vmTable.innerHTML = '<thead><tr><th>VM</th><th>状态</th><th>阶段</th><th>该阶段停留</th><th>云盘（完/总）</th><th>错误</th></tr></thead>';
+    const vmBody = document.createElement('tbody');
+    (data.vms || []).forEach(vm => {
+        const tr = document.createElement('tr');
+        tr.appendChild(text('td', '', vm.name));
+        const info = vmStatusInfo(vm.status);
+        const stTd = text('td');
+        stTd.appendChild(text('span', 'badge ' + info[0], info[1] || vm.status));
+        tr.appendChild(stTd);
+        tr.appendChild(text('td', '', phaseLabel(vm.phase) || vm.phase));
+        tr.appendChild(text('td', '', fmtDuration(vm.phase_seconds)));
+        const disks = vm.disks || {};
+        tr.appendChild(text('td', '', (disks.done || 0) + '/' + (disks.total || 0)
+            + (disks.failed ? ' · 失败 ' + disks.failed : '')
+            + (disks.in_flight ? ' · 进行中 ' + disks.in_flight : '')));
+        const errTd = text('td', vm.error ? 'c-fail' : '', vm.error || '—');
+        errTd.title = vm.error || '';
+        tr.appendChild(errTd);
+        vmBody.appendChild(tr);
+    });
+    if (!(data.vms || []).length) {
+        vmBody.innerHTML = '<tr><td colspan="6" class="empty-box">暂无数据</td></tr>';
+    }
+    vmTable.appendChild(vmBody);
+    body.appendChild(vmTable);
+
+    if (data.relay && (data.relay.nodes || []).length) {
+        body.appendChild(text('div', 'section-lbl', '中转机节点'));
+        data.relay.nodes.forEach(node => {
+            body.appendChild(text('div', 'sec-note',
+                '• ' + (node.role === 'source' ? '源' : '目标') + ' ' + node.node_id
+                + ' · ' + node.state + (node.current_task_id ? ' · 当前任务 ' + node.current_task_id : '')));
+        });
+    }
+    if (data.relay) {
+        body.appendChild(text('div', 'section-lbl', '中转机在途卷（按停留时长排序）'));
+        const relayTable = document.createElement('table');
+        relayTable.className = 'vol-table';
+        relayTable.style.width = '100%';
+        relayTable.innerHTML = '<thead><tr><th>VM</th><th>卷</th><th>阶段</th><th>已等待</th><th>重试</th><th>快照 / 派生卷</th></tr></thead>';
+        const relayBody = document.createElement('tbody');
+        const rows = (data.relay.volumes || []).filter(row => !['done', 'cleaned'].includes(row.phase)).slice(0, 20);
+        rows.forEach(row => {
+            const tr = document.createElement('tr');
+            tr.appendChild(text('td', '', row.vm_id || '—'));
+            tr.appendChild(text('td', 'mono', row.volume_id));
+            tr.appendChild(text('td', '', row.phase_label || row.phase));
+            tr.appendChild(text('td', '', fmtDuration(row.waited_seconds)));
+            tr.appendChild(text('td', '', String(row.retry_count || 0)));
+            tr.appendChild(text('td', 'mono', (row.snapshot_id || '—') + ' / ' + (row.derived_volume_id || '—')));
+            relayBody.appendChild(tr);
+        });
+        if (!rows.length) {
+            relayBody.innerHTML = '<tr><td colspan="6" class="empty-box">没有在途卷</td></tr>';
+        }
+        relayTable.appendChild(relayBody);
+        body.appendChild(relayTable);
+    }
+
+    body.appendChild(text('div', 'section-lbl', '相关日志尾部（' + (data.log_file || '') + '）'));
+    body.appendChild(text('pre', 'diag-panel',
+        (data.log_lines || []).length ? data.log_lines.join('\n')
+            : '日志里没有该作业/VM 的记录（可能已被轮转或清理）。'));
+    if ((data.log_recent || []).length) {
+        body.appendChild(text('div', 'section-lbl', '服务最近日志（并发排队信息在这里）'));
+        body.appendChild(text('pre', 'diag-panel', data.log_recent.join('\n')));
+    }
+}
+
 
 function openJobDeleteConfirm(jobId) {
     openConfirm({
@@ -4014,39 +4190,181 @@ async function refreshRelayPool() {
             ? '任务运行中：对账会删掉正在拷贝的卷，任务结束后才能用'
             : '回收没有作业认领的残留卷/节点记录';
     }
+    let relay = null;
     try {
         const res = await fetch(`/api/jobs/${state.jobId}/relay`);
         const json = await res.json();
-        if (!json.relay) { tab.classList.add('hidden'); return; }
-        tab.classList.remove('hidden');
-        state.relayNow = json.relay.now || 0;
-        const nodes = [...json.relay.source, ...json.relay.target];
-        const busy = nodes.filter(node => node.state === 'busy').length;
-        const unhealthy = nodes.filter(node => node.state === 'unhealthy').length;
-        const ledger = json.relay.ledger || { in_flight: 0, done: 0, cleaned: 0, failed: 0 };
-        const counters = $('#relay-counters');
-        counters.innerHTML = '';
-        [['节点', nodes.length], ['忙碌', busy], ['异常', unhealthy],
-         ['在途卷', ledger.in_flight], ['已完成', ledger.done],
-         ['已清理', ledger.cleaned]].forEach(([label, num]) => {
-            const pill = text('span', 'count-pill');
-            pill.appendChild(document.createTextNode(label + ' '));
-            pill.appendChild(text('b', '', String(num)));
-            counters.appendChild(pill);
-        });
-        const failPill = text('span', 'count-pill ' + (ledger.failed ? 'c-fail' : ''));
-        failPill.appendChild(document.createTextNode('失败 '));
-        failPill.appendChild(text('b', '', String(ledger.failed)));
-        counters.appendChild(failPill);
-        relayVolumeProgress(json.relay.volumes);
+        relay = json.relay || null;
     } catch (err) {
-        $('#jobtab-relay').classList.add('hidden');
+        relay = null;
     }
+    const vms = (state.currentJob && state.currentJob.vms) || [];
+    // 中转机运行时在作业结束后会被回收（/relay 返回 null），此时改用作业里
+    // 持久化的逐盘结果，否则"完成了几块盘、失败了几块盘"会跟着运行时消失。
+    const diskRows = relayDiskRows(vms);
+    if (!relay && !diskRows.length) { tab.classList.add('hidden'); return; }
+    tab.classList.remove('hidden');
+    state.relayNow = (relay && relay.now) || 0;
+    relayCounters(relay, diskRows);
+    relayVmDiskSummary(vms, relay);
+    relayVolumeProgress(
+        relay ? relayLiveVolumeRows(relay.volumes) : diskRows,
+        Boolean(relay)
+    );
+}
+
+function relayCounters(relay, diskRows) {
+    const counters = $('#relay-counters');
+    if (!counters) return;
+    counters.innerHTML = '';
+    const pill = (label, num, cls) => {
+        const item = text('span', 'count-pill' + (cls ? ' ' + cls : ''));
+        item.appendChild(document.createTextNode(label + ' '));
+        item.appendChild(text('b', '', String(num)));
+        counters.appendChild(item);
+    };
+    if (relay) {
+        const nodes = [...relay.source, ...relay.target];
+        const ledger = relay.ledger || { in_flight: 0, done: 0, cleaned: 0, failed: 0 };
+        pill('节点', nodes.length);
+        pill('忙碌', nodes.filter(node => node.state === 'busy').length);
+        pill('异常', nodes.filter(node => node.state === 'unhealthy').length);
+        pill('在途卷', ledger.in_flight);
+        pill('已完成', ledger.done);
+        pill('已清理', ledger.cleaned);
+        pill('失败', ledger.failed, ledger.failed ? 'c-fail' : '');
+        return;
+    }
+    // 运行时已回收：只报作业里留存的逐盘结果。
+    const done = diskRows.filter(row => row.disk_status === 'success').length;
+    const failed = diskRows.filter(row => row.disk_status === 'failed').length;
+    pill('云盘', diskRows.length);
+    pill('已完成', done);
+    pill('失败', failed, failed ? 'c-fail' : '');
+    pill('未完成', diskRows.length - done - failed);
+}
+
+const RELAY_DISK_STATES = {
+    pending: ['badge-muted', '待拷贝'],
+    copying: ['badge-running', '拷贝中'],
+    success: ['badge-success', '完成'],
+    failed: ['badge-failed', '失败'],
+};
+
+function relayDiskLabel(status) {
+    return (RELAY_DISK_STATES[status] || ['badge-muted', status || '未知'])[1];
+}
+
+/* 作业里持久化的逐盘结果 → 与台账一致的行结构，两张表共用一套渲染。 */
+function relayDiskRows(vms) {
+    const rows = [];
+    (vms || []).forEach(vm => {
+        (vm.relay_disks || []).forEach(disk => {
+            const size = Number(disk.size) || 0;
+            const bytes = size * 1024 * 1024 * 1024;
+            const status = disk.status || 'pending';
+            rows.push({
+                vm_id: vm.name,
+                volume_id: disk.volume_id,
+                target_volume_id: disk.target_volume_id || '',
+                role: disk.role === 'boot' ? '系统盘' : '数据盘',
+                disk_status: status,
+                phase: status === 'success' ? 'done'
+                    : (status === 'failed' ? 'failed'
+                        : (status === 'copying' ? 'copying' : 'queued')),
+                progress_label: relayDiskLabel(status),
+                total_bytes: bytes,
+                copied_bytes: status === 'success' ? bytes : 0,
+                error: disk.error || '',
+            });
+        });
+    });
+    return rows;
+}
+
+/* 每台 VM 各完成/失败了几块盘：迁移结束后也要能看到。 */
+function vmDiskSummaryItems(vms) {
+    const items = [];
+    (vms || []).forEach(vm => {
+        const disks = vmDisksOf(vm);
+        if (disks.length) items.push({ vm, disks });
+    });
+    return items;
+}
+
+function relayVmDiskSummary(vms, relay) {
+    const items = vmDiskSummaryItems(vms);
+    if (!items.length && relay) {
+        // 老作业（升级前提交的）没有 relay_disks 字段，退回用台账聚合；
+        // VM 状态仍从作业里按名字找回来，否则整列都是 "—"。
+        const byName = {};
+        (vms || []).forEach(vm => { byName[vm.name] = vm; });
+        const byVm = {};
+        (relay.volumes || []).forEach(volume => {
+            const key = volume.vm_id || '未命名';
+            (byVm[key] = byVm[key] || []).push(volume);
+        });
+        Object.keys(byVm).sort().forEach(name => {
+            items.push({ vm: byName[name] || { name, status: '' }, disks: byVm[name] });
+        });
+    }
+    renderVmDiskSummary($('#relay-vm-disks'), items);
+}
+
+/* items: [{vm, disks}]，disk 既可以是 relay_disks 的条目，也可以是 VolumeTask。 */
+function renderVmDiskSummary(tb, items) {
+    if (!tb) return;
+    if (!items.length) {
+        tb.innerHTML = '<tr><td colspan="7" class="empty-box">暂无数据</td></tr>';
+        return;
+    }
+    tb.innerHTML = '';
+    items.forEach(({ vm, disks }) => {
+        const done = disks.filter(disk => relayDiskDone(disk)).length;
+        const failed = disks.filter(disk => relayDiskFailed(disk)).length;
+        // 持久化结果给的是 size(GiB)，台账行给的是 total_bytes，两种都要认。
+        const size = disks.reduce(
+            (sum, disk) => sum + (Number(disk.size) || (Number(disk.total_bytes) || 0) / (1024 ** 3)),
+            0);
+        const tr = document.createElement('tr');
+        tr.appendChild(text('td', '', vm.name));
+        const stTd = text('td');
+        if (vm.status) stTd.appendChild(vmStatusBadge(vm.status));
+        else stTd.appendChild(text('span', 'sec-note', '—'));
+        tr.appendChild(stTd);
+        tr.appendChild(text('td', 'mono', String(disks.length) + ' 块'));
+        tr.appendChild(text('td', 'mono', String(done)));
+        tr.appendChild(text('td', 'mono', String(failed), failed ? 'c-fail' : ''));
+        tr.appendChild(text('td', 'mono', String(disks.length - done - failed)));
+        // size 是 GiB（上面按两种来源归一过），formatGiB 收字节。
+        tr.appendChild(text('td', 'mono', size ? formatGiB(Math.round(size * 1024 ** 3)) : '—'));
+        tb.appendChild(tr);
+    });
+}
+
+function relayDiskDone(disk) {
+    // 持久化结果是 status，台账行是 phase，两种来源都要认。
+    return disk.status === 'success'
+        || disk.phase === 'done' || disk.phase === 'cleaned';
+}
+
+function relayDiskFailed(disk) {
+    return disk.status === 'failed'
+        || disk.phase === 'failed' || disk.phase === 'failed_retained';
+}
+
+/* 台账里有字节的与"还没结束"的都要留：打快照/派生卷阶段一个字节都没有，
+   按字节过滤会把最慢的一步整段藏起来，页面显示"暂无在途卷"而任务其实在跑。 */
+function relayLiveVolumeRows(volumes) {
+    const finished = ['done', 'cleaned', 'failed', 'failed_retained'];
+    return (volumes || []).filter(volume =>
+        volume.total_bytes > 0 || volume.copied_bytes > 0 ||
+        finished.indexOf(volume.phase || '') < 0);
 }
 
 function relayPhaseBadge(volume) {
     const phase = volume.phase || '';
-    const done = phase === 'done';
+    const done = phase === 'done' || phase === 'cleaned';
     const failed = phase === 'failed' || phase === 'failed_retained';
     const waiting = phase === 'queued';
     const cls = done ? 'badge-success' : failed ? 'badge-failed'
@@ -4089,21 +4407,26 @@ function relayVolumeBytes(volume) {
     const copied = Number(volume.copied_bytes) || 0;
     const total = Number(volume.total_bytes) || 0;
     const skipped = Number(volume.skipped_bytes) || 0;
+    if (volume.disk_status) {
+        // 运行时已回收，只有卷容量；显示 "0.00 GiB / 200.00 GiB" 会让人以为拷贝没开始。
+        return total > 0 ? formatGiB(total) : '—';
+    }
     let value = formatGiB(copied) + ' / ' + (total > 0 ? formatGiB(total) : '未知');
     if (skipped > 0) value += ' · 跳过 ' + formatGiB(skipped);
     return value;
 }
 
-function relayVolumeProgress(volumes) {
+function relayVolumeProgress(rows, live) {
     const tb = $('#relay-volume-progress');
     if (!tb) return;
-    // 打快照/派生卷阶段还没有任何字节，按字节过滤会把最慢的一步整段藏起来，
-    // 页面显示"暂无在途卷"而任务其实在跑。未结束的记录一律保留。
-    const finished = ['done', 'cleaned', 'failed', 'failed_retained'];
-    const rows = (volumes || []).filter(volume =>
-        volume.total_bytes > 0 || volume.copied_bytes > 0 ||
-        finished.indexOf(volume.phase || '') < 0);
-    if (!rows.length) {
+    const note = $('#relay-disks-note');
+    if (note) {
+        note.classList.toggle('hidden', Boolean(live));
+        note.textContent = live ? '' :
+            '任务已结束（中转机运行时已回收），下面是留存在作业里的逐盘结果；'
+            + '每块盘的「数据量」为卷容量，进度列不再有实时字节数。';
+    }
+    if (!(rows || []).length) {
         tb.innerHTML = '<tr><td colspan="5" class="empty-box">暂无在途卷</td></tr>';
         return;
     }
@@ -4111,9 +4434,22 @@ function relayVolumeProgress(volumes) {
     rows.forEach(volume => {
         const tr = document.createElement('tr');
         tr.appendChild(text('td', '', volume.vm_id || '未命名'));
-        tr.appendChild(text('td', 'mono', volume.volume_id || '—'));
+        // 持久化结果带了系统盘/数据盘角色，失败时一眼能认出是哪块盘。
+        const volTd = text(
+            'td', 'mono',
+            (volume.role ? volume.role + ' ' : '') + (volume.volume_id || '—'));
+        if (volume.target_volume_id) {
+            volTd.appendChild(text('div', 'sec-note mono', '目标 ' + volume.target_volume_id));
+        }
+        tr.appendChild(volTd);
         const stTd = text('td');
         stTd.appendChild(relayPhaseBadge(volume));
+        if (volume.error) {
+            const err = text('span', 'sec-note', ' · ' + volume.error);
+            err.style.color = 'var(--danger)';
+            err.title = volume.error;
+            stTd.appendChild(err);
+        }
         tr.appendChild(stTd);
         const progTd = text('td');
         progTd.innerHTML = relayProgressHTML(volume);
@@ -4487,6 +4823,7 @@ document.addEventListener('DOMContentLoaded', () => {
     $('#bulk-cutover').addEventListener('click', bulkCutover);
     $('#job-cancel-btn').addEventListener('click', () => { if (state.jobId) cancelJob(state.jobId); });
     $('#job-delete-btn').addEventListener('click', () => { if (state.jobId) openJobDeleteConfirm(state.jobId); });
+    $('#job-diag-btn').addEventListener('click', jobDiagnose);
     $('#job-resubmit-btn').addEventListener('click', restoreLastSubmit);
 
     // 设置

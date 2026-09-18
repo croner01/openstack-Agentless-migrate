@@ -138,12 +138,20 @@ class VmTask:
     target_flavor: str | None = None
     status: VmStatus = VmStatus.QUEUED
     phase: str = "queued"
+    #: 进入当前阶段的时间（ISO8601）。诊断页据此算"卡在这个阶段多久了"；
+    #: 老作业反序列化时没有这个字段，前端按 None 处理即可。
+    phase_since: str | None = None
     error: str | None = None
     source_server_id: str | None = None
     target_server_id: str | None = None
     target_network_ports: list = field(default_factory=list)
     created_resources: list = field(default_factory=list)
     volumes: list[VolumeTask] = field(default_factory=list)
+    #: 中转机通道逐块盘的迁移结果（``volume_id``/``target_volume_id``/``size``/
+    #: ``status``/``error``）。中转机的运行时在作业结束后会被回收，卷信息只存在
+    #: 台账里会被 7 天保留期清掉；挂在这里才能让"这台 VM 几块盘完成、几块失败"
+    #: 跟着作业一起留存并展示。
+    relay_disks: list[dict[str, Any]] = field(default_factory=list)
     started_at: str | None = None
     finished_at: str | None = None
     duration_seconds: float | None = None
@@ -167,21 +175,26 @@ class VmTask:
             volume.status == VolumeStatus.SUCCESS for volume in self.volumes
         )
 
+    def set_phase(self, phase: str) -> None:
+        """记录阶段与进入时间：诊断页据此判断卡在某个阶段多久了。"""
+        self.phase = phase
+        self.phase_since = datetime.now(timezone.utc).isoformat()
+
     def mark_failed(self, message: str) -> None:
         self.status = VmStatus.FAILED
-        self.phase = "failed"
+        self.set_phase("failed")
         self.error = message
         self.finish(interrupted=True)
 
     def mark_success(self) -> None:
         self.status = VmStatus.SUCCESS
-        self.phase = "success"
+        self.set_phase("success")
         self.error = None
         self.finish(interrupted=False)
 
     def mark_cancelled(self, message: str = "任务被用户取消") -> None:
         self.status = VmStatus.CANCELLED
-        self.phase = "cancelled"
+        self.set_phase("cancelled")
         self.error = message
         self.finish(interrupted=True)
 
@@ -211,12 +224,14 @@ class VmTask:
             "target_flavor": self.target_flavor,
             "status": self.status.value,
             "phase": self.phase,
+            "phase_since": self.phase_since,
             "error": self.error,
             "source_server_id": self.source_server_id,
             "target_server_id": self.target_server_id,
             "target_network_ports": self.target_network_ports,
             "created_resources": self.created_resources,
             "volumes": [volume.to_dict() for volume in self.volumes],
+            "relay_disks": self.relay_disks,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "duration_seconds": self.duration_seconds,
@@ -244,6 +259,7 @@ class VmTask:
             target_flavor=data.get("target_flavor"),
             status=VmStatus(data.get("status") or VmStatus.QUEUED.value),
             phase=data.get("phase") or "queued",
+            phase_since=data.get("phase_since"),
             error=data.get("error"),
             source_server_id=data.get("source_server_id"),
             target_server_id=data.get("target_server_id"),
@@ -252,6 +268,7 @@ class VmTask:
             volumes=[
                 VolumeTask.from_dict(volume) for volume in data.get("volumes") or []
             ],
+            relay_disks=data.get("relay_disks") or [],
             started_at=data.get("started_at"),
             finished_at=data.get("finished_at"),
             duration_seconds=data.get("duration_seconds"),

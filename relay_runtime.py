@@ -46,6 +46,7 @@ RELAY_PHASE_LABELS = {
     "detaching": "卸载卷",
     "cleaning": "收尾清理",
     "done": "完成",
+    "cleaned": "已清理",
     "failed": "失败",
 }
 
@@ -730,6 +731,7 @@ class RelayRuntime:
                 {
                     "volume_id": record.volume_id,
                     "vm_id": record.vm_id,
+                    "target_volume_id": record.target_volume_id,
                     "phase": record.phase,
                     "progress_label": relay_phase_label(record.phase),
                     "copied_bytes": copied,

@@ -258,6 +258,86 @@ class RelayPathBranchTest(unittest.TestCase):
         self.assertIn("prepare", order)
         self.assertIn("transfer", order)
 
+    def test_relay_path_records_per_disk_results(self):
+        """逐块盘的结果要落在 VM 上：运行时会回收，只剩台账就没法看了。"""
+        self.manager._migrate_vm_inner(
+            self.vm,
+            {
+                "job_id": "job-1",
+                "data_channel": "relay",
+                "relay_mover_factory": self.mover_factory,
+            },
+        )
+
+        disks = self.vm.relay_disks
+        self.assertEqual(len(disks), 2)
+        self.assertEqual(
+            [(d["volume_id"], d["role"], d["status"], d["size"]) for d in disks],
+            [("vol-s1", "boot", "success", 40), ("vol-s2", "data", "success", 20)],
+        )
+        self.assertEqual([d["target_volume_id"] for d in disks], ["vol-t0", "vol-t1"])
+        self.assertEqual([d["error"] for d in disks], ["", ""])
+
+    def test_relay_path_marks_failed_and_pending_disks(self):
+        """失败那块带错误，后面还没轮到的也要落成失败，不能一直显示"待拷贝"。"""
+        self.mover.transfer.side_effect = [
+            {"target_volume_id": "vol-t0", "size": 40, "source_volume_id": "vol-s1"},
+            RuntimeError("目标存储写超时"),
+        ]
+
+        with self.assertRaises(RuntimeError):
+            self.manager._migrate_vm_inner(
+                self.vm,
+                {
+                    "job_id": "job-1",
+                    "data_channel": "relay",
+                    "relay_mover_factory": self.mover_factory,
+                },
+            )
+
+        statuses = [disk["status"] for disk in self.vm.relay_disks]
+        self.assertEqual(statuses, ["success", "failed"])
+        self.assertIn("目标存储写超时", self.vm.relay_disks[1]["error"])
+        self.assertEqual(self.vm.relay_disks[0]["error"], "")
+
+    def test_relay_path_marks_every_disk_failed_when_prepare_fails(self):
+        """准备阶段就挂了（快照/派生失败）时，所有盘都要有结论。"""
+        self.mover.prepare.side_effect = RuntimeError("快照创建超时")
+
+        with self.assertRaises(RuntimeError):
+            self.manager._migrate_vm_inner(
+                self.vm,
+                {
+                    "job_id": "job-1",
+                    "data_channel": "relay",
+                    "relay_mover_factory": self.mover_factory,
+                },
+            )
+
+        self.assertEqual(
+            [disk["status"] for disk in self.vm.relay_disks], ["failed", "failed"]
+        )
+
+    def test_relay_path_keeps_successful_disks_when_target_creation_fails(self):
+        """盘都拷完了才失败，说明问题在建目标机，不能把已完成的盘算成失败。"""
+        self.manager.target_os.create_server_from_volumes.side_effect = RuntimeError(
+            "quota exceeded"
+        )
+
+        with self.assertRaises(RuntimeError):
+            self.manager._migrate_vm_inner(
+                self.vm,
+                {
+                    "job_id": "job-1",
+                    "data_channel": "relay",
+                    "relay_mover_factory": self.mover_factory,
+                },
+            )
+
+        self.assertEqual(
+            [disk["status"] for disk in self.vm.relay_disks], ["success", "success"]
+        )
+
     def test_relay_path_finishes_every_prepare_before_transferring(self):
         """先把所有盘准备好再开始传数据：传输要占中转机槽位，早占只会白等。"""
         events = []
