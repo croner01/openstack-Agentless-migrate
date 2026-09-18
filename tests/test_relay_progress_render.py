@@ -102,5 +102,64 @@ class RelayProgressRenderTest(unittest.TestCase):
         self.assertIn("if (volume.phase === 'done') return '100%';", html)
 
 
+class RelayDiskDetailRenderTest(unittest.TestCase):
+    """中转机页签要有一行一块盘的明细表：失败后仍能看到每块盘的状态与原因。"""
+
+    def setUp(self):
+        self.client = app_module.app.test_client()
+
+    def _html(self) -> str:
+        return self.client.get("/").get_data(as_text=True)
+
+    def test_detail_table_has_expected_columns(self):
+        html = self._html()
+
+        self.assertIn('id="relay-disk-detail"', html)
+        self.assertIn("<th>VM</th><th>盘</th><th>源卷</th><th>目标卷</th><th>状态</th>", html)
+        self.assertIn("失败原因", html)
+        self.assertIn('<tbody id="relay-disk-detail"><tr><td colspan="8"', html)
+
+    def test_detail_table_is_refreshed_with_the_relay_tab(self):
+        html = self._html()
+
+        self.assertIn("function renderRelayDiskDetail(vms, relay)", html)
+        self.assertIn("renderRelayDiskDetail(vms, relay);", html)
+        # 在途实时进度与作业留存的逐盘结果按源卷 id 合并。
+        self.assertIn("function relayDiskDetailRows(vms, relay)", html)
+        self.assertIn("const now = live[row.volume_id];", html)
+
+    def test_detail_table_shows_error_and_bytes(self):
+        html = self._html()
+
+        self.assertIn("function relayDiskErrorCell(row)", html)
+        self.assertIn("td.title = row.error;", html)
+        # 长异常要单行截断，完整内容在 title 里。
+        self.assertIn("td.appendChild(text('span', 'disk-err', row.error));", html)
+        self.assertIn(".disk-err {", html)
+        self.assertIn("function relayDiskDetailBytes(row)", html)
+
+    def test_detail_table_offers_per_disk_actions(self):
+        html = self._html()
+
+        self.assertIn("function relayDiskDetailActionCell(vm, row)", html)
+        self.assertIn("const retry = diskRetryButton(vm, row);", html)
+        self.assertIn("const release = diskReleaseButton(vm, row);", html)
+        # 按钮文案带盘角色，单看「重试」分不清是哪块盘。
+        self.assertIn("释放数据盘中间卷", html)
+        self.assertIn("重试系统盘", html)
+        # 明细表里的 role 已是中文，按钮文案必须能认，否则会退化成「重试」。
+        self.assertIn(
+            "const key = role === '系统盘' ? 'boot' : (role === '数据盘' ? 'data' : role);",
+            html,
+        )
+
+    def test_detail_role_label_accepts_persisted_and_raw_role(self):
+        """relay_disks 里的 role 已转成中文，台账里可能是 boot/data，两种都要认。"""
+        html = self._html()
+
+        self.assertIn("if (role === 'boot') return '系统盘';", html)
+        self.assertIn("if (role === 'data') return '数据盘';", html)
+
+
 if __name__ == "__main__":
     unittest.main()

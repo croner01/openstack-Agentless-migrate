@@ -308,6 +308,12 @@ details.form-sec .sec-body { padding: 4px 14px 14px; }
 .count-pill.c-fail { color: var(--danger); border-color: var(--tint-danger-border); background: var(--tint-danger-bg); }
 td.c-fail { color: var(--danger); font-weight: 600; }
 .sec-note.c-fail { color: var(--danger); }
+/* 云盘明细的失败原因：单行省略，完整内容放 title，避免长异常把表格撑宽 */
+.disk-err {
+    display: inline-block; max-width: 320px; vertical-align: middle;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    word-break: normal; color: var(--danger);
+}
 .count-pill.c-warn { color: var(--warn); border-color: var(--tint-warn-border); background: var(--tint-warn-bg); }
 .count-pill.c-busy { color: var(--accent); border-color: var(--tint-accent-border); background: var(--tint-accent-bg); }
 .tabs { display: flex; gap: 2px; padding: 8px 18px 0; border-bottom: 1px solid var(--line); }
@@ -630,6 +636,16 @@ body.wizard-view .toast-box { bottom: 92px; }
                             <table class="vol-table" style="width:100%">
                                 <thead><tr><th>VM</th><th>VM 状态</th><th>云盘</th><th>完成</th><th>失败</th><th title="未落终态的盘：排队中 / 拷贝中 / 增量已就绪待切换">进行中</th><th>合计容量</th><th>操作</th></tr></thead>
                                 <tbody id="relay-vm-disks"><tr><td colspan="8" class="empty-box">暂无数据</td></tr></tbody>
+                            </table>
+                            <div class="section-lbl">云盘明细（中转机通道）</div>
+                            <div class="sec-note" style="margin-bottom:6px">一行一块盘：成功/失败/原因都在这里，作业结束后仍然可见（中转机运行时回收后改用作业里留存的结果）。</div>
+                            <table class="vol-table" style="width:100%">
+                                <thead><tr>
+                                    <th>VM</th><th>盘</th><th>源卷</th><th>目标卷</th><th>状态</th>
+                                    <th title="已传输字节 / 卷容量；打快照/派生阶段还没有字节流动">数据量</th>
+                                    <th style="min-width:180px">失败原因</th><th>操作</th>
+                                </tr></thead>
+                                <tbody id="relay-disk-detail"><tr><td colspan="8" class="empty-box">暂无数据</td></tr></tbody>
                             </table>
                             <div class="section-lbl">卷拷贝进度（中转机通道）</div>
                             <table class="vol-table" style="width:100%">
@@ -4343,6 +4359,7 @@ async function refreshRelayPool() {
     state.relayNow = (relay && relay.now) || 0;
     relayCounters(relay, diskRows);
     relayVmDiskSummary(vms, relay);
+    renderRelayDiskDetail(vms, relay);
     relayVolumeProgress(
         relay ? relayLiveVolumeRows(relay.volumes) : diskRows,
         Boolean(relay)
@@ -4588,6 +4605,54 @@ function renderVmDiskSummary(tb, items, opts) {
     });
 }
 
+/* 单块盘的操作按钮构造器：重试与释放共用一套样式/接口。 */
+function makeDiskBtn(vmName, label, cls, ids, handler, title) {
+    const btn = text('button', 'btn btn-sm ' + cls, label);
+    if (title) btn.title = title;
+    btn.style.marginRight = '6px';
+    btn.style.marginBottom = '4px';
+    btn.addEventListener('click', () => handler(vmName, ids));
+    return btn;
+}
+
+/* relay_disks 里 role 是 boot/data，台账里可能没有；明细表按盘角色给中文名。 */
+function relayDiskRoleLabel(role) {
+    if (role === '系统盘' || role === '数据盘') return role;
+    if (role === 'boot') return '系统盘';
+    if (role === 'data') return '数据盘';
+    return '';
+}
+
+/* 按钮文案带上盘角色，只写「重试」「释放」看不出是哪块盘。 */
+const RELAY_DISK_ROLE_ACTIONS = {
+    boot: { retry: '重试系统盘', release: '释放系统盘中间卷' },
+    data: { retry: '重试数据盘', release: '释放数据盘中间卷' },
+};
+
+function relayDiskRoleAction(role, kind) {
+    // 明细表里的 role 已经转成「系统盘/数据盘」，汇总表传的是原始 boot/data。
+    const key = role === '系统盘' ? 'boot' : (role === '数据盘' ? 'data' : role);
+    const fallback = { retry: '重试', release: '释放中间卷' };
+    return (RELAY_DISK_ROLE_ACTIONS[key] || fallback)[kind];
+}
+
+/* 只在"等待重试"、且这块盘确实失败时给重试按钮，避免和正在跑的传输抢盘。 */
+function diskRetryButton(vm, disk) {
+    if (vm.status !== 'awaiting_disk_retry') return null;
+    if (!relayDiskFailed(disk) || !disk.volume_id) return null;
+    return makeDiskBtn(vm.name, relayDiskRoleAction(disk.role, 'retry'),
+        'btn-primary', [disk.volume_id], retryVmDisk,
+        (disk.error ? disk.error + ' · ' : '') + disk.volume_id);
+}
+
+/* 失败保留期内给释放入口：不必为了归还配额而取消整个任务。 */
+function diskReleaseButton(vm, disk) {
+    if (!(Number(disk.retained_until) > 0) || !disk.volume_id) return null;
+    return makeDiskBtn(vm.name, relayDiskRoleAction(disk.role, 'release'),
+        '', [disk.volume_id], releaseVmDisk,
+        relayRetainText(disk) || disk.volume_id);
+}
+
 function diskRetryCell(vm, disks) {
     const td = text('td');
     const failed = disks.filter(disk => relayDiskFailed(disk) && disk.volume_id);
@@ -4597,22 +4662,13 @@ function diskRetryCell(vm, disks) {
     }
     const retained = failed.filter(disk => Number(disk.retained_until) > 0);
     const retryable = vm.status === 'awaiting_disk_retry';
-    const makeBtn = (label, cls, ids, handler, title) => {
-        const btn = text('button', 'btn btn-sm ' + cls, label);
-        if (title) btn.title = title;
-        btn.style.marginRight = '6px';
-        btn.style.marginBottom = '4px';
-        btn.addEventListener('click', () => handler(vm.name, ids));
-        return btn;
-    };
     if (retryable) {
         failed.forEach(disk => {
-            const label = disk.role === 'boot' ? '重试系统盘' : '重试数据盘';
-            td.appendChild(makeBtn(label, 'btn-primary', [disk.volume_id], retryVmDisk,
-                (disk.error ? disk.error + ' · ' : '') + disk.volume_id));
+            const btn = diskRetryButton(vm, disk);
+            if (btn) td.appendChild(btn);
         });
         if (failed.length > 1) {
-            td.appendChild(makeBtn('全部重试', 'btn-primary',
+            td.appendChild(makeDiskBtn(vm.name, '全部重试', 'btn-primary',
                 failed.map(disk => disk.volume_id), retryVmDisk, '重试全部失败盘'));
         }
     } else if (!retained.length) {
@@ -4623,12 +4679,11 @@ function diskRetryCell(vm, disks) {
     // 立即把占用配额的大盘派生卷/快照释放掉，不必为了归还配额而取消任务。
     if (retained.length) {
         retained.forEach(disk => {
-            const label = disk.role === 'boot' ? '释放系统盘中间卷' : '释放数据盘中间卷';
-            td.appendChild(makeBtn(label, '', [disk.volume_id], releaseVmDisk,
-                relayRetainText(disk) || disk.volume_id));
+            const btn = diskReleaseButton(vm, disk);
+            if (btn) td.appendChild(btn);
         });
         if (retained.length > 1) {
-            td.appendChild(makeBtn('全部释放', '',
+            td.appendChild(makeDiskBtn(vm.name, '全部释放', '',
                 retained.map(disk => disk.volume_id), releaseVmDisk,
                 '释放全部保留的中间卷'));
         }
@@ -4755,6 +4810,109 @@ function relayVolumeProgress(rows, live) {
         progTd.innerHTML = relayProgressHTML(volume);
         tr.appendChild(progTd);
         tr.appendChild(text('td', 'mono', relayVolumeBytes(volume)));
+        tb.appendChild(tr);
+    });
+}
+
+/* ── 云盘明细：一行一块盘，成功/失败与原因在作业结束后仍然可见 ── */
+
+/* 合并两个来源：作业里持久化的 relay_disks（运行时回收后仍在）与运行时台账
+   relay.volumes（在途的实时阶段与字节），按源卷 id 对齐。 */
+function relayDiskDetailRows(vms, relay) {
+    const live = {};
+    ((relay && relay.volumes) || []).forEach(volume => {
+        if (volume.volume_id) live[volume.volume_id] = volume;
+    });
+    const rows = relayDiskRows(vms);
+    if (rows.length) {
+        return rows.map(row => {
+            const now = live[row.volume_id];
+            if (!now) return row;
+            return Object.assign({}, row, {
+                phase: now.phase || row.phase,
+                progress_label: now.progress_label || row.progress_label,
+                copied_bytes: Math.max(
+                    Number(now.copied_bytes) || 0, Number(row.copied_bytes) || 0),
+                total_bytes: Number(now.total_bytes) || row.total_bytes,
+                skipped_bytes: Number(now.skipped_bytes) || 0,
+                progress_percent: now.progress_percent,
+                throughput_mb_s: now.throughput_mb_s,
+                updated_at: now.updated_at,
+                target_volume_id: now.target_volume_id || row.target_volume_id,
+                retained_until: Number(now.retained_until) || row.retained_until,
+                retain_reason: now.retain_reason || row.retain_reason,
+                live: true,
+            });
+        });
+    }
+    // 老作业（升级前提交的）没有 relay_disks：退回台账，至少能看到残留的盘。
+    return ((relay && relay.volumes) || []).map(volume => Object.assign({}, volume, {
+        vm_id: volume.vm_id || '未命名',
+        disk_status: volume.phase || '',
+        role: '',
+        live: true,
+    }));
+}
+
+/* 有实时台账才显示已拷/总量；否则只知道卷容量，避免 "0.00 GiB / 200 GiB" 被读成没开始拷。 */
+function relayDiskDetailBytes(row) {
+    const total = Number(row.total_bytes) || 0;
+    if (!row.live) return total > 0 ? formatGiB(total) : '—';
+    const copied = Number(row.copied_bytes) || 0;
+    if (total <= 0 && copied <= 0) return '—';
+    let value = formatGiB(copied) + ' / ' + (total > 0 ? formatGiB(total) : '未知');
+    const skipped = Number(row.skipped_bytes) || 0;
+    if (skipped > 0) value += ' · 跳过 ' + formatGiB(skipped);
+    return value;
+}
+
+/* 失败原因常常是一整段异常文本，折行会把表格撑爆：单行省略，完整内容放 title。 */
+function relayDiskErrorCell(row) {
+    const td = text('td', 'sec-note');
+    if (!row.error) {
+        td.appendChild(text('span', '', '—'));
+        return td;
+    }
+    td.title = row.error;
+    td.appendChild(text('span', 'disk-err', row.error));
+    return td;
+}
+
+/* 单块盘的操作：重试 / 释放，沿用汇总表同一套按钮与接口。 */
+function relayDiskDetailActionCell(vm, row) {
+    const td = text('td');
+    const retry = diskRetryButton(vm, row);
+    if (retry) td.appendChild(retry);
+    const release = diskReleaseButton(vm, row);
+    if (release) td.appendChild(release);
+    if (!retry && !release) td.appendChild(text('span', 'sec-note', '—'));
+    return td;
+}
+
+function renderRelayDiskDetail(vms, relay) {
+    const tb = $('#relay-disk-detail');
+    if (!tb) return;
+    const rows = relayDiskDetailRows(vms, relay);
+    if (!rows.length) {
+        tb.innerHTML = '<tr><td colspan="8" class="empty-box">暂无数据</td></tr>';
+        return;
+    }
+    const byName = {};
+    (vms || []).forEach(vm => { byName[vm.name] = vm; });
+    tb.innerHTML = '';
+    rows.forEach(row => {
+        const vm = byName[row.vm_id] || { name: row.vm_id, status: '' };
+        const tr = document.createElement('tr');
+        tr.appendChild(text('td', '', row.vm_id || '未命名'));
+        tr.appendChild(text('td', '', relayDiskRoleLabel(row.role) || '—'));
+        tr.appendChild(text('td', 'mono', row.volume_id || '—'));
+        tr.appendChild(text('td', 'mono', row.target_volume_id || '—'));
+        const stTd = text('td');
+        stTd.appendChild(relayPhaseBadge(row));
+        tr.appendChild(stTd);
+        tr.appendChild(text('td', 'mono', relayDiskDetailBytes(row)));
+        tr.appendChild(relayDiskErrorCell(row));
+        tr.appendChild(relayDiskDetailActionCell(vm, row));
         tb.appendChild(tr);
     });
 }
