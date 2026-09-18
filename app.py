@@ -207,16 +207,69 @@ def _handle_upload_too_large(_exc):
     )
 
 
+#: 迁移自身之外最吵的第三方 logger：它们的 INFO 基本是请求流水，
+#: 调试迁移时会把 `[MIGRATION]` 行淹掉。
+THIRD_PARTY_LOGGERS = (
+    "werkzeug",
+    "openstack",
+    "keystoneauth",
+    "urllib3",
+    "requests",
+    "novaclient",
+    "cinderclient",
+    "glanceclient",
+    "neutronclient",
+)
+
+
+def log_only_migration() -> bool:
+    """``MIGRATION_LOG_ONLY``：默认只输出迁移相关日志，``off`` 恢复全量。
+
+    「迁移相关」= 迁移服务自己的记录（走 root logger）加上 `[MIGRATION]` /
+    `[SHUTDOWN]` 前缀；ERROR 及以上一律放行，避免降噪把真实报错一起吞掉。
+    """
+    raw = (env_str("MIGRATION_LOG_ONLY", "on") or "on").strip().lower()
+    return raw not in {"off", "0", "false", "no"}
+
+
+class MigrationOnlyFilter(logging.Filter):
+    """按来源过滤：第三方库的 INFO/WARNING 只当噪声，ERROR 起仍会输出。"""
+
+    _PREFIXES = ("[MIGRATION]", "[SHUTDOWN]")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.ERROR:
+            return True
+        if record.name in {"root", ""}:
+            return True
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 - 格式化失败不能连日志一起丢
+            return True
+        return message.startswith(self._PREFIXES)
+
+
+#: 复用同一个实例：_setup_logging 会被重复调用，handler 每次都是新的。
+MIGRATION_ONLY_FILTER = MigrationOnlyFilter()
+
+#: 过滤是否真正生效：``MIGRATION_HTTP_DEBUG=1`` 时会让位给 HTTP 调试日志，
+#: 设置页据此显示"生效值"而不是环境变量里的期望值。
+_LOG_FILTER_ACTIVE = False
+
+
 def _setup_logging() -> None:
     """Write logs to both the log file and stdout (kubectl logs)."""
+    global _LOG_FILTER_ACTIVE
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     formatter = logging.Formatter(
         "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
     )
-    # 避免重复 handler（热加载/多次 import）
+    # 避免重复 handler（热加载/多次 import）；旧 handler 要 close，
+    # 否则文件句柄一直挂着（测试里会看到 ResourceWarning）。
     for handler in root.handlers[:]:
         root.removeHandler(handler)
+        handler.close()
     handlers: list[logging.Handler] = []
     if LOG_FILE:
         # 日志落在 uploads（hostPath）下并轮转，Pod 重启后仍能查历史。
@@ -236,13 +289,25 @@ def _setup_logging() -> None:
         handler.setFormatter(formatter)
         handler.setLevel(logging.INFO)
         root.addHandler(handler)
-    for name in (
-        "werkzeug",
-        "openstack",
-        "keystoneauth",
-        "urllib3",
-    ):
-        logging.getLogger(name).propagate = True
+
+    only_migration = log_only_migration()
+    if only_migration and os.environ.get("MIGRATION_HTTP_DEBUG") == "1":
+        # 显式要看 HTTP 请求/响应时不能过滤，否则调试开关等于失效。
+        logging.info(
+            "[MIGRATION] MIGRATION_HTTP_DEBUG=1：本次不做迁移日志过滤（"
+            "MIGRATION_LOG_ONLY 暂不生效）"
+        )
+        only_migration = False
+    _LOG_FILTER_ACTIVE = only_migration
+    if only_migration:
+        for handler in handlers:
+            handler.addFilter(MIGRATION_ONLY_FILTER)
+    for name in THIRD_PARTY_LOGGERS:
+        logger = logging.getLogger(name)
+        logger.propagate = True
+        # 关闭过滤时恢复继承 root（NOTSET），否则 _setup_logging 重复调用
+        # 会把这几个 logger 永久压在 WARNING。
+        logger.setLevel(logging.WARNING if only_migration else logging.NOTSET)
 
 
 _setup_logging()
@@ -2129,6 +2194,9 @@ def api_runtime():
                     "MIGRATION_UPLOAD_RETENTION_DAYS", 7, minimum=1
                 ),
                 "ceph_preflight": ceph_preflight_enabled(),
+                "log_only_migration": _LOG_FILTER_ACTIVE,
+                "log_only_migration_configured": log_only_migration(),
+                "log_file": LOG_FILE,
             },
         }
     )

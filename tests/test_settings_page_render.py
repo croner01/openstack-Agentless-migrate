@@ -43,8 +43,10 @@ class SettingsPageRenderTest(unittest.TestCase):
 
         self.assertIn("/api/runtime", html)
         for element_id in ("set-copy-slots", "set-mem-water", "set-rbd-timeout",
-                           "set-stall-timeout", "set-upload-limits", "set-preflight"):
+                           "set-stall-timeout", "set-upload-limits", "set-preflight",
+                           "set-log-filter"):
             self.assertIn('id="' + element_id + '"', html)
+        self.assertIn("MIGRATION_LOG_ONLY", html)
 
 
 if __name__ == "__main__":

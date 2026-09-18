@@ -357,6 +357,18 @@ RBD 直连通道的语义不变。
 - `MIGRATION_DELETE_SNAPSHOT_BUDGET_SECONDS`：删除任务前回收其增量迁移快照的
   时间预算（秒），默认 60；超预算的部分交给下一轮 GC。
 
+## 日志
+
+- `MIGRATION_LOG_ONLY`：默认 `on`，日志里只留迁移自身的记录（走 root logger
+  的迁移日志，以及 `[MIGRATION]` / `[SHUTDOWN]` 前缀行）；openstacksdk、
+  keystoneauth、urllib3、werkzeug 等库的 INFO/WARNING 基本是请求流水，会被
+  丢弃，避免把迁移进度淹掉。`ERROR` 及以上一律保留，降噪不吞真实报错。
+  设成 `off`（或 `0`/`false`/`no`）恢复全量输出。
+- 与 `MIGRATION_HTTP_DEBUG=1` 同时设置时以 HTTP 调试为准，本次不过滤日志；
+  平台设置页「生效参数 · 日志过滤」显示的是实际生效状态。
+- `MIGRATION_LOG_MAX_MB`（默认 20）与 `MIGRATION_LOG_BACKUPS`（默认 5）控制
+  日志轮转；日志落在持久卷的 `uploads/vm_batch_migration.log`，Pod 重启后仍可查。
+
 ## API
 
 - `POST /api/migrate`：提交 OpenStack 凭据、Ceph conf、并发、单卷限速与

@@ -1004,6 +1004,7 @@ body.wizard-view .toast-box { bottom: 92px; }
                             <dt>拷贝停滞判定</dt><dd id="set-stall-timeout">—</dd>
                             <dt>上传上限 / 保留</dt><dd id="set-upload-limits">—</dd>
                             <dt>提交前 mon 探测</dt><dd id="set-preflight">—</dd>
+                            <dt>日志过滤</dt><dd id="set-log-filter">—</dd>
                         </div>
                         <p class="sec-note" style="margin-top:8px">这些值来自容器环境变量（<span class="mono">MIGRATION_*</span>），改值后重启服务才生效；「RBD 并发名额」被占满时新任务会在「等待 RBD 拷贝名额」排队。</p>
                     </div>
@@ -1343,6 +1344,11 @@ function renderRuntimeInfo(rt) {
     setText('#set-stall-timeout', rt.copy_stall_timeout_seconds + ' s 无进展即中断并释放名额');
     setText('#set-upload-limits', rt.max_upload_mb + ' MB / 上传目录保留 ' + rt.upload_retention_days + ' 天');
     setText('#set-preflight', rt.ceph_preflight ? '开启（不可达的 mon_host 提交时直接拒绝）' : '已关闭（MIGRATION_CEPH_PREFLIGHT=off）');
+    setText('#set-log-filter', !rt.log_only_migration_configured
+        ? '全量输出（MIGRATION_LOG_ONLY=off，第三方库 INFO 也会写入）'
+        : (rt.log_only_migration
+            ? '只输出迁移相关日志（ERROR 及以上仍输出）'
+            : '迁移日志过滤未生效：MIGRATION_HTTP_DEBUG=1 保留 HTTP 调试日志'));
 }
 
 async function loadRuntimeInfo() {
@@ -1353,7 +1359,8 @@ async function loadRuntimeInfo() {
         renderRuntimeInfo(data.runtime);
     } catch (err) {
         ['#set-copy-slots', '#set-mem-water', '#set-rbd-timeout', '#set-stall-timeout',
-            '#set-upload-limits', '#set-preflight'].forEach(sel => setText(sel, '不可用：' + err.message));
+            '#set-upload-limits', '#set-preflight', '#set-log-filter']
+            .forEach(sel => setText(sel, '不可用：' + err.message));
     }
 }
 

@@ -76,9 +76,36 @@ class RuntimeInfoApiTest(unittest.TestCase):
                 "max_upload_mb",
                 "upload_retention_days",
                 "ceph_preflight",
+                "log_only_migration",
+                "log_only_migration_configured",
+                "log_file",
             },
         )
         self.assertIsInstance(runtime["api_token_enabled"], bool)
+
+    def test_reports_log_filter_switch(self):
+        self.addCleanup(app_module._setup_logging)
+        with mock.patch.dict(
+            os.environ,
+            {"MIGRATION_LOG_ONLY": "on", "MIGRATION_HTTP_DEBUG": ""},
+        ):
+            app_module._setup_logging()
+            runtime = self.client.get("/api/runtime").get_json()["runtime"]
+
+        self.assertTrue(runtime["log_only_migration"])
+        self.assertTrue(runtime["log_only_migration_configured"])
+
+    def test_log_filter_reports_off(self):
+        self.addCleanup(app_module._setup_logging)
+        with mock.patch.dict(
+            os.environ,
+            {"MIGRATION_LOG_ONLY": "off", "MIGRATION_HTTP_DEBUG": ""},
+        ):
+            app_module._setup_logging()
+            runtime = self.client.get("/api/runtime").get_json()["runtime"]
+
+        self.assertFalse(runtime["log_only_migration"])
+        self.assertFalse(runtime["log_only_migration_configured"])
 
 
 if __name__ == "__main__":
