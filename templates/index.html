@@ -4004,6 +4004,16 @@ async function refreshRelayPool() {
     if (!state.jobId) return;
     const tab = $('#jobtab-relay');
     if (!tab) return;
+    // 运行中的作业不能手工对账：它的派生卷/目标卷正在被拷贝使用，
+    // 回收会删掉在途卷，后续挂载直接 404。
+    const reconcileBtn = $('#relay-reconcile');
+    if (reconcileBtn) {
+        const running = (state.currentJob && state.currentJob.status) === 'running';
+        reconcileBtn.disabled = running;
+        reconcileBtn.title = running
+            ? '任务运行中：对账会删掉正在拷贝的卷，任务结束后才能用'
+            : '回收没有作业认领的残留卷/节点记录';
+    }
     try {
         const res = await fetch(`/api/jobs/${state.jobId}/relay`);
         const json = await res.json();

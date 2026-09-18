@@ -100,6 +100,93 @@ class RelayReaperTest(unittest.TestCase):
         }
         self.assertEqual(phases, {"vol-a": "cleanup_failed", "vol-b": "cleanup_failed"})
 
+    def test_sweep_never_reaps_a_running_jobs_records(self):
+        """作业还在跑：记录再"静默"也不能当残留删掉。
+
+        同一 VM 的盘是串行传的，排在队里的卷要等前一块拷完才轮到，可能几小时
+        不刷新 updated_at；按时间判残留会把在用的派生卷删掉，轮到它挂载时就
+        是 404 Volume ... could not be found。
+        """
+        self.ledger.all.return_value = [
+            self._record(phase="attaching_target", updated_at=1000.0)
+        ]
+        reaper = RelayReaper(
+            ledger=self.ledger,
+            lifecycle=self.lifecycle,
+            pools={"source": mock.MagicMock(), "target": mock.MagicMock()},
+            stale_seconds=600.0,
+            active_jobs=lambda: {"job-1"},
+        )
+
+        cleaned = reaper.sweep(now=100000.0)
+
+        self.assertEqual(cleaned, [])
+        self.lifecycle.cleanup_source_copy.assert_not_called()
+        self.lifecycle.detach.assert_not_called()
+
+    def test_sweep_still_reaps_records_of_finished_jobs(self):
+        """作业已经不在运行（重启后的残留）时照旧回收。"""
+        self.ledger.all.return_value = [self._record(updated_at=1000.0)]
+        reaper = RelayReaper(
+            ledger=self.ledger,
+            lifecycle=self.lifecycle,
+            pools={"source": mock.MagicMock(), "target": mock.MagicMock()},
+            stale_seconds=600.0,
+            active_jobs=lambda: set(),
+        )
+
+        cleaned = reaper.sweep(now=100000.0)
+
+        self.assertEqual(cleaned, ["job-1:vol-s1"])
+        self.lifecycle.cleanup_source_copy.assert_called_once()
+
+    def test_sweep_does_nothing_when_active_jobs_unknown(self):
+        """读不出活跃作业时宁可留着：误删在用卷比多留一小时残留糟得多。"""
+        def boom():
+            raise RuntimeError("registry unavailable")
+
+        self.ledger.all.return_value = [self._record(updated_at=1000.0)]
+        reaper = RelayReaper(
+            ledger=self.ledger,
+            lifecycle=self.lifecycle,
+            pools={"source": mock.MagicMock(), "target": mock.MagicMock()},
+            stale_seconds=600.0,
+            active_jobs=boom,
+        )
+
+        self.assertEqual(reaper.sweep(now=100000.0), [])
+        self.lifecycle.cleanup_source_copy.assert_not_called()
+
+    def test_reconcile_job_ignores_active_jobs_guard(self):
+        """作业收尾走 reconcile_job：它就是来清自己作业的，不受活跃保护影响。"""
+        self.ledger.all.return_value = [self._record(updated_at=1000.0)]
+        reaper = RelayReaper(
+            ledger=self.ledger,
+            lifecycle=self.lifecycle,
+            pools={"source": mock.MagicMock(), "target": mock.MagicMock()},
+            stale_seconds=600.0,
+            active_jobs=lambda: {"job-1"},
+        )
+
+        cleaned = reaper.reconcile_job("job-1")
+
+        self.assertEqual(cleaned, ["job-1:vol-s1"])
+
+    def test_cleanup_logs_which_volume_was_reclaimed(self):
+        """回收必须留下日志，否则云上少了一块盘只能靠猜。"""
+        self.ledger.all.return_value = [self._record(updated_at=1000.0)]
+
+        with self.assertLogs("root", level="WARNING") as logs:
+            self.reaper.sweep(now=2000.0)
+
+        text = "\n".join(logs.output)
+        self.assertIn("对账回收孤儿卷", text)
+        self.assertIn("vol-d1", text)
+        self.assertIn("job-1", text)
+        # 必须是回收"之前"的阶段与静默时长，否则日志等于没记。
+        self.assertIn("phase=copying", text)
+        self.assertIn("静默 1000s", text)
+
     def test_cleanup_failure_is_retried_after_short_interval(self):
         record = self._record(phase="cleanup_failed", updated_at=1000.0)
         self.ledger.all.return_value = [record]

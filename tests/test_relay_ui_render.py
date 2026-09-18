@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import app as app_module
 from state_machine import MigrationMode, VolumeTask
@@ -295,6 +296,44 @@ class RelayPageRenderTest(unittest.TestCase):
         response = self.client.post("/api/jobs/no-such-job/relay/reconcile")
 
         self.assertEqual(response.status_code, 404)
+
+    def test_relay_reconcile_refuses_while_job_is_running(self):
+        """运行中的作业不能手工对账：会删掉正在拷贝的派生卷/目标卷。
+
+        删掉之后轮到挂载时 Nova 直接 404 Volume ... could not be found，
+        看起来就像"云上凭空少了一块盘"。
+        """
+        runtime = mock.MagicMock()
+        running = mock.MagicMock(status=app_module.JobStatus.RUNNING)
+        with mock.patch.object(app_module, "get_runtime", return_value=runtime), \
+                mock.patch.object(app_module.job_manager, "get", return_value=running):
+            response = app_module.app.test_client().post(
+                "/api/jobs/job-1/relay/reconcile"
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("仍在运行", response.get_json()["error"])
+        runtime.reaper.reconcile_job.assert_not_called()
+
+    def test_relay_reconcile_runs_after_job_finished(self):
+        runtime = mock.MagicMock()
+        runtime.reaper.reconcile_job.return_value = ["job-1:vol-s1"]
+        finished = mock.MagicMock(status=app_module.JobStatus.COMPLETED)
+        with mock.patch.object(app_module, "get_runtime", return_value=runtime), \
+                mock.patch.object(app_module.job_manager, "get", return_value=finished):
+            response = app_module.app.test_client().post(
+                "/api/jobs/job-1/relay/reconcile"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["cleaned"], ["job-1:vol-s1"])
+
+    def test_reconcile_button_is_disabled_while_job_runs(self):
+        """页面上也要拦住：运行中禁用按钮并写明原因。"""
+        html = self._html()
+
+        self.assertIn("reconcileBtn.disabled = running", html)
+        self.assertIn("对账会删掉正在拷贝的卷", html)
 
     def test_theme_defaults_to_light_with_dark_override(self):
         """默认浅色主题，深色仅作为覆盖层，两套调色板都要存在。"""

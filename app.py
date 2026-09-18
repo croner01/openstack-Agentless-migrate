@@ -1388,9 +1388,26 @@ def api_job_relay(job_id: str):
 
 @app.post("/api/jobs/<job_id>/relay/reconcile")
 def api_job_relay_reconcile(job_id: str):
+    """手工对账：只回收"没人认领"的残留，运行中的卷由任务自己清理。
+
+    运行中的作业绝不能对账：该作业的派生卷/目标卷正在被拷贝线程使用，
+    回收会把卷删掉，轮到挂载时就变成 404 Volume ... could not be found。
+    """
     runtime = get_runtime(job_id)
     if runtime is None:
         return jsonify({"ok": False, "error": "该任务没有中转机运行时"}), 404
+    job = job_manager.get(job_id)
+    if job is not None and job.status == JobStatus.RUNNING:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "任务仍在运行：运行中的卷由任务自己回收，"
+                    "此时对账会删掉正在拷贝的卷。请等任务结束后再对账。",
+                }
+            ),
+            409,
+        )
     cleaned = runtime.reaper.reconcile_job(job_id)
     return jsonify({"ok": True, "cleaned": cleaned})
 

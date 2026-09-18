@@ -456,6 +456,10 @@ class RelayRuntime:
                 float(config.result_timeout or 0.0),
                 RELAY_REAPER_MIN_STALE_SECONDS,
             ),
+            # 对账只回收"没有活作业认领"的残留：本进程里还在跑的作业，它的
+            # 卷就算几小时不刷新 updated_at 也归它自己的线程收拾，绝不能被
+            # 巡检当孤儿删掉（否则后续挂载会 404 Volume not found）。
+            active_jobs=lambda: set(_RUNTIMES),
         )
 
     def _token(self, job_id: str, role: str) -> str:

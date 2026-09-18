@@ -633,6 +633,36 @@ class RelayOptionsFromFormTest(unittest.TestCase):
         self.assertIsNone(parse_relay_options(options))
 
 
+class ReaperActiveJobsWiringTest(unittest.TestCase):
+    """对账必须知道哪些作业还在跑，否则会删掉在途卷。"""
+
+    def test_reaper_knows_registered_jobs(self):
+        config = mock.MagicMock()
+        config.platform_url = "https://platform.example.com"
+        config.token_ttl = 3600
+        config.source = PoolConfig(size=1, image="i", flavor="f", az="az1", network="n")
+        config.target = PoolConfig(size=1, image="i", flavor="f", az="az2", network="n")
+        config.rate_limit_bytes_per_sec = 0.0
+        config.chunk_size = 4 * 1024 * 1024
+        config.ready_timeout = 5.0
+        config.result_timeout = 0.0
+        runtime = RelayRuntime(
+            config=config,
+            source_os=mock.MagicMock(),
+            target_os=mock.MagicMock(),
+            state=mock.MagicMock(),
+            ledger=mock.MagicMock(),
+            job_id="job-live",
+        )
+        register_runtime("job-live", runtime)
+        try:
+            self.assertIn("job-live", runtime.reaper._live_jobs())
+        finally:
+            drop_runtime("job-live")
+
+        self.assertNotIn("job-live", runtime.reaper._live_jobs())
+
+
 class RuntimeRegistryTest(unittest.TestCase):
     def test_register_get_and_drop(self):
         runtime = mock.MagicMock()

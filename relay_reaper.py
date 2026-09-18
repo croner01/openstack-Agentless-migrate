@@ -35,12 +35,30 @@ class RelayReaper:
         pools: dict[str, Any],
         stale_seconds: float = 600.0,
         now: Callable[[], float] = time.time,
+        active_jobs: Callable[[], set[str]] | None = None,
     ):
         self.ledger = ledger
         self.lifecycle = lifecycle
         self.pools = pools
         self.stale_seconds = stale_seconds
         self._now = now
+        #: 本进程里仍在跑的作业 id 提供者；None 表示调用方不做"活作业"保护
+        #: （仅老测试/单次脚本会这样传）。
+        self.active_jobs = active_jobs
+
+    def _live_jobs(self) -> set[str] | None:
+        """正在运行的作业 id；返回 None 表示判断不了，此时本轮不清理任何东西。
+
+        删掉一个正在被拷贝的派生卷的代价远大于多留一小时孤儿卷，所以读不出
+        活跃作业列表时宁可什么都不删。
+        """
+        if self.active_jobs is None:
+            return set()
+        try:
+            return {str(item) for item in (self.active_jobs() or ())}
+        except Exception:  # noqa: BLE001 - 判断不了就不清理
+            logging.exception("[MIGRATION] 读取活跃作业失败，本轮对账跳过")
+            return None
 
     def sweep(
         self,
@@ -54,9 +72,18 @@ class RelayReaper:
         去清理 B 云遗留的资源。
         """
         current = self._now() if now is None else now
+        live_jobs = self._live_jobs()
+        if live_jobs is None:
+            return []
         cleaned: list[str] = []
         for record in list(self.ledger.all()):
             if record.phase in TERMINAL_PHASES:
+                continue
+            # 作业还在跑：它自己的线程负责回收，对账只清"没人认领"的残留。
+            # updated_at 只在阶段切换/进度上报时刷新，而"已派生但排在队里等
+            # 传输"的卷可能几小时不刷新（同一 VM 的盘是串行传的），按时间判
+            # 残留会把正在用的派生卷删掉，轮到它挂载时就 404 Volume not found。
+            if record.job_id in live_jobs:
                 continue
             if cloud_filter is not None and (
                 record.source_cloud != cloud_filter[0]
@@ -71,11 +98,28 @@ class RelayReaper:
             )
             if current - float(record.updated_at or 0.0) < stale_limit:
                 continue
+            # 先记下回收前的阶段与静默时长：下面会覆盖 phase/updated_at，
+            # 覆盖后再打日志就变成"phase=cleaned 静默 0s"，等于没记。
+            stale_phase = record.phase
+            silent_seconds = max(current - float(record.updated_at or 0.0), 0.0)
             ok = self._cleanup(record)
             record.phase = "cleaned" if ok else CLEANUP_FAILED_PHASE
             record.updated_at = current
             self.ledger.upsert(record)
             if ok:
+                # 明确记录"谁删了哪个卷"：否则云上少了一块盘只能靠猜。
+                logging.warning(
+                    "[MIGRATION] 对账回收孤儿卷 job=%s vm=%s volume=%s phase=%s "
+                    "derived=%s snapshot=%s target=%s 静默 %.0fs",
+                    record.job_id,
+                    record.vm_id,
+                    record.volume_id,
+                    stale_phase,
+                    record.derived_volume_id or "-",
+                    record.snapshot_id or "-",
+                    record.target_volume_id or "-",
+                    silent_seconds,
+                )
                 cleaned.append(record.key)
         if cleaned:
             self.ledger.save()
