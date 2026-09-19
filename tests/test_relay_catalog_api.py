@@ -6,11 +6,24 @@ from relay_catalog import build_catalog, preflight
 from relay_runtime import PoolConfig, RelayChannelConfig
 
 
-def _named(identifier: str, name: str, *, external: bool = False) -> mock.Mock:
+def _named(
+    identifier: str,
+    name: str,
+    *,
+    external: bool = False,
+    vcpus: int = 0,
+    ram: int = 0,
+    disk: int = 0,
+) -> mock.Mock:
     """Mock 的 name 是保留参数，必须构造后再赋值。"""
     item = mock.Mock(id=identifier)
     item.name = name
     item.is_router_external = external
+    # flavor 的规格字段显式赋值：不加的话 getattr 会拿到自动生成的 Mock，
+    # 目录里就没法算出中转机的 vCPU/内存占用量。
+    item.vcpus = vcpus
+    item.ram = ram
+    item.disk = disk
     return item
 
 
@@ -79,7 +92,8 @@ class BuildCatalogTest(unittest.TestCase):
             catalog["source"]["images"], [{"id": "img-s", "name": "web"}]
         )
         self.assertEqual(
-            catalog["target"]["flavors"], [{"id": "flv-t", "name": "m1"}]
+            catalog["target"]["flavors"],
+            [{"id": "flv-t", "name": "m1", "vcpus": 0, "ram": 0, "disk": 0}],
         )
         self.assertEqual(
             catalog["source"]["networks"], [{"id": "net-s", "name": "s"}]

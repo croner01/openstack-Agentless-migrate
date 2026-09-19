@@ -737,3 +737,87 @@ class AttachVolumeFailureTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SourceServerDiskFactsTest(unittest.TestCase):
+    """批量筛选要按"盘数/容量"过滤，清单里必须带这两项。"""
+
+    def _utils(self, volumes):
+        conn = mock.Mock()
+        conn.compute.servers.return_value = [
+            FakeSourceServer("srv-1", "web-1", "ACTIVE", "az1", image_id="image-1")
+        ]
+        conn.compute.flavors.return_value = [FakeSourceFlavor()]
+        conn.image.images.return_value = [
+            SimpleNamespace(id="image-1", name="cirros")
+        ]
+        conn.block_storage.volumes.return_value = volumes
+        return OpenStackUtils(conn=conn), conn
+
+    def test_volume_count_and_capacity_are_reported(self):
+        utils, _conn = self._utils([
+            _AttachedVolume("srv-1", 20),
+            _AttachedVolume("srv-1", 100),
+            _AttachedVolume("srv-other", 50),
+        ])
+
+        summary = utils.list_source_servers()[0]
+
+        self.assertEqual(summary["volume_count"], 2)
+        self.assertEqual(summary["volume_gb"], 120)
+
+    def test_volume_list_failure_does_not_break_the_picker(self):
+        utils, conn = self._utils([])
+        conn.block_storage.volumes.side_effect = RuntimeError("cinder down")
+
+        summary = utils.list_source_servers()[0]
+
+        self.assertEqual(summary["volume_count"], 0)
+        self.assertEqual(summary["volume_gb"], 0)
+
+    def test_bundle_fetches_all_pages_and_reports_cursor(self):
+        conn = mock.Mock()
+        page_one = [FakeSourceServer(f"srv-{i}", f"vm-{i}", "ACTIVE", "az1")
+                    for i in range(2)]
+        page_two = [FakeSourceServer("srv-9", "vm-9", "ACTIVE", "az1")]
+        conn.compute.servers.side_effect = [page_one, page_two]
+        conn.compute.flavors.return_value = [FakeSourceFlavor()]
+        conn.image.images.return_value = [
+            SimpleNamespace(id="image-1", name="cirros")
+        ]
+        conn.block_storage.volumes.return_value = []
+        utils = OpenStackUtils(conn=conn)
+
+        bundle = utils.list_source_servers_bundle(limit=2, fetch_all=True)
+
+        self.assertEqual(len(bundle["servers"]), 3)
+        self.assertIsNone(bundle["next_marker"])
+        self.assertEqual(conn.compute.servers.call_count, 2)
+
+    def test_bundle_caps_results_and_keeps_cursor_for_continuation(self):
+        conn = mock.Mock()
+        conn.compute.servers.return_value = [
+            FakeSourceServer(f"srv-{i}", f"vm-{i}", "ACTIVE", "az1")
+            for i in range(3)
+        ]
+        conn.compute.flavors.return_value = [FakeSourceFlavor()]
+        conn.image.images.return_value = [
+            SimpleNamespace(id="image-1", name="cirros")
+        ]
+        conn.block_storage.volumes.return_value = []
+        utils = OpenStackUtils(conn=conn)
+
+        bundle = utils.list_source_servers_bundle(limit=3, fetch_all=True, max_results=3)
+
+        self.assertEqual(len(bundle["servers"]), 3)
+        # 上限截断时游标必须留着，页面才能继续加载剩下的 VM。
+        self.assertEqual(bundle["next_marker"], "srv-2")
+
+
+class _AttachedVolume:
+    def __init__(self, server_id, size):
+        self._server_id = server_id
+        self._size = size
+
+    def to_dict(self):
+        return {"size": self._size, "attachments": [{"server_id": self._server_id}]}

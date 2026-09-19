@@ -1,3 +1,4 @@
+import io
 import json
 import hmac
 import logging
@@ -11,7 +12,7 @@ from logging.handlers import RotatingFileHandler
 from typing import Any
 
 import pandas as pd
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_file
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from ceph_utils import (
@@ -27,11 +28,18 @@ from ceph_utils import (
 from config import LOG_FILE, UPLOAD_FOLDER, default_vm_pass
 from env_utils import env_float, env_int, env_str
 from environment_profiles import EnvironmentProfile, EnvironmentProfileStore
-from excel_parser import parse_mode, parse_rows, parse_selected_rows, parse_start_target
+from excel_parser import (
+    parse_mode,
+    parse_rows,
+    parse_rows_tolerant,
+    parse_selected_rows,
+    parse_start_target,
+)
 from graceful_shutdown import ShutdownCoordinator
 from job_manager import JobManager
 from json_store import atomic_write_json
 from migration_manager import MigrationManager
+from migration_policies import MigrationPolicyStore
 from migration_planner import override_key
 from openstack_utils import OpenStackUtils
 from relay_admin_api import create_admin_blueprint
@@ -195,6 +203,32 @@ app.register_blueprint(create_admin_blueprint(layer=RELAY_RESOURCES))
 
 # 环境档案：与中转机共用主密钥，缺省自动生成并落盘，不新增必填环境变量。
 ENV_PROFILE_PATH = os.path.join(UPLOAD_FOLDER, "environment-profiles.json")
+
+# 迁移策略模板（参数快照 + 规则映射）：不存凭据，明文 JSON 即可。
+MIGRATION_POLICY_PATH = os.path.join(UPLOAD_FOLDER, "migration-policies.json")
+
+#: 「一次拉全量清单」的上限：再大就退回 marker 分页，避免单请求把内存吃满。
+SOURCE_VM_ALL_LIMIT = env_int("MIGRATION_SOURCE_VM_ALL_LIMIT", 2000, minimum=1)
+
+
+def _migration_policy_store() -> MigrationPolicyStore:
+    return MigrationPolicyStore.load(MIGRATION_POLICY_PATH)
+
+
+def busy_source_vm_names() -> set[str]:
+    """仍在运行/等待中的作业已经占用的源 VM 名，用于清单里提示"已在迁移中"。"""
+    names: set[str] = set()
+    try:
+        jobs = job_manager.list_jobs(limit=100)
+    except Exception:  # noqa: BLE001 - 只是提示信息，读不到就不标
+        return names
+    for job in jobs:
+        if job.status != JobStatus.RUNNING:
+            continue
+        for vm in job.vms:
+            if vm.name:
+                names.add(vm.name)
+    return names
 
 
 def _environment_profile_sealer() -> Sealer:
@@ -1498,22 +1532,34 @@ def index():
 
 @app.post("/api/preview")
 def api_preview():
-    """Parse an uploaded Excel into rows for the frontend preview table."""
+    """解析 Excel 成预览行；坏行只报行号不整份失败。
+
+    批量清单里一行写错就整份提交不了，用户得反复试；这里改成"能用的行照常
+    返回 + errors 列出问题行"，页面上按行号改完再提交。
+    """
     try:
         excel_file = request.files.get("excel_file")
         if not excel_file:
             raise ValueError("缺少 excel_file")
         frame = pd.read_excel(excel_file)
-        rows = parse_rows(frame.to_dict(orient="records"))
+        rows, errors = parse_rows_tolerant(frame.to_dict(orient="records"))
         return jsonify(
             {
                 "ok": True,
+                "errors": errors,
                 "rows": [
                     {
                         "vm_name": row.vm_name,
                         "target_az": row.target_az,
                         "target_image": row.target_image,
                         "target_flavor": row.target_flavor,
+                        "mode": row.mode,
+                        "start_target": row.start_target,
+                        "channel": row.channel,
+                        "target_network": row.target_network,
+                        "target_volume_type": row.target_volume_type,
+                        "rate_limit_mb_s": row.rate_limit_mb_s,
+                        "row_number": row.row_number,
                     }
                     for row in rows
                 ],
@@ -1521,6 +1567,55 @@ def api_preview():
         )
     except Exception as exc:  # noqa: BLE001
         logging.exception("[MIGRATION] Excel 预览失败")
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+#: Excel 模板列与示例行：列名必须与 excel_parser 的字段名一致。
+EXCEL_TEMPLATE_COLUMNS = [
+    "vm_name",
+    "target_az",
+    "target_image",
+    "target_flavor",
+    "mode",
+    "start_target",
+    "channel",
+    "target_network",
+    "target_volume_type",
+    "rate_limit_mb_s",
+]
+EXCEL_TEMPLATE_EXAMPLE = {
+    "vm_name": "web-01",
+    "target_az": "az1",
+    "target_image": "（留空按源镜像匹配）",
+    "target_flavor": "（留空自动匹配）",
+    "mode": "full",
+    "start_target": "是",
+    "channel": "relay",
+    "target_network": "（留空按源网段自动映射）",
+    "target_volume_type": "（留空用作业默认）",
+    "rate_limit_mb_s": 0,
+}
+
+
+@app.get("/api/excel-template")
+def api_excel_template():
+    """下载批量迁移清单模板（含一行示例），避免用户猜列名。"""
+    try:
+        frame = pd.DataFrame([EXCEL_TEMPLATE_EXAMPLE], columns=EXCEL_TEMPLATE_COLUMNS)
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            frame.to_excel(writer, index=False, sheet_name="migration")
+        buffer.seek(0)
+        return send_file(
+            buffer,
+            mimetype=(
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ),
+            as_attachment=True,
+            download_name="migration-list-template.xlsx",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("[MIGRATION] 生成 Excel 模板失败")
         return jsonify({"ok": False, "error": str(exc)}), 400
 
 
@@ -1881,6 +1976,41 @@ def api_vm_disk_retry(job_id: str, vm_name: str):
             409,
         )
     return jsonify({"ok": True})
+
+
+@app.post("/api/jobs/<job_id>/relay/disks/retry-all")
+def api_relay_disk_retry_all(job_id: str):
+    """一键重试本作业所有"等待失败盘重试"的 VM。
+
+    大批量作业里几十台 VM 各自散在「中转机通道」页签，逐台点重试太慢；
+    这里按 VM 维度把它们的全部失败盘排队，返回实际受理/跳过的清单。
+    只影响已经在等待重试的 VM，不会去动正在拷贝或已结束的盘。
+    """
+    job = job_manager.get(job_id)
+    if job is None:
+        return jsonify({"ok": False, "error": "job 不存在"}), 404
+    requested: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    for vm in job.vms:
+        failed = [
+            str(disk.get("volume_id") or "")
+            for disk in vm.relay_disks or []
+            if disk.get("status") == "failed" and str(disk.get("volume_id") or "")
+        ]
+        if not failed:
+            continue
+        if job_manager.request_disk_retry(job_id, vm.name, failed):
+            requested.append({"vm": vm.name, "volume_ids": failed})
+        else:
+            skipped.append(
+                {
+                    "vm": vm.name,
+                    "reason": "当前不在等待失败盘重试（可能正在重试或已结束）",
+                }
+            )
+    if not requested and not skipped:
+        return jsonify({"ok": True, "requested": [], "skipped": [], "message": "没有失败盘需要重试"})
+    return jsonify({"ok": True, "requested": requested, "skipped": skipped})
 
 
 @app.post("/api/jobs/<job_id>/vms/<vm_name>/disks/release")
@@ -2396,7 +2526,12 @@ def api_catalog():
 
 @app.post("/api/source-vms")
 def api_source_vms():
-    """List source-project VMs for the checklist picker."""
+    """List source-project VMs for the checklist picker.
+
+    批量迁移要一次拿全项目清单（前端"加载更多"点几十次太慢）：``all=true``
+    时内部按 marker 翻页，最多 ``SOURCE_VM_ALL_LIMIT`` 台，返回的
+    ``next_marker`` 非空表示还有剩余，可以继续加载。
+    """
     try:
         payload = request.get_json(force=True)
         auth_args, profile_error = _auth_args_from_request_payload(payload)
@@ -2409,21 +2544,68 @@ def api_source_vms():
         except (TypeError, ValueError):
             limit = 100
         marker = str(payload.get("marker") or "").strip() or None
-        servers = source_os.list_source_servers(
+        fetch_all = bool(payload.get("all"))
+        bundle = source_os.list_source_servers_bundle(
             search=search,
             limit=limit,
             marker=marker,
+            fetch_all=fetch_all,
+            max_results=SOURCE_VM_ALL_LIMIT if fetch_all else 0,
         )
-        next_marker = servers[-1]["server_id"] if len(servers) == limit else None
+        servers = bundle["servers"]
+        busy = busy_source_vm_names()
+        for item in servers:
+            item["busy_in_job"] = item.get("name") in busy
         return jsonify(
             {
                 "ok": True,
                 "servers": servers,
-                "next_marker": next_marker,
+                "next_marker": bundle["next_marker"],
+                "busy_names": sorted(busy),
             }
         )
     except Exception as exc:  # noqa: BLE001
         logging.exception("[MIGRATION] 查询源 VM 列表失败")
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@app.get("/api/policies")
+def api_policies_list():
+    """迁移策略模板列表（参数快照 + 规则映射，不含任何凭据）。"""
+    try:
+        return jsonify(
+            {"ok": True, "policies": _migration_policy_store().list_public()}
+        )
+    except Exception as exc:  # noqa: BLE001 - 读失败不该 500 暴露堆栈
+        logging.exception("[MIGRATION] 迁移策略列表失败")
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@app.post("/api/policies")
+def api_policies_save():
+    payload = request.get_json(silent=True) or {}
+    try:
+        store = _migration_policy_store()
+        policy = store.save(payload)
+        store.flush()
+        return jsonify({"ok": True, "policy": MigrationPolicyStore._public(policy)})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("[MIGRATION] 迁移策略保存失败")
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@app.delete("/api/policies/<policy_id>")
+def api_policies_delete(policy_id: str):
+    try:
+        store = _migration_policy_store()
+        if not store.delete(policy_id):
+            return jsonify({"ok": False, "error": "策略不存在"}), 404
+        store.flush()
+        return jsonify({"ok": True})
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("[MIGRATION] 迁移策略删除失败")
         return jsonify({"ok": False, "error": str(exc)}), 400
 
 

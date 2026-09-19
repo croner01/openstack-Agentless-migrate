@@ -219,6 +219,7 @@ def execute_task(
                 length=length,
                 chunk_size=chunk_size,
                 rate_limit_bytes_per_sec=task.get("rate_limit_bytes_per_sec") or None,
+                rate_schedule=task.get("rate_schedule") or None,
                 progress_cb=progress,
                 is_cancelled=lambda: cancel_flag["requested"],
                 skip_zero=sparse,

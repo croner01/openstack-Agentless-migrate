@@ -8,6 +8,13 @@ from migration_planner import ip_belongs_to_subnet
 
 
 def _resources(os_utils: Any) -> dict[str, Any]:
+    def as_int(value: Any) -> int:
+        """目录里的数值字段容错：取不到/不是数字一律按 0，别让整段目录失败。"""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
     result: dict[str, Any] = {
         "images": [],
         "flavors": [],
@@ -39,6 +46,9 @@ def _resources(os_utils: Any) -> dict[str, Any]:
             {
                 "id": str(flavor.id),
                 "name": str(getattr(flavor, "name", "") or flavor.id),
+                "vcpus": as_int(getattr(flavor, "vcpus", 0)),
+                "ram": as_int(getattr(flavor, "ram", 0)),
+                "disk": as_int(getattr(flavor, "disk", 0)),
             }
             for flavor in os_utils.list_flavors()
         ],
@@ -103,6 +113,107 @@ def _quota_warnings(config: Any, source_os: Any, target_os: Any) -> list[str]:
                 f"{side}卷类型 {pool.volume_type} 的配额为 0（{key}），建卷会被拒绝，"
                 "请换一个卷类型或请管理员调整配额。"
             )
+    return warnings
+
+
+def _flavor_facts(section: dict[str, Any], value: str) -> dict[str, int]:
+    """按名称/ID 找 flavor 的 vCPU/RAM；找不到返回空。"""
+    for flavor in section.get("flavors") or []:
+        if value in (flavor.get("id"), flavor.get("name")):
+            return {
+                "vcpus": int(flavor.get("vcpus", 0) or 0),
+                "ram": int(flavor.get("ram", 0) or 0),
+            }
+    return {}
+
+
+def _remaining(limits: dict[str, int], max_key: str, used_key: str) -> int | None:
+    if max_key not in limits or used_key not in limits:
+        return None
+    return int(limits[max_key]) - int(limits[used_key])
+
+
+def _capacity_warnings(
+    config: Any, catalog: dict[str, Any], source_os: Any, target_os: Any
+) -> list[str]:
+    """建机容量预检：建 2×并发 台前先核对 vCPU/RAM/实例数/端口/浮动 IP 配额。
+
+    读不到配额时给"请自行确认"的提示，而不是静默通过——中转机建到一半撞
+    QuotaExceeded 会把已经建好的机器和设备一起回滚，代价比提前提示大得多。
+    """
+    warnings: list[str] = []
+    mode = str(getattr(config, "node_mode", "ephemeral") or "ephemeral")
+    plan = {"源端": config.source, "目标端": config.target}
+    total = sum(int(getattr(pool, "size", 0) or 0) for pool in plan.values())
+    if total:
+        warnings.append(
+            f"容量口径：本次将创建 {total} 台中转机（"
+            + " + ".join(
+                f"{side} {int(getattr(pool, 'size', 0) or 0)} 台"
+                for side, pool in plan.items()
+            )
+            + ("，临时池已按「传输并发」扩池" if mode == "ephemeral" else "，常驻池按需扩缩容")
+            + "）。"
+        )
+    for side, os_utils, pool in (
+        ("源端", source_os, config.source),
+        ("目标端", target_os, config.target),
+    ):
+        size = int(getattr(pool, "size", 0) or 0)
+        if size <= 0:
+            continue
+        facts = _flavor_facts(catalog["source" if side == "源端" else "target"], pool.flavor)
+        need_cores = size * int(facts.get("vcpus", 0) or 0)
+        need_ram = size * int(facts.get("ram", 0) or 0)
+        try:
+            limits = os_utils.get_compute_limits() or {}
+        except Exception:  # noqa: BLE001 - 配额读失败不阻断预检
+            limits = {}
+        if not isinstance(limits, dict) or not limits:
+            warnings.append(
+                f"{side}读不到计算配额，无法确认能否建 {size} 台 flavor={pool.flavor} 的中转机"
+                f"（需要 {need_cores} vCPU / {need_ram} MB 内存），请先确认实例/核数/内存配额。"
+            )
+        else:
+            shortfalls: list[str] = []
+            remain_instances = _remaining(limits, "maxTotalInstances", "totalInstancesUsed")
+            if remain_instances is not None and remain_instances < size:
+                shortfalls.append(f"实例数剩余 {remain_instances} < {size}")
+            remain_cores = _remaining(limits, "maxTotalCores", "totalCoresUsed")
+            if remain_cores is not None and remain_cores < need_cores:
+                shortfalls.append(f"vCPU 剩余 {remain_cores} < {need_cores}")
+            remain_ram = _remaining(limits, "maxTotalRAMSize", "totalRAMUsed")
+            if remain_ram is not None and remain_ram < need_ram:
+                shortfalls.append(f"内存剩余 {remain_ram}MB < {need_ram}MB")
+            if shortfalls:
+                warnings.append(
+                    f"{side}计算配额可能不足（{ '；'.join(shortfalls) }）："
+                    f"建 {size} 台 flavor={pool.flavor} 会失败，请下调「传输并发」/池大小或申请配额。"
+                )
+        if not getattr(pool, "port_ids", None):
+            try:
+                net_limits = os_utils.get_network_quota() or {}
+            except Exception:  # noqa: BLE001
+                net_limits = {}
+            if isinstance(net_limits, dict) and net_limits:
+                port_limit = net_limits.get("port")
+                if port_limit is not None and int(port_limit) < size:
+                    warnings.append(
+                        f"{side}网络端口配额（{port_limit}）小于中转机台数 {size}，"
+                        "建端口会失败，请申请配额或改用常驻池。"
+                    )
+        fip_network = str(getattr(pool, "data_floating_network", "") or "")
+        if fip_network:
+            try:
+                net_limits = os_utils.get_network_quota() or {}
+            except Exception:  # noqa: BLE001
+                net_limits = {}
+            fip_limit = net_limits.get("floatingip") if isinstance(net_limits, dict) else None
+            if fip_limit is not None and int(fip_limit) < size:
+                warnings.append(
+                    f"{side}浮动 IP 配额（{fip_limit}）小于中转机台数 {size}，"
+                    "数据面绑 FIP 会失败，请申请配额。"
+                )
     return warnings
 
 
@@ -186,6 +297,7 @@ def preflight(config: Any, source_os: Any, target_os: Any) -> dict[str, Any]:
                     "仅当需要反向连通（诊断/回连）时才配置。"
                 )
     warnings.extend(_quota_warnings(config, source_os, target_os))
+    warnings.extend(_capacity_warnings(config, catalog, source_os, target_os))
     warnings.append(
         "无法自动校验源端 Cinder 驱动是否支持对 in-use 卷打快照，"
         "请确认后再执行；不支持时预检通过的配置仍会在拷贝阶段失败。"

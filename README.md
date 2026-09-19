@@ -4,9 +4,11 @@
 
 在目标 OpenStack 云创建 BFV（Boot From Volume）VM：
 
-1. 直接从源项目加载 VM 列表勾选，或通过高级入口解析 Excel
-   （`vm_name`、`target_az` 必填；`target_image`、`target_flavor`、
-   `start_target` 可选）；
+1. 直接从源项目加载 VM 列表勾选（支持一次拉全量 + AZ/状态/规格/镜像/盘数/
+   通配符多维筛选，见「批量迁移」），或通过高级入口解析 Excel
+   （`vm_name`、`target_az` 必填；`target_image`、`target_flavor`、`mode`、
+   `start_target`/`power_on`、`channel`、`target_network`、
+   `target_volume_type`、`rate_limit_mb_s` 可选，模板可下载）；
 2. 创建目标端口与数据卷，使用指定目标镜像创建 BFV VM；
 3. 依次停止目标 VM 与源 VM；
 4. 从源 Ceph 集群逐卷导出并导入到目标 BFV VM 的实际 RBD 卷；
@@ -391,7 +393,104 @@ Cinder 卷状态始终是 `available`，平台无从察觉，干等约 25 分钟
 模式）、作业表单「挂载超时 (秒)」= `relay_attach_ready_timeout`、
 `MIGRATION_ATTACH_READY_TIMEOUT`（默认 600）、
 `MIGRATION_RELAY_MAX_POOL_SIZE`（ephemeral 自动扩池硬上限，默认 16）。
+批量迁移相关：`MIGRATION_SOURCE_VM_ALL_LIMIT`（「一次拉全量」上限，默认 2000）、
+`MIGRATION_RELAY_EAGER_POOL=1`（回到"开工即按并发全量建机"，默认按需扩池）。
 「中转机配置」页签文案与上述超时说明已同步更新。
+
+## 批量迁移（清单、策略模板、规则映射）
+
+大批量迁移的痛点是"选 VM"和"选参数"要重复点很多次。这一节的能力都落在
+新建迁移向导第③/④步，与既有的逐台覆盖并存。
+
+### 清单：一次拉全量 + 多维筛选
+
+- 第③步新增「⇩ 一次拉全量」：服务端按 marker 翻页把整个源项目取回来
+  （上限 `MIGRATION_SOURCE_VM_ALL_LIMIT`，默认 2000 台；超过上限时返回的
+  `next_marker` 非空，可继续加载），不必一页页点「加载更多」；
+  接口 `POST /api/source-vms` 新增 `all` 参数，响应里还会带
+  `busy_names`（正在运行的作业已占用的 VM 名）。
+- 清单每行给出**盘数/容量**（`volume_count` / `volume_gb`，由项目卷列表汇总，
+  取不到时为 0，不影响清单可用），并支持按 **AZ / 电源状态 / 规格 / 镜像 /
+  盘数 / 名称（可勾「通配符」用 `*`、`?`）/ 是否已在迁移中** 组合筛选；
+  计数显示"匹配 X / 已加载 N（源项目还有更多）"。
+- 勾选作用于**当前筛选结果**（`勾选当前筛选结果` / `清空勾选`），批量勾选先同步
+  建行、再统一拉一次网卡信息，不再几百台逐台 `await`；清单本身渐进渲染
+  （先 300 行，`显示更多` 继续），几千台也不会把页面卡死。
+- 已在其它运行中作业里的 VM 会带「迁移中」标记（Excel 行按名称匹配），
+  可用「隐藏迁移中」过滤，避免同一个 VM 被两个作业同时迁移。
+
+### 迁移策略模板与规则映射
+
+- 「迁移策略模板」把一整套作业级参数（并发、限速、超时、中转机池、通道…）
+  命名保存，下次一键套用；接口 `GET/POST /api/policies`、
+  `DELETE /api/policies/<id>`，落盘 `uploads/migration-policies.json`（0600）。
+- 只保存 `migration_policies.POLICY_PARAM_FIELDS` 白名单里的字段：**口令、
+  令牌、Ceph conf 一律不入库**（有单测校验前后端字段名一致、且白名单不含
+  `password`/`token`/`ceph_conf`）。
+- 规则映射（跟着策略一起存）：按源 **名称正则 / AZ / 状态 / 镜像 / 规格 /
+  最少盘数** 匹配，命中后批量改 **目标 AZ / 镜像 / 规格 / 网络 / 通道**。
+  「预览命中」只报台数不改清单，「应用到清单」才落库；第一条命中的规则生效，
+  同一 VM 后续规则不再覆盖。目标网络只给到"网络"这一级，落到每台 VM 的
+  网卡覆盖上（能对上目录时预选，仍可逐网卡改）。
+- 清单里的「通道」列会转成逐台 `data_channel`（后端 `vm_channel` 优先读逐台覆盖）。
+
+### 计划预览与容量口径
+
+提交前的「迁移计划预览」按当前表单给出台数、通道分布、**峰值并发盘数
+（同时迁移 VM 数 × 每台卷并发）**、以及中转机会建多少台：
+
+- 临时池（ephemeral）**不再开工即按并发全量建机**：先建表单配置的台数
+  （`relay_source_size`/`relay_target_size`），用满后由 `RelayPool.acquire`
+  **按需扩一台**，直到扩到"生效传输并发"（硬上限 `MIGRATION_RELAY_MAX_POOL_SIZE`，
+  默认 16）。想回到旧行为（开工全建）设 `MIGRATION_RELAY_EAGER_POOL=1`。
+- 预览里给出的是**上限口径**：源端/目标端各按需扩到并发上限，即最多
+  `2 × 并发` 台；这个上限决定需要预留的实例/vCPU/内存/端口配额。
+- 配额预检（`POST /api/relay/preflight`）除了原有的卷类型配额，新增
+  **计算配额（实例数 / vCPU / 内存）与网络配额（端口 / 浮动 IP）**核对
+  （`get_compute_limits` / `get_network_quota`，读不到时明确提示"请自行确认"），
+  并输出"本次将创建 N 台"的容量口径行。
+
+### 排队可视化与批量重试
+
+- 「中转机通道」页签新增 **等待中转机槽位（排队中）** 表：卷、侧（源/目标）、
+  FIFO **位置**、已等待、等待上限、原因（`relay_orchestrator.slot_wait_snapshot`
+  经 `/api/jobs/<id>/relay` 的 `slot_waits` 暴露），池满时不用去翻日志。
+- 新增 **「↻ 重试全部失败盘」**：`POST /api/jobs/<id>/relay/disks/retry-all`
+  把所有处于 `awaiting_disk_retry` 的 VM 一次性排队（已不在等待重试的 VM 会被
+  跳过并在响应里列出）。注意它会**覆盖**该 VM 上一次已排队的选择（等价于
+  "重试这块 VM 的全部失败盘"）。
+- 页签顶部新增 **作业进度报表**：VM 完成/失败/待人工重试台数、云盘完成度、
+  进行中与排队盘数、中转机忙碌/建机中台数、实时吞吐汇总。
+
+### 最近 Excel 清单增强
+
+- 新增可选列：`channel`（`rbd`/直连、`relay`/中转机）、`target_network`、
+  `target_volume_type`、`rate_limit_mb_s`、`power_on`（`start_target` 的别名，
+  两个都填时 `start_target` 优先）。
+- `GET /api/excel-template` 直接下载带示例行的清单模板（列名与解析器同源），
+  不用猜表头。
+- `POST /api/preview` 改成**逐行容错**：坏行只报行号与原因（`errors`），
+  能解析的行照常进入规划，页面顶部列出前 8 条问题行，改完再解析一次即可；
+  重复的 `vm_name` 也会被标出来。预览响应不再丢 `mode`/`start_target`，
+  并带回 `channel`/`target_network`/`target_volume_type`/`rate_limit_mb_s`。
+
+### 时段限速
+
+- 中转机表单新增 **低谷限速时段**（`offpeak_window`，如 `22:00-06:00`，
+  可加 `@+08:00` 指定时区偏移；不写按平台本地时区）与
+  **低谷时段限速**（`offpeak_rate_limit_mb_s`，MiB/s，0/留空 = 低谷不限速）。
+- 平台按**绝对时刻**算出未来 48 小时的切换表（`relay_transfer.rate_schedule`）
+  随任务下发给中转机 agent；agent 的令牌桶每 5s 回读一次当前速率，因此跨时段
+  的长拷贝会自动切换，且不同时区的节点不会在错误的时段限速。
+  旧版本 agent 忽略该字段（退化为单卷限速），新节点由 bootstrap 自动升级。
+
+### 未做（后续可评估）
+
+- **多项目发现**：目前一次作业只对应一对源/目标 project 凭据，按项目分别建作业；
+  要做成 Azure Migrate / MGN 那种"一个 appliance 发现多个项目"需要改凭据模型
+  与权限模型，本期不动。
+- **逐 VM 限速**：`rate_limit_mb_s` 仍是作业级；Excel 的逐行限速列已能解析，
+  但要让搬运器按 VM 取速率还需要改数据面参数下发。
 
 ## 中转机空洞跳过（sparse copy）
 

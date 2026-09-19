@@ -710,11 +710,13 @@ class OpenStackUtils:
         image_by_id,
         image_id_override: str | None = None,
         image_name_hint: str | None = None,
+        volume_stats: dict[str, dict[str, int]] | None = None,
     ) -> dict[str, Any]:
         data = server.to_dict()
         flavor_id = (data.get("flavor") or {}).get("id") or ""
         image_id = image_id_override or (data.get("image") or {}).get("id") or ""
         flavor = flavor_by_id.get(flavor_id)
+        stats = (volume_stats or {}).get(str(getattr(server, "id", "") or ""), {})
         return {
             "server_id": str(getattr(server, "id", "") or ""),
             "name": str(getattr(server, "name", "") or data.get("name") or ""),
@@ -738,7 +740,30 @@ class OpenStackUtils:
                 or (image_id if image_id else "")
                 or "BFV（卷启动）"
             ),
+            # 盘数/总容量用于批量筛选（例如"只看 5 块盘以上的 VM"）与提交前
+            # 的容量估算；取不到卷清单时保持 0，不影响清单本身可用。
+            "volume_count": int(stats.get("count", 0) or 0),
+            "volume_gb": int(stats.get("gb", 0) or 0),
         }
+
+    @staticmethod
+    def _volume_stats_by_server(volumes: list[Any]) -> dict[str, dict[str, int]]:
+        """按 server_id 汇总挂载的卷数与容量（含启动盘）。"""
+        stats: dict[str, dict[str, int]] = {}
+        for volume in volumes:
+            try:
+                data = volume.to_dict()
+            except Exception:  # noqa: BLE001 - 单块卷读不出来不影响清单
+                continue
+            size = int(data.get("size", getattr(volume, "size", 0)) or 0)
+            for attachment in data.get("attachments") or []:
+                server_id = str(attachment.get("server_id") or "").strip()
+                if not server_id:
+                    continue
+                item = stats.setdefault(server_id, {"count": 0, "gb": 0})
+                item["count"] += 1
+                item["gb"] += size
+        return stats
 
     @staticmethod
     def _boot_image_records_by_server(
@@ -780,14 +805,27 @@ class OpenStackUtils:
         search: str = "",
         limit: int = 100,
         marker: str | None = None,
+        *,
+        fetch_all: bool = False,
+        max_results: int = 0,
     ) -> list[dict[str, Any]]:
-        """List source-project VMs with flavor/image names for the picker."""
-        filters: dict[str, Any] = {"limit": int(limit)}
-        if search:
-            filters["name"] = search
-        if marker:
-            filters["marker"] = marker
-        servers = list(self.conn.compute.servers(**filters))
+        """List source-project VMs with flavor/image/disk facts for the picker.
+
+        ``fetch_all`` 用于批量迁移：内部按 marker 循环翻页，把整个项目（或
+        到 ``max_results`` 为止）一次取回，避免前端"加载更多"点几十次；翻页
+        只做一次 flavor/image/volume 的公共查询。
+        """
+        servers, _next_marker = self._collect_source_servers(
+            search=search,
+            limit=limit,
+            marker=marker,
+            fetch_all=fetch_all,
+            max_results=max_results,
+        )
+        return self._summarize_source_servers(servers)
+
+    def _summarize_source_servers(self, servers: list[Any]) -> list[dict[str, Any]]:
+        """把服务器对象补成清单行：flavor/镜像名 + 盘数/容量。"""
         flavor_ids = {
             (server.to_dict().get("flavor") or {}).get("id")
             for server in servers
@@ -797,20 +835,9 @@ class OpenStackUtils:
             for flavor in self.conn.compute.flavors()
             if flavor.id in flavor_ids
         }
-        boot_records_by_server: dict[str, dict[str, str]] = {}
-        missing_image_servers = [
-            server
-            for server in servers
-            if not (server.to_dict().get("image") or {}).get("id")
-        ]
-        if missing_image_servers:
-            try:
-                volumes = list(self.conn.block_storage.volumes())
-            except AttributeError:
-                volumes = []
-            boot_records_by_server = self._boot_image_records_by_server(
-                volumes,
-            )
+        volumes = self._list_volumes_safe()
+        boot_records_by_server = self._boot_image_records_by_server(volumes)
+        volume_stats = self._volume_stats_by_server(volumes)
         boot_image_by_server = {
             server_id: record["image_id"]
             for server_id, record in boot_records_by_server.items()
@@ -844,9 +871,70 @@ class OpenStackUtils:
                     image_by_id,
                     image_id_override=resolved_image_id or None,
                     image_name_hint=image_name_hint_by_server.get(server.id),
+                    volume_stats=volume_stats,
                 )
             )
         return summaries
+
+    def list_source_servers_bundle(
+        self,
+        search: str = "",
+        limit: int = 100,
+        marker: str | None = None,
+        *,
+        fetch_all: bool = False,
+        max_results: int = 0,
+    ) -> dict[str, Any]:
+        """清单 + 下一页游标；``fetch_all`` 时游标为 None（已取全）。"""
+        servers, next_marker = self._collect_source_servers(
+            search=search,
+            limit=limit,
+            marker=marker,
+            fetch_all=fetch_all,
+            max_results=max_results,
+        )
+        return {"servers": self._summarize_source_servers(servers), "next_marker": next_marker}
+
+    def _collect_source_servers(
+        self,
+        *,
+        search: str,
+        limit: int,
+        marker: str | None,
+        fetch_all: bool,
+        max_results: int,
+    ) -> tuple[list[Any], str | None]:
+        """按需翻页拉取服务器；返回 (servers, 下一页游标)。"""
+        page_size = max(1, int(limit))
+        cap = max(0, int(max_results or 0))
+        collected: list[Any] = []
+        cursor = marker
+        while True:
+            filters: dict[str, Any] = {"limit": page_size}
+            if search:
+                filters["name"] = search
+            if cursor:
+                filters["marker"] = cursor
+            page = list(self.conn.compute.servers(**filters))
+            collected.extend(page)
+            if not fetch_all or len(page) < page_size:
+                if fetch_all:
+                    return collected, None
+                return collected, (page[-1].id if len(page) >= page_size and page else None)
+            if cap and len(collected) >= cap:
+                # 还有更多但已到上限：把游标留下，页面可以继续加载。
+                return collected, page[-1].id
+            cursor = page[-1].id
+
+    def _list_volumes_safe(self) -> list[Any]:
+        """尽力列出项目卷（磁盘统计与 BFV 启动盘镜像名都要用）。"""
+        try:
+            return list(self.conn.block_storage.volumes())
+        except AttributeError:
+            return []
+        except Exception as exc:  # noqa: BLE001 - 卷列表拿不到不该拖垮 VM 清单
+            logging.debug("[MIGRATION] 读取源端卷列表失败: %s", exc)
+            return []
 
     # ---------- target resource discovery ----------
 
@@ -1697,6 +1785,51 @@ class OpenStackUtils:
 
     def delete_port(self, port_id: str) -> None:
         self.conn.network.delete_port(port_id)
+
+    def get_compute_limits(self) -> dict[str, int]:
+        """尽力读取计算配额用量（vCPU/RAM/实例数）；读不到返回空字典。
+
+        中转机是"临时批量建机"，建 2×并发 台机器前先看剩余配额，比建到一半
+        撞 QuotaExceeded 再回滚便宜得多。
+        """
+        raw: Any = None
+        try:
+            raw = self.conn.compute.limits()
+            raw = raw.to_dict() if hasattr(raw, "to_dict") else dict(raw)
+        except Exception as exc:  # noqa: BLE001 - 读不到就当没有配额信息
+            logging.debug("[MIGRATION] 读取计算配额失败: %s", exc)
+            return {}
+        absolute = (raw or {}).get("absolute") if isinstance(raw, dict) else None
+        source = absolute if isinstance(absolute, dict) else (raw or {})
+        limits: dict[str, int] = {}
+        for key, value in source.items():
+            try:
+                limits[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return limits
+
+    def get_network_quota(self, project_id: str | None = None) -> dict[str, int]:
+        """尽力读取网络配额（端口/浮动 IP）；读不到返回空字典。"""
+        target = project_id or ""
+        if not target:
+            auth_vars = self._collect_auth_attrs(getattr(self.conn, "auth", None))
+            target = str(auth_vars.get("project_id") or "")
+        if not target:
+            return {}
+        try:
+            quota = self.conn.network.get_quota(target)
+            raw = quota.to_dict() if hasattr(quota, "to_dict") else dict(quota)
+        except Exception as exc:  # noqa: BLE001 - 配额读取失败不影响主流程
+            logging.debug("[MIGRATION] 读取网络配额失败: %s", exc)
+            return {}
+        limits: dict[str, int] = {}
+        for key, value in (raw or {}).items():
+            try:
+                limits[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return limits
 
     @staticmethod
     def enable_http_debug_logging() -> None:

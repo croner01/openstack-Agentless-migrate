@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import socket
 import stat
 import struct
@@ -79,6 +80,119 @@ class TransferError(RuntimeError):
 MIN_THROTTLE_SLEEP = 0.0005
 
 
+#: 「限速时段」形如 ``22:00-06:00``，可追加重定位偏移 ``@+08:00`` 指定时区；
+#: 不写偏移时按平台本地时区解释（容器里通常是 UTC，跨时区部署请显式写偏移）。
+RATE_WINDOW_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*(?:@([+-])(\d{1,2}):(\d{2}))?\s*$")
+
+
+def parse_rate_window(window: str) -> tuple[int, int, int] | None:
+    """解析限速时段；返回 (起始分钟, 结束分钟, 时区偏移秒)。非法返回 None。"""
+    match = RATE_WINDOW_RE.match(str(window or ""))
+    if match is None:
+        return None
+    start_h, start_m, end_h, end_m, sign, off_h, off_m = match.groups()
+    start = int(start_h) * 60 + int(start_m)
+    end = int(end_h) * 60 + int(end_m)
+    if start > 24 * 60 or end > 24 * 60:
+        return None
+    offset = 0
+    if sign:
+        offset = (int(off_h) * 60 + int(off_m)) * 60
+        if sign == "-":
+            offset = -offset
+    return start, end, offset
+
+
+def _minute_in_window(minute: int, start: int, end: int) -> bool:
+    if start == end:
+        return False
+    if start < end:
+        return start <= minute < end
+    # 跨零点：22:00-06:00 = [22:00, 24:00) ∪ [00:00, 06:00)
+    return minute >= start or minute < end
+
+
+def rate_schedule(
+    base_rate: float | None,
+    offpeak_rate: float | None,
+    window: str,
+    *,
+    now: float | None = None,
+    hours: float = 48.0,
+) -> list[dict[str, float]]:
+    """生成未来 ``hours`` 小时的 (绝对时刻, 速率) 切换表。
+
+    绝对时刻在平台侧算好再下发给中转机 agent：不同时区的节点不会因为"本地
+    时间不同"而在错误的时段限速。没有任何限速时返回空表（= 不限速）。
+    """
+    parsed = parse_rate_window(window)
+    if parsed is None:
+        return []
+    base = float(base_rate) if base_rate else None
+    offpeak = float(offpeak_rate) if offpeak_rate else None
+    if base is None and offpeak is None:
+        return []
+    start, end, offset = parsed
+    current = float(now if now is not None else time.time())
+    local_now = current + offset
+    day_start = local_now - (local_now % 86400)
+
+    transitions: list[float] = []
+    for day in range(-1, int(hours // 24) + 2):
+        base_day = day_start + day * 86400
+        for minute in (start, end):
+            moment = base_day + minute * 60 - offset
+            if current - 60 <= moment <= current + hours * 3600:
+                transitions.append(moment)
+    transitions = sorted(set(transitions))
+
+    schedule: list[dict[str, float]] = [{"at": 0.0, "rate": scheduled_rate_from(base, offpeak, start, end, offset, current)}]
+    for moment in transitions:
+        if moment <= current:
+            continue
+        schedule.append({
+            "at": moment,
+            "rate": scheduled_rate_from(base, offpeak, start, end, offset, moment + 1),
+        })
+    return schedule
+
+
+def scheduled_rate_from(
+    base: float | None,
+    offpeak: float | None,
+    start: int,
+    end: int,
+    offset: int,
+    moment: float,
+) -> float:
+    """某一绝对时刻应有的速率：落在限速时段内用 offpeak，否则用 base。"""
+    minute = int(((moment + offset) % 86400) // 60)
+    if _minute_in_window(minute, start, end):
+        return float(offpeak) if offpeak else float(base or 0.0)
+    return float(base or 0.0)
+
+
+def scheduled_rate(schedule: list[dict[str, float]] | None, now: float) -> float | None:
+    """按切换表取当前速率；表为空返回 None（不限速）。"""
+    if not schedule:
+        return None
+    rate = float(schedule[0].get("rate") or 0.0)
+    for item in schedule:
+        if float(item.get("at") or 0.0) <= now:
+            rate = float(item.get("rate") or 0.0)
+        else:
+            break
+    return rate or None
+
+
+def schedule_rate_provider(schedule: list[dict[str, float]] | None, clock=None):
+    """把切换表包成 TokenBucket 需要的 rate_provider（None = 不限速）。"""
+    if not schedule:
+        return None
+    wall = clock or time.time
+    return lambda: scheduled_rate(schedule, wall())
+
+
 class TokenBucket:
     """简单令牌桶限速器，rate 为 None 表示不限速。"""
 
@@ -89,6 +203,8 @@ class TokenBucket:
         burst: int | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
+        rate_provider: Callable[[], float | None] | None = None,
+        recheck_seconds: float = 5.0,
     ):
         if rate_bytes_per_sec is not None and rate_bytes_per_sec <= 0:
             raise ValueError("rate must be positive or None")
@@ -99,8 +215,34 @@ class TokenBucket:
         self._clock = clock
         self._sleep = sleeper
         self._last = clock()
+        #: 时段限速：定时回读"当前时段应有的速率"，让长拷贝能在跨时段时自动切换。
+        self._rate_provider = rate_provider
+        self._recheck_seconds = max(float(recheck_seconds), 0.1)
+        self._last_rate_check = clock()
+
+    def _refresh_rate(self) -> None:
+        if self._rate_provider is None:
+            return
+        now = self._clock()
+        if now - self._last_rate_check < self._recheck_seconds:
+            return
+        self._last_rate_check = now
+        try:
+            value = self._rate_provider()
+        except Exception:  # noqa: BLE001 - 限速读取失败不能打断迁移
+            return
+        self.set_rate(value)
+
+    def set_rate(self, rate_bytes_per_sec: float | None) -> None:
+        """切换速率：令牌桶容量跟着调整，避免放宽后仍被旧容量卡住。"""
+        if rate_bytes_per_sec is not None and rate_bytes_per_sec <= 0:
+            rate_bytes_per_sec = None
+        self.rate = rate_bytes_per_sec
+        self.capacity = max(float(self.rate or 0), 1.0)
+        self._tokens = min(self._tokens, self.capacity)
 
     def consume(self, amount: int) -> None:
+        self._refresh_rate()
         if not self.rate or amount <= 0:
             return
         remaining = amount
@@ -131,6 +273,7 @@ def send_device(
     length: int | None = None,
     chunk_size: int = DEFAULT_CHUNK,
     rate_limit_bytes_per_sec: float | None = None,
+    rate_schedule: list[dict[str, float]] | None = None,
     progress_cb: Callable[[int], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
     skip_zero: bool = False,
@@ -147,7 +290,12 @@ def send_device(
     if offset < 0 or length < 0 or offset + length > total:
         raise ValueError("transfer range out of bounds")
 
-    bucket = TokenBucket(rate_limit_bytes_per_sec)
+    # 时段限速：切换表由平台按绝对时刻算好，agent 只是照表切速率，
+    # 跨时区的节点不会在错误的时段限速。
+    bucket = TokenBucket(
+        rate_limit_bytes_per_sec,
+        rate_provider=schedule_rate_provider(rate_schedule),
+    )
     zeros = b"\0" * chunk_size if skip_zero else b""
     processed = 0
     with socket.create_connection((peer_host, peer_port), timeout=30) as sock:
@@ -318,6 +466,10 @@ __all__ = [
     "TokenBucket",
     "TransferError",
     "hash_device",
+    "parse_rate_window",
+    "rate_schedule",
+    "schedule_rate_provider",
+    "scheduled_rate",
     "receive_device",
     "send_device",
 ]

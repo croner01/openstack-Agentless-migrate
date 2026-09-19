@@ -105,6 +105,15 @@ class _FifoSlotQueue:
             queue = self._queues.get(key)
             return bool(queue) and queue[0] == token
 
+    def position(self, key: int, token: int) -> int:
+        """返回票号在队列里的位次（1 = 下一个拿到槽位）；不在队列返回 0。"""
+        with self._lock:
+            queue = self._queues.get(key) or []
+            try:
+                return queue.index(token) + 1
+            except ValueError:
+                return 0
+
     def drop(self, key: int, token: int) -> None:
         with self._lock:
             queue = self._queues.get(key)
@@ -117,6 +126,55 @@ class _FifoSlotQueue:
 
 
 _SLOT_QUEUE = _FifoSlotQueue()
+
+#: 正在排队等槽位的盘：页面用它显示"谁在等、排第几、等了多久、为什么"。
+_SLOT_WAITS: dict[tuple[str, str], dict[str, Any]] = {}
+_SLOT_WAITS_LOCK = threading.Lock()
+
+
+def _register_slot_wait(
+    *,
+    job_id: str,
+    task_id: str,
+    role: str,
+    position: int,
+    waited: float,
+    limit: float,
+    vm_id: str = "",
+) -> None:
+    with _SLOT_WAITS_LOCK:
+        entry = _SLOT_WAITS.setdefault(
+            (str(job_id), str(task_id)),
+            {"since": time.time(), "reason": ""},
+        )
+        entry.update(
+            {
+                "job_id": str(job_id),
+                "task_id": str(task_id),
+                "vm_id": str(vm_id or entry.get("vm_id") or ""),
+                "role": role,
+                "position": int(position),
+                "waited": round(float(waited), 1),
+                "limit": float(limit),
+                "reason": entry.get("reason") or "等待中转机空闲槽位",
+            }
+        )
+
+
+def _clear_slot_wait(job_id: str, task_id: str) -> None:
+    with _SLOT_WAITS_LOCK:
+        _SLOT_WAITS.pop((str(job_id), str(task_id)), None)
+
+
+def slot_wait_snapshot(job_id: str) -> list[dict[str, Any]]:
+    """本作业当前排队等槽位的盘（按等待时长倒序）。"""
+    with _SLOT_WAITS_LOCK:
+        items = [
+            dict(entry)
+            for (entry_job, _task), entry in _SLOT_WAITS.items()
+            if entry_job == str(job_id)
+        ]
+    return sorted(items, key=lambda item: item.get("waited", 0.0), reverse=True)
 
 
 def _pool_has_live_holder(pool: Any) -> bool:
@@ -163,6 +221,7 @@ class RelayVolumeMover:
         job_id: str,
         chunk_size: int = DEFAULT_CHUNK,
         rate_limit_bytes_per_sec: float = 0.0,
+        rate_schedule: list[dict[str, float]] | None = None,
         ready_timeout: float = 180.0,
         #: 单卷拷贝的墙钟上限（秒），0 = 不限时。真正防卡死的是 stall_timeout 的
     #: 字节进度看门狗；这个上限只是兜底，1TiB 盘在 50MB/s 下要 5.8 小时，
@@ -194,6 +253,8 @@ class RelayVolumeMover:
         self.job_id = job_id
         self.chunk_size = chunk_size
         self.rate_limit_bytes_per_sec = rate_limit_bytes_per_sec
+        #: 时段限速切换表（绝对时刻 → 速率），由平台按作业表单算好。
+        self.rate_schedule = list(rate_schedule or [])
         self.ready_timeout = ready_timeout
         self.result_timeout = result_timeout
         self.poll_interval = poll_interval
@@ -603,7 +664,9 @@ class RelayVolumeMover:
         started_bytes = max(int(record.copied_bytes or 0), 0)
         try:
             source_node = self._acquire_with_wait(
-                self.source_pool, volume.source_volume_id
+                self.source_pool,
+                volume.source_volume_id,
+                vm_id=str(getattr(record, "vm_id", "") or ""),
             )
             if source_node is None:
                 # 源端都拿不到就不要再抢目标端：既白等一轮，也会把"自己刚
@@ -614,7 +677,9 @@ class RelayVolumeMover:
                     f"{source_state}）"
                 )
             target_node = self._acquire_with_wait(
-                self.target_pool, volume.source_volume_id
+                self.target_pool,
+                volume.source_volume_id,
+                vm_id=str(getattr(record, "vm_id", "") or ""),
             )
             if target_node is None:
                 target_state = ", ".join(_describe(self.target_pool)) or "无节点"
@@ -809,6 +874,7 @@ class RelayVolumeMover:
                 peer_host=target_node.data_address,
                 peer_port=target_node.data_port,
                 rate_limit_bytes_per_sec=self.rate_limit_bytes_per_sec,
+                rate_schedule=self.rate_schedule,
             )
         )
         task_ids = (target_task_id, source_task_id)
@@ -850,7 +916,9 @@ class RelayVolumeMover:
             if self.state.task_result(task_id) is None:
                 request_cancel(task_id)
 
-    def _acquire_with_wait(self, pool: Any, task_id: str) -> Any:
+    def _acquire_with_wait(
+        self, pool: Any, task_id: str, *, vm_id: str = ""
+    ) -> Any:
         """取中转机槽位；池满时排队等待，避免把并发作业直接判失败。
 
         ephemeral 池按作业固定创建 N 台机器，池大小小于并发数时立刻报
@@ -880,10 +948,21 @@ class RelayVolumeMover:
         deadline = None if limit <= 0 else self.clock() + limit
         waited = 0.0
         key, token = _SLOT_QUEUE.ticket(pool)
+        job_id = str(getattr(self, "job_id", "") or "")
+        role = str(getattr(pool, "role", "") or "")
         try:
             while True:
                 if self.should_stop():
                     raise CopyCancelled("等待中转机空闲槽位被取消")
+                _register_slot_wait(
+                    job_id=job_id,
+                    task_id=task_id,
+                    role=role,
+                    position=_SLOT_QUEUE.position(key, token),
+                    waited=waited,
+                    limit=limit,
+                    vm_id=vm_id,
+                )
                 if _SLOT_QUEUE.is_front(key, token):
                     node = pool.acquire(task_id)
                     if node is not None:
@@ -901,6 +980,7 @@ class RelayVolumeMover:
                 waited += self.poll_interval
         finally:
             _SLOT_QUEUE.drop(key, token)
+            _clear_slot_wait(job_id, task_id)
 
     def _sparse_enabled(self, source_node: Any, target_node: Any) -> tuple[bool, str]:
         """两端 agent 都支持空洞帧、且模式不为 off 时才启用。

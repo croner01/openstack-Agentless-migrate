@@ -237,3 +237,128 @@ class RelayPoolTest(unittest.TestCase):
         changed = self.pool.sweep(now=1006.0)
 
         self.assertEqual(len(changed), 2)
+
+
+class RelayPoolLazyGrowthTest(unittest.TestCase):
+    """临时池按需扩容：初始只建表单配置的台数，用满后逐台扩到并发上限。"""
+
+    def setUp(self):
+        self.state = RelayState(secret=b"secret")
+        self.os_utils = mock.MagicMock()
+        self._created = 0
+
+        def create(**_kwargs):
+            self._created += 1
+            return mock.Mock(id=f"srv-{self._created}")
+
+        self.os_utils.create_relay_server.side_effect = create
+        self.pool = RelayPool(
+            role="target",
+            job_id="job-1",
+            az="az1",
+            size=4,
+            initial_size=1,
+            image_id="img-1",
+            flavor_id="flv-1",
+            port_ids=["port-1", "port-2", "port-3", "port-4"],
+            admin_password="pw",
+            platform_url="https://platform.example.com",
+            token_factory=lambda job_id, role: "tok",
+            os_utils=self.os_utils,
+            state=self.state,
+        )
+        self.pool.provision()
+        self.state.register(
+            job_id="job-1", role="target", name="relay-target-0", version="1.0.0",
+            address="198.51.100.9", now=time.time(),
+            data_address="10.0.0.9", data_port=9200,
+        )
+        self.pool.wait_ready(timeout=1.0, poll_interval=0.01)
+
+    def test_provision_only_creates_initial_size(self):
+        self.assertEqual(self.os_utils.create_relay_server.call_count, 1)
+
+    def test_acquire_grows_one_node_when_full(self):
+        node = self.pool.acquire("task-1")
+        self.assertIsNotNone(node)
+
+        # 池里只有一台且已被占用：下一次 acquire 触发扩容并返回 None（由上层排队）。
+        self.assertIsNone(self.pool.acquire("task-2"))
+        self.assertEqual(self.os_utils.create_relay_server.call_count, 2)
+        self.assertEqual(len(self.pool.nodes), 2)
+        # 扩容出来的机器用的是对应的端口，不会两台抢同一个端口。
+        kwargs = self.os_utils.create_relay_server.call_args_list[1].kwargs
+        self.assertEqual(kwargs["port_ids"], ["port-2"])
+
+    def test_growth_stops_at_size_limit(self):
+        self.pool.acquire("task-1")
+        for index in range(2, 6):
+            self.pool.acquire(f"task-{index}")
+
+        self.assertEqual(len(self.pool.nodes), 4)
+        self.assertEqual(self.os_utils.create_relay_server.call_count, 4)
+
+    def test_registered_growth_node_becomes_usable(self):
+        self.pool.acquire("task-1")
+        self.pool.acquire("task-2")
+        self.state.register(
+            job_id="job-1", role="target", name="relay-target-1", version="1.0.0",
+            address="198.51.100.10", now=time.time(),
+            data_address="10.0.0.10", data_port=9200,
+        )
+
+        node = self.pool.acquire("task-2")
+
+        self.assertIsNotNone(node)
+        self.assertEqual(node.name, "relay-target-1")
+
+    def test_has_live_holder_is_true_while_growth_is_possible(self):
+        self.pool.acquire("task-1")
+        # 已建的那台失联，但池还没扩满：继续排队是有意义的。
+        self.state.drop_by_name("relay-target-0")
+
+        self.assertTrue(self.pool.has_live_holder())
+
+    def test_failed_growth_keeps_pool_waitable(self):
+        self.os_utils.create_relay_server.side_effect = RuntimeError("quota exceeded")
+        self.pool.acquire("task-1")
+
+        self.assertIsNone(self.pool.acquire("task-2"))
+        self.assertEqual(len(self.pool.nodes), 1)
+
+
+class RelayPoolGrowthFailureTest(unittest.TestCase):
+    """连续扩容失败后不能继续假装"迟早会有槽位"，否则不限时排队会永久挂起。"""
+
+    def test_repeated_growth_failure_stops_live_holder(self):
+        state = RelayState(secret=b"secret")
+        os_utils = mock.MagicMock()
+        # 初始那台要建得出来，之后扩容才开始失败：模拟"配额用完"。
+        os_utils.create_relay_server.side_effect = [
+            mock.Mock(id="srv-1"),
+            RuntimeError("quota exceeded"),
+            RuntimeError("quota exceeded"),
+            RuntimeError("quota exceeded"),
+            RuntimeError("quota exceeded"),
+        ]
+        pool = RelayPool(
+            role="source",
+            job_id="job-1",
+            az="az1",
+            size=3,
+            initial_size=1,
+            image_id="img-1",
+            flavor_id="flv-1",
+            port_ids=["port-1", "port-2", "port-3"],
+            admin_password="pw",
+            platform_url="https://platform.example.com",
+            token_factory=lambda job_id, role: "tok",
+            os_utils=os_utils,
+            state=state,
+        )
+        pool.provision()
+
+        for index in range(4):
+            self.assertIsNone(pool.acquire(f"task-{index}"))
+
+        self.assertFalse(pool.has_live_holder())

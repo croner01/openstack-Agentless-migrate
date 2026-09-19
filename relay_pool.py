@@ -172,6 +172,8 @@ class RelayNode:
     current_task_id: str = ""
     root_volume_id: str = ""
     lease_id: str = ""
+    #: 建机时刻（墙钟）。临时池按需扩容时用来判断"还在注册"还是"起不来了"。
+    created_at: float = 0.0
 
 
 class RelayPool:
@@ -184,6 +186,7 @@ class RelayPool:
         job_id: str,
         az: str,
         size: int,
+        initial_size: int = 0,
         image_id: str,
         flavor_id: str,
         port_ids: list[str],
@@ -204,7 +207,12 @@ class RelayPool:
         self.role = role
         self.job_id = job_id
         self.az = az
-        self.size = size
+        #: 扩容上限（临时池 = 生效传输并发经硬上限收敛后的值）。
+        self.size = max(int(size or 1), 1)
+        #: 作业启动时先建几台；0 = 与 size 相同（老行为：开工即全量建机）。
+        self.initial_size = (
+            self.size if not initial_size else min(int(initial_size), self.size)
+        )
         self.image_id = image_id
         self.flavor_id = flavor_id
         self.port_ids = list(port_ids)
@@ -225,23 +233,32 @@ class RelayPool:
         self.data_fips: list[dict[str, str]] = []
         self.data_addresses: list[str] = []
         self.nodes: list[RelayNode] = []
+        #: 扩容互斥：同时只允许一台在建，避免等待线程各自建一堆机器。
+        self._growing = False
+        #: 连续扩容失败次数：用来判断"还能扩"是不是真的成立，避免无限排队。
+        self._growth_failures = 0
         # acquire/release/sweep 都是"读-改-写"节点状态，必须串行化，否则
         # 两个拷贝任务会同时抢到同一台中转机（同一数据端口互相踩踏）。
         self._lock = threading.Lock()
 
     def provision(self) -> None:
-        """按池大小创建中转机，cloud-init 注入注册令牌。"""
+        """按初始规模创建中转机，cloud-init 注入注册令牌。
+
+        临时池初始只建 ``initial_size`` 台，用满后由 ``acquire`` 按需扩到
+        ``size``；常驻模式与旧行为仍是 initial_size == size。
+        """
         if self.port_ids and len(self.port_ids) != self.size:
             raise ValueError(
                 f"中转机端口数与池大小不一致: {len(self.port_ids)} != {self.size}"
             )
-        for index in range(self.size):
+        for index in range(self.initial_size):
             self.provision_one(index)
         logging.info(
-            "[MIGRATION] 中转机池 role=%s az=%s 创建 %s 台",
+            "[MIGRATION] 中转机池 role=%s az=%s 创建 %s 台（按需扩到 %s 台）",
             self.role,
             self.az,
             len(self.nodes),
+            self.size,
         )
 
     def provision_one(self, index: int) -> RelayNode:
@@ -287,6 +304,7 @@ class RelayPool:
             az=self.az,
             server_id=server.id,
             root_volume_id=str(getattr(server, "root_volume_id", "") or ""),
+            created_at=time.time(),
         )
         self.nodes.append(node)
         return node
@@ -324,17 +342,8 @@ class RelayPool:
             """返回 True 表示全部就绪；否则把还没注册的节点留在 pending。"""
             still_pending = []
             for node in pending:
-                agent = self.state.find_by_name(node.name)
-                if agent is None:
+                if not self._refresh_from_agent(node):
                     still_pending.append(node)
-                    continue
-                node.session_id = agent.session_id
-                node.data_address = agent.data_address
-                node.data_port = agent.data_port
-                node.ssh_public_key = agent.ssh_public_key
-                node.agent_version = getattr(agent, "version", "") or ""
-                node.state = "ready"
-                self._log_host(node)
             pending[:] = still_pending
             return not pending
 
@@ -392,8 +401,18 @@ class RelayPool:
         )
 
     def acquire(self, task_id: str) -> RelayNode | None:
+        """取一台空闲中转机；池没满就顺手扩一台（按需扩容）。
+
+        临时池原先"开工即按并发全量建机"，一份作业填了并发 8 就先建 16 台。
+        现在初始只建表单配置的台数，用满后再逐台扩到并发上限：拿不到机器时
+        返回 None（由搬运器按「等待空闲槽位」排队），下一次轮询再取。
+        """
+        grow_index: int | None = None
         with self._lock:
             for node in self.nodes:
+                if node.state == "provisioning":
+                    # 扩容出来的机器注册后要能立刻投入使用，不必等 wait_ready。
+                    self._refresh_from_agent(node)
                 # unhealthy 只是瞬时判定：agent 心跳恢复后应当能重新被调度，
                 # 否则一次网络抖动就会把节点在这个作业里永久拉黑。
                 if node.state in {"ready", "unhealthy"} and self.agent_alive(node):
@@ -404,7 +423,51 @@ class RelayPool:
                     node.state = "busy"
                     node.current_task_id = task_id
                     return node
-            return None
+            if len(self.nodes) < self.size and not self._growing:
+                self._growing = True
+                grow_index = len(self.nodes)
+        if grow_index is not None:
+            self._grow_one(grow_index)
+        return None
+
+    def _grow_one(self, index: int) -> None:
+        """扩容一台机器；失败只记日志，等待逻辑照常按"池满"处理。"""
+        try:
+            with self._lock:
+                if len(self.nodes) != index or len(self.nodes) >= self.size:
+                    return
+                logging.info(
+                    "[MIGRATION] 临时中转机池扩容 role=%s %s -> %s 台（上限 %s）",
+                    self.role,
+                    len(self.nodes),
+                    len(self.nodes) + 1,
+                    self.size,
+                )
+                self.provision_one(index)
+                self._growth_failures = 0
+        except Exception:  # noqa: BLE001 - 扩容失败不影响排队等待/超时语义
+            with self._lock:
+                self._growth_failures += 1
+            logging.exception(
+                "[MIGRATION] 扩容中转机失败 role=%s index=%s", self.role, index
+            )
+        finally:
+            with self._lock:
+                self._growing = False
+
+    def _refresh_from_agent(self, node: RelayNode) -> bool:
+        """agent 注册后把节点提升为 ready；返回是否已就绪。"""
+        agent = self.state.find_by_name(node.name)
+        if agent is None:
+            return False
+        node.session_id = agent.session_id
+        node.data_address = agent.data_address
+        node.data_port = agent.data_port
+        node.ssh_public_key = agent.ssh_public_key
+        node.agent_version = getattr(agent, "version", "") or ""
+        node.state = "ready"
+        self._log_host(node)
+        return True
 
     def has_live_holder(self) -> bool:
         """池里是否有"迟早会释放槽位"的持有者/可用节点。
@@ -413,6 +476,10 @@ class RelayPool:
         只会永久挂起，此时应当快速失败而不是把作业卡死。
         """
         with self._lock:
+            if len(self.nodes) < self.size and self._growth_failures < 3:
+                # 还能继续扩容，排队是有意义的；连续扩建失败说明配额/平台有问题，
+                # 此时不再假装"会有人释放"，让上层按无可用容量快速失败。
+                return True
             if not self.nodes:
                 return False
             return any(self.agent_alive(node) for node in self.nodes)
@@ -451,6 +518,17 @@ class RelayPool:
             for node in self.nodes:
                 agent = self.state.find_by_name(node.name)
                 alive = agent is not None and (now - agent.last_heartbeat) <= limit
+                if node.state == "provisioning":
+                    if alive:
+                        self._refresh_from_agent(node)
+                        changed.append(node.node_id)
+                    elif now - float(node.created_at or 0.0) <= self._provision_grace():
+                        # 刚建出来的机器还没注册完，别急着标死。
+                        continue
+                    else:
+                        node.state = "unhealthy"
+                        changed.append(node.node_id)
+                    continue
                 if alive and node.state == "unhealthy":
                     node.state = "busy" if node.current_task_id else "ready"
                     changed.append(node.node_id)
@@ -459,6 +537,10 @@ class RelayPool:
                     node.state = "unhealthy"
                     changed.append(node.node_id)
             return changed
+
+    def _provision_grace(self) -> float:
+        """建机到注册的宽限期：给足 boots + cloud-init 下载 agent 的时间。"""
+        return max(300.0, self.heartbeat_timeout * 4)
 
     def destroy(self) -> None:
         for node in list(self.nodes):

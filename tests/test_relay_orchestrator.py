@@ -1081,3 +1081,76 @@ class DerivedRetentionWindowTest(unittest.TestCase):
                 job_id="job-1",
             )
         self.assertEqual(mover.derived_retention_window, 2 * 3600.0)
+
+
+class SlotWaitSnapshotTest(unittest.TestCase):
+    """排队可视化：等槽位的盘要能被页面查到（位次/已等待/上限/VM）。"""
+
+    def setUp(self):
+        from relay_ledger import VolumeTaskRecord
+        from relay_volumes import SourceCopy
+
+        self.VolumeTaskRecord = VolumeTaskRecord
+        self.SourceCopy = SourceCopy
+        self.lifecycle = mock.MagicMock()
+        self.lifecycle.source_os = mock.MagicMock()
+        self.lifecycle.target_os = mock.MagicMock()
+        self.lifecycle.source_os.wait_attachment_device.return_value = "/dev/vdb"
+        self.lifecycle.target_os.wait_attachment_device.return_value = "/dev/vdc"
+        self.lifecycle.create_source_copy.return_value = SourceCopy(
+            snapshot_id="snap-1", derived_volume_id="vol-d1"
+        )
+        self.lifecycle.create_target_volume.return_value = "vol-t1"
+
+    def test_waiting_disk_is_reported_with_position(self):
+        from relay_orchestrator import (
+            RelayVolumeMover,
+            _clear_slot_wait,
+            slot_wait_snapshot,
+        )
+
+        pool = _FakePool([])
+        # 假池"迟早会释放"：等到表单上限就返回 None，测试不会挂死。
+        pool.has_live_holder = lambda: True
+        mover = RelayVolumeMover(
+            source_pool=pool,
+            target_pool=pool,
+            lifecycle=self.lifecycle,
+            state=_FakeState(),
+            ledger=_FakeLedger(),
+            job_id="job-wait",
+            sleeper=_Sleeper(),
+            slot_wait_timeout=0.05,
+            poll_interval=0.02,
+        )
+        try:
+            node = mover._acquire_with_wait(pool, "vol-1", vm_id="vm-1")
+            self.assertIsNone(node)
+            # 超时退出后必须清掉登记，否则页面会一直显示"排队中"。
+            self.assertEqual(slot_wait_snapshot("job-wait"), [])
+        finally:
+            _clear_slot_wait("job-wait", "vol-1")
+
+    def test_registry_reports_entry_fields(self):
+        from relay_orchestrator import (
+            _clear_slot_wait,
+            _register_slot_wait,
+            slot_wait_snapshot,
+        )
+
+        _register_slot_wait(
+            job_id="job-x", task_id="vol-1", role="target",
+            position=2, waited=95.0, limit=600.0, vm_id="vm-1",
+        )
+        try:
+            items = slot_wait_snapshot("job-x")
+
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["vm_id"], "vm-1")
+            self.assertEqual(items[0]["position"], 2)
+            self.assertEqual(items[0]["waited"], 95.0)
+            self.assertEqual(items[0]["limit"], 600.0)
+            self.assertEqual(items[0]["role"], "target")
+        finally:
+            _clear_slot_wait("job-x", "vol-1")
+        self.assertEqual(slot_wait_snapshot("job-x"), [])

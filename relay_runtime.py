@@ -4,12 +4,13 @@ from __future__ import annotations
 import logging
 import re
 import time
+from relay_transfer import rate_schedule as build_rate_schedule
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
-from env_utils import env_float, env_int
+from env_utils import env_float, env_int, env_str
 
-from relay_orchestrator import RelayVolumeMover
+from relay_orchestrator import RelayVolumeMover, slot_wait_snapshot
 from relay_pool import RelayPool
 from relay_protocol import DEFAULT_CHUNK, issue_token
 from relay_reaper import TERMINAL_PHASES, RelayReaper
@@ -140,6 +141,8 @@ class PoolConfig:
     data_floating_network: str = ""
     fixed_ips: list[str] = field(default_factory=list)
     port_ids: list[str] = field(default_factory=list)
+    #: 作业启动时先建几台；0 = 用 size（临时池按需扩到 size，见 expand 逻辑）。
+    initial_size: int = 0
 
 
 @dataclass
@@ -170,6 +173,8 @@ class RelayChannelConfig:
     source_cloud: str = ""
     target_cloud: str = ""
     rate_limit_bytes_per_sec: float = 0.0
+    #: 时段限速切换表：absolute epoch → bytes/sec，空表 = 不限速。
+    rate_schedule: list[dict[str, float]] = field(default_factory=list)
     chunk_size: int = DEFAULT_CHUNK
     ready_timeout: float = 180.0
     #: 单卷拷贝的墙钟上限（秒），0 = 不限时；防卡死靠 stall_timeout。
@@ -318,6 +323,7 @@ def parse_relay_options(options: dict[str, Any]) -> RelayChannelConfig | None:
 
     source_size = int(options.get("relay_source_size") or 2)
     target_size = int(options.get("relay_target_size") or 2)
+    source_configured, target_configured = source_size, target_size
     source_ports = _as_list(options.get("relay_source_ports"))
     target_ports = _as_list(options.get("relay_target_ports"))
     if node_mode == "ephemeral":
@@ -329,6 +335,16 @@ def parse_relay_options(options: dict[str, Any]) -> RelayChannelConfig | None:
         )
     if source_size < 1 or target_size < 1:
         raise ValueError("中转机池大小必须大于 0")
+    # 临时池默认"先按表单配置的台数建，用满后按需扩到并发上限"，不再开工
+    # 就把 2×并发 台全建出来；MIGRATION_RELAY_EAGER_POOL=1 可回到旧行为。
+    eager = env_str("MIGRATION_RELAY_EAGER_POOL", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    source_initial = source_size if eager else min(max(source_configured, 1), source_size)
+    target_initial = target_size if eager else min(max(target_configured, 1), target_size)
 
     slot_wait = max(
         _form_float(options, "relay_slot_wait_seconds", default=1800.0) or 0.0,
@@ -339,6 +355,14 @@ def parse_relay_options(options: dict[str, Any]) -> RelayChannelConfig | None:
         attach_timeout = max(min(float(attach_timeout), 7 * 24 * 3600.0), 0.0)
 
     rate_limit_mb = float(options.get("rate_limit_mb_s") or 0)
+    # 时段限速：只在填了时段或低谷速率时才算切换表（否则保持"不限速"语义）。
+    offpeak_window = str(options.get("offpeak_window") or "").strip()
+    offpeak_rate_mb = float(options.get("offpeak_rate_limit_mb_s") or 0)
+    rate_schedule = build_rate_schedule(
+        rate_limit_mb * 1024 * 1024,
+        offpeak_rate_mb * 1024 * 1024 if offpeak_rate_mb else None,
+        offpeak_window,
+    )
     hole_mode = str(options.get("relay_hole_mode") or "").strip().lower() or "skip"
     if hole_mode not in {"skip", "zero", "off"}:
         hole_mode = "skip"
@@ -346,6 +370,7 @@ def parse_relay_options(options: dict[str, Any]) -> RelayChannelConfig | None:
         platform_url=str(options["relay_platform_url"]).strip().rstrip("/"),
         source=PoolConfig(
             size=source_size,
+            initial_size=source_initial,
             image=str(options.get("relay_source_image") or "").strip(),
             flavor=str(options.get("relay_source_flavor") or "").strip(),
             az=str(options.get("relay_source_az") or "").strip(),
@@ -363,6 +388,7 @@ def parse_relay_options(options: dict[str, Any]) -> RelayChannelConfig | None:
         ),
         target=PoolConfig(
             size=target_size,
+            initial_size=target_initial,
             image=str(options.get("relay_target_image") or "").strip(),
             flavor=str(options.get("relay_target_flavor") or "").strip(),
             az=str(options.get("relay_target_az") or "").strip(),
@@ -425,6 +451,7 @@ def parse_relay_options(options: dict[str, Any]) -> RelayChannelConfig | None:
         source_cloud=str(options.get("source_cloud") or ""),
         target_cloud=str(options.get("target_cloud") or ""),
         rate_limit_bytes_per_sec=rate_limit_mb * 1024 * 1024,
+        rate_schedule=rate_schedule,
         # 常驻模式在 Task 14 完成前不可用，因此表单默认仍走 ephemeral；
         # 只有显式传 relay_node_mode=persistent 才启用常驻池。
         node_mode=node_mode,
@@ -541,6 +568,7 @@ class RelayRuntime:
             job_id=job_id,
             az=config.source.az,
             size=config.source.size,
+            initial_size=config.source.initial_size,
             image_id=config.source.image,
             flavor_id=config.source.flavor,
             port_ids=config.source.port_ids,
@@ -563,6 +591,7 @@ class RelayRuntime:
             job_id=job_id,
             az=config.target.az,
             size=config.target.size,
+            initial_size=config.target.initial_size,
             image_id=config.target.image,
             flavor_id=config.target.flavor,
             port_ids=config.target.port_ids,
@@ -734,6 +763,7 @@ class RelayRuntime:
             job_id=self.job_id,
             chunk_size=self.config.chunk_size,
             rate_limit_bytes_per_sec=self.config.rate_limit_bytes_per_sec,
+            rate_schedule=self.config.rate_schedule,
             ready_timeout=self.config.ready_timeout,
             result_timeout=self.config.result_timeout,
             copy_retries=self.config.copy_retries,
@@ -835,6 +865,8 @@ class RelayRuntime:
             "target": [asdict(node) for node in self.target_pool.nodes],
             "ledger": self.ledger_summary(),
             "volumes": self.volume_progress(),
+            # 排队等槽位的盘：页面显示"排第几、等了多久、为什么"，不必去翻日志。
+            "slot_waits": slot_wait_snapshot(self.job_id),
             # 用服务端时钟做基准：浏览器与服务器时间不同步时，页面算出来的
             # "已等待" 才不会凭空多出几小时。
             "now": time.time(),
