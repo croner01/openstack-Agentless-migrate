@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -18,9 +19,18 @@ from openstack_utils import (
 
 #: 挂载 / 卸载卷的等待上限（秒）。与"建卷"不同：Cinder 卡在 attaching 不会自己
 #: 往前走（通常意味着宿主机连不上存储后端），保留一个可预期上限、超时后走
-#: 卸载回滚，比无限等待更安全。商业存储上需要放宽时用
-#: MIGRATION_ATTACH_READY_TIMEOUT 覆盖，0 = 不限时。
-ATTACH_READY_TIMEOUT_SECONDS = 1800.0
+#: 卸载回滚，比无限等待更安全。实测一次 libvirt 热插盘失败后卷一直 available，
+#: 1800s 的上限让一块盘白占槽位半小时，因此默认收到 600s；商业存储上确实需
+#: 要放宽时用 MIGRATION_ATTACH_READY_TIMEOUT 或作业表单覆盖，0 = 不限时。
+ATTACH_READY_TIMEOUT_SECONDS = 600.0
+
+#: 挂载命令发出后，至少等这么久再判"attachment 记录缺失"：Nova/Cinder 登记
+#: attachment 有延迟，过早判定会把正常挂载误判成失败。
+ATTACH_FAILURE_GRACE_SECONDS = 60.0
+
+#: 识别到挂载失败后自动重试一次；仍失败才进入人工重试。
+ATTACH_AUTO_RETRIES = 1
+ATTACH_RETRY_BACKOFF_SECONDS = 10.0
 
 #: 失败收尾时把卷从中转机卸下来的等待上限（秒）。这不是数据面操作，正常
 #: 几秒就完成；给一个短上限是为了不让"卸载卡住"拖慢失败/保留状态的呈现。
@@ -74,13 +84,28 @@ class VolumeLifecycle:
         *,
         ready_timeout: float | None = None,
         snapshot_timeout: float | None = None,
+        attach_timeout: float | None = None,
         should_stop: Callable[[], bool] | None = None,
+        sleeper: Callable[[float], None] | None = None,
     ):
         self.source_os = source_os
         self.target_os = target_os
         self.ready_timeout = float(ready_timeout) if ready_timeout else None
         self.snapshot_timeout = float(snapshot_timeout) if snapshot_timeout else None
+        self.attach_timeout = (
+            float(attach_timeout) if attach_timeout is not None else None
+        )
         self.should_stop = should_stop
+        self.sleeper = sleeper or time.sleep
+
+    def _attach_timeout(self) -> float:
+        """挂载/卸载等待上限：作业表单优先，否则取环境变量兜底（默认 600s）。"""
+        if self.attach_timeout is not None:
+            return float(self.attach_timeout)
+        return attach_ready_timeout()
+
+    def _stopping(self) -> bool:
+        return bool(self.should_stop is not None and self.should_stop())
 
     def _derive_timeouts(self, size: int) -> tuple[float, float]:
         """返回 (快照等待, 派生卷等待)，单位秒；0 表示不限时。"""
@@ -202,8 +227,56 @@ class VolumeLifecycle:
         """把拷完的系统盘标记为可启动，否则 Nova 用 boot_index=0 建机会被拒。"""
         self._os_for(role).set_volume_bootable(volume_id, True)
 
-    def attach(self, *, role: str, server_id: str, volume_id: str) -> str:
+    def attach(
+        self,
+        *,
+        role: str,
+        server_id: str,
+        volume_id: str,
+        retries: int = ATTACH_AUTO_RETRIES,
+    ) -> str:
+        """挂载卷并等到 in-use；失败识别后自动重试一次。
+
+        宿主机热插盘失败（libvirt 报错）时 Cinder 卷可能一直是 available，
+        旧实现只看卷状态会干等到超时。这里叠加 Nova instance action 与
+        attachment 记录两条判据，识别到失败后清理残留再重试一次；仍失败
+        才抛错交给上层保留台账/人工重试。
+        """
+        attempts = max(int(retries), 0) + 1
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                return self._attach_once(
+                    role=role, server_id=server_id, volume_id=volume_id
+                )
+            except Exception as exc:  # noqa: BLE001 - 重试后再决定是否抛出
+                last_error = exc
+                if attempt >= attempts - 1 or self._stopping():
+                    raise
+                logging.warning(
+                    "[MIGRATION] 挂载失败，%.0fs 后自动重试（%s/%s）: %s",
+                    ATTACH_RETRY_BACKOFF_SECONDS,
+                    attempt + 1,
+                    attempts - 1,
+                    exc,
+                )
+                self._sleep_backoff(ATTACH_RETRY_BACKOFF_SECONDS)
+        raise last_error  # pragma: no cover - 循环内必返回或抛出
+
+    def _sleep_backoff(self, seconds: float) -> None:
+        """可被取消打断的退避等待。"""
+        remaining = max(float(seconds), 0.0)
+        step = 0.5
+        while remaining > 0:
+            if self._stopping():
+                return
+            sleep_for = min(step, remaining)
+            self.sleeper(sleep_for)
+            remaining -= sleep_for
+
+    def _attach_once(self, *, role: str, server_id: str, volume_id: str) -> str:
         os_utils = self._os_for(role)
+        known_actions = self._known_action_ids(os_utils, server_id)
         attachment_id = os_utils.attach_volume(
             server_id=server_id, volume_id=volume_id
         )
@@ -213,9 +286,16 @@ class VolumeLifecycle:
             os_utils.wait_volume_status(
                 volume_id,
                 target="in-use",
-                timeout=attach_ready_timeout(),
+                timeout=self._attach_timeout(),
                 context=context,
                 should_stop=self.should_stop,
+                failure_probe=self._attach_failure_probe(
+                    os_utils,
+                    server_id=server_id,
+                    volume_id=volume_id,
+                    attachment_id=attachment_id,
+                    known_actions=known_actions,
+                ),
             )
         except Exception:
             # 挂载失败不能把卷留在 attaching：尽力卸载，否则后续删除会被 Cinder 拒绝。
@@ -229,6 +309,57 @@ class VolumeLifecycle:
                 )
             raise
         return attachment_id
+
+    @staticmethod
+    def _known_action_ids(os_utils: Any, server_id: str) -> set[str]:
+        lister = getattr(os_utils, "list_server_action_ids", None)
+        if not callable(lister):
+            return set()
+        try:
+            return set(lister(server_id) or ())
+        except Exception:  # noqa: BLE001 - 诊断判据取不到不影响挂载
+            return set()
+
+    def _attach_failure_probe(
+        self,
+        os_utils: Any,
+        *,
+        server_id: str,
+        volume_id: str,
+        attachment_id: str,
+        known_actions: set[str],
+    ) -> Callable[[], str | None]:
+        started = time.time()
+
+        def probe() -> str | None:
+            detector = getattr(os_utils, "attach_volume_failure", None)
+            if callable(detector):
+                try:
+                    detail = detector(
+                        server_id,
+                        volume_id,
+                        exclude_ids=known_actions,
+                        attachment_id=attachment_id,
+                    )
+                except Exception:  # noqa: BLE001 - 查询失败不误判
+                    detail = None
+                if detail:
+                    return str(detail)
+            if time.time() - started < ATTACH_FAILURE_GRACE_SECONDS:
+                return None
+            finder = getattr(os_utils, "find_volume_attachment", None)
+            if callable(finder):
+                try:
+                    if finder(server_id, volume_id) is None:
+                        return (
+                            "Nova 未登记卷 attachment（挂载命令可能未下发或已被"
+                            "拒绝），卷状态仍未 in-use"
+                        )
+                except Exception:  # noqa: BLE001 - 查询失败不误判
+                    return None
+            return None
+
+        return probe
 
     def detach(
         self,
@@ -254,7 +385,7 @@ class VolumeLifecycle:
         os_utils.wait_volume_status(
             volume_id,
             target="available",
-            timeout=attach_ready_timeout() if timeout is None else float(timeout),
+            timeout=self._attach_timeout() if timeout is None else float(timeout),
             should_stop=self.should_stop,
             context=f"（卸载 {role} 卷 {volume_id}）",
         )

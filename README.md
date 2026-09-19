@@ -224,9 +224,11 @@ ceph 客户端连不上 mon 时不会立刻报错，而是无限重连——一�
 - `MIGRATION_SNAPSHOT_READY_TIMEOUT` / `MIGRATION_VOLUME_READY_TIMEOUT` /
   `MIGRATION_DERIVE_SECONDS_PER_GIB`：中转机通道「快照 → 派生卷」的等待上限
   基线（默认 `0` = 不限时），见下面的「快照 / 派生卷等待超时」；
-- `MIGRATION_ATTACH_READY_TIMEOUT`：挂载 / 卸载卷的等待上限，默认 1800 秒。
+- `MIGRATION_ATTACH_READY_TIMEOUT`：挂载 / 卸载卷的等待上限，默认 600 秒。
   与建卷不同，Cinder 卡在 `attaching` 不会自己往前走（多半是宿主机连不上
-  存储后端），保留可预期上限后走卸载回滚比无限等待更安全；
+  存储后端），保留可预期上限后走卸载回滚比无限等待更安全。作业表单
+  「挂载超时 (秒)」可覆盖（0 = 不限时）；识别到宿主机热插盘失败会清理残留
+  并自动重试 1 次，见「槽位等待与挂载健壮性」；
 - `MIGRATION_DERIVED_RETENTION_HOURS`：中转机通道**失败后保留派生卷/快照**
   的时长，默认 `24` 小时，`0` = 失败立即回收（旧行为）。保留期内人工点
   「重试失败盘」会先校验再复用已有派生卷，省掉商业存储上几小时的打快照 +
@@ -270,7 +272,7 @@ CoW 后端上是秒级，但换到商业存储后往往退化成**存储侧全�
 的公式随卷大小放宽）。同一区域的另两个参数也在这里：**停滞判死 (秒)**
 （数据面零字节流动多久算卡死，对应 `relay_stall_timeout`）与
 **等待空闲槽位 (秒)**（池里没有空机器的等待上限，对应
-`relay_slot_wait_seconds`）。
+`relay_slot_wait_seconds`，`0` = 不限时）。
 
 **何时该配基线**：不限时意味着一个"存储侧真的卡住"的派生卷会让这台 VM 一直
 等下去。如果希望"宁可失败也别等"，给上面两个环境变量一个明确的估算上限；
@@ -279,7 +281,13 @@ CoW 后端上是秒级，但换到商业存储后往往退化成**存储侧全�
 长等待期间台账会跟着 60 秒打点刷新时间戳（页面上的「已等待」也因此持续更新），
 这样对账清理不会把"正在派生"的卷当成残留删掉；对账窗口另有一个 1 小时的下限，
 不会被不限时配置带成 0。挂载 / 卸载步骤仍在
-`MIGRATION_ATTACH_READY_TIMEOUT`（默认 1800 秒）内失败回滚。
+`MIGRATION_ATTACH_READY_TIMEOUT`（默认 600 秒）内失败回滚。
+
+> 「等待空闲槽位」与挂载超时的默认值已调整：槽位等待统一由作业表单的
+> `relay_slot_wait_seconds` 驱动（`0` = 不限时），ephemeral 与 persistent
+> 两种模式共用同一口径；挂载上限默认收到 600 秒（作业表单「挂载超时 (秒)」
+> 或环境变量可覆盖），并增加失败识别与自动重试。详见下文
+> [槽位等待与挂载健壮性](#槽位等待与挂载健壮性本期实施)。
 
 ### 对账的安全边界（谁在删卷）
 
@@ -321,6 +329,57 @@ RBD 直连通道的语义不变。
   `failed`），不会留下占配额的半成品；正在跑的准备任务会先结束再抛错，
   避免后台线程继续建资源；
 - 多线程写台账（准备阶段）已加锁，页面轮询读取不会读到写一半的 JSON。
+
+### 槽位等待与挂载健壮性（本期实施）
+
+背景：一次真实作业里，目标端池大小 = 1、传输并发 = 3，两块盘在 1800s 上限内
+没等到槽位被判失败；随后对失败盘重试时，平台发出的挂载请求在 Nova 侧（宿主
+`node-2` 的 libvirt 热插盘，`virDomainAttachDeviceFlags() failed`）失败，但
+Cinder 卷状态始终是 `available`，平台无从察觉，干等约 25 分钟，直到手工挂载才
+恢复。以下调整**均已落地**，两种模式共用同一口径，不再按模式分批。
+
+- 槽位等待统一口径：作业表单「等待空闲槽位 (秒)」(`relay_slot_wait_seconds`)
+  是唯一入口，**ephemeral 与 persistent 两种模式共用**，不再各自维护一套超时：
+  - `0` = 不限时：池里暂时没有空闲槽位就一直排队，轮到即继续，避免把并发
+    作业直接判失败；
+  - 正数 = 等满该秒数仍拿不到槽位才失败，并给出可操作的报错；
+  - 例外保护：池里确实无人会释放（池为空且无法扩容、全部节点
+    `agent-unreachable`、节点 draining）时不受 `0` 影响直接失败，避免永久挂起；
+  - 等待期间可被「取消作业 / 平台停机」立刻打断（给搬运器补 `should_stop`，
+    当前 `_acquire_with_wait` 不检查取消）；
+  - 源端槽位拿不到时立即收尾，不再继续去抢目标端，避免白等一轮，也避免把
+    "自己刚标记的 busy"写进报错现场；
+  - 排队按 FIFO 交接，避免多个等待者反复抢占造成饥饿；
+  - persistent 侧 `RelayScheduler` 池满时的 `NoCapacityError` /
+    `QueueTimeoutError` 转为统一的等待/超时语义；
+    `SchedulerConfig.queue_timeout_seconds` 不再单独生效。
+- 挂载（作业表单「挂载超时 (秒)」= `relay_attach_ready_timeout`；留空用
+  `MIGRATION_ATTACH_READY_TIMEOUT` 兜底，默认已从 1800 收到 600 秒，0 = 不限时）：
+  - 失败识别不再只看 Cinder 卷状态，增加 Nova instance action 的
+    `attach_volume` 结果与 attachment 记录两条判据；reserve 阶段卷可能长时间
+    保持 `available`，不能只凭卷状态判断；
+  - 识别到失败后清理残留 attachment、退避约 10s 后自动重试 1 次；再失败才
+    保留台账进入人工重试，并把宿主机真实报错（如
+    `virDomainAttachDeviceFlags() failed`）显示在「中转机通道」页签；
+  - 挂载卡住会占用槽位并推迟同一块盘的源端挂载，因此 600s 上限与快速识别
+    需同时生效。
+- ephemeral 自动扩池（口径 A，仅临时模式）：
+  - `size = min(max(配置的池大小, 生效传输并发), 硬上限)`，其中
+    `生效传输并发 = min(relay_transfer_concurrency 或 volume_concurrency, 8)`，
+    硬上限用环境变量 `MIGRATION_RELAY_MAX_POOL_SIZE` 调整（默认 16）；
+    日志与页面明确显示"池大小由 X 扩到 Y（传输并发=N）"；
+  - 跨 VM 的峰值需求（`vm_concurrency × 每 VM 并发盘数`）仍靠不限时排队兜底，
+    不按 `vm_concurrency` 成倍扩池；
+  - 表单显式填了中转机端口列表时不自动扩池，改为把并发收敛到端口数并告警。
+- persistent 保持既有容量模型（`slots_per_node` × 按需扩容到 `max_nodes`，
+  默认 5 × 6 = 30 个槽位，跨作业共享），只把「等待空闲槽位」的等待/超时口径
+  接进上面的统一逻辑，容量口径不变。
+
+影响到的配置面：`relay_slot_wait_seconds`（`0` = 不限时，且同时驱动两种
+模式）、作业表单「挂载超时 (秒)」= `relay_attach_ready_timeout`、
+`MIGRATION_ATTACH_READY_TIMEOUT`（默认 600）、
+`MIGRATION_RELAY_MAX_POOL_SIZE`（ephemeral 自动扩池硬上限，默认 16）。
+「中转机配置」页签文案与上述超时说明已同步更新。
 
 ## 中转机空洞跳过（sparse copy）
 

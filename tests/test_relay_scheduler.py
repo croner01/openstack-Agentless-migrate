@@ -123,6 +123,38 @@ class RelaySchedulerSlotTest(unittest.TestCase):
         with self.assertRaises(NoCapacityError):
             self._acquire()
 
+    def test_try_acquire_returns_none_instead_of_raising(self):
+        """常驻池池满时不再抛异常，交给搬运器统一排队。"""
+        self.registry.drop("relay-source-1")
+
+        self.assertIsNone(
+            self.scheduler.try_acquire(
+                "task-1",
+                job_id="job-1",
+                role="source",
+                tenant_key="t1",
+                az="nova-1",
+            )
+        )
+
+    def test_grow_nowait_returns_none_when_at_capacity(self):
+        """wait=False 的 grow 不能进入 queue_timeout 长等待。"""
+        from unittest import mock as _mock
+
+        node = self.inventory.get("1")
+        node.slots_total = 1
+        node.slots_used = 1
+        scheduler = RelayScheduler(
+            inventory=self.inventory,
+            leases=self.leases,
+            registry=self.registry,
+            config=SchedulerConfig(max_nodes=1, min_nodes=1, queue_timeout_seconds=1800),
+            node_manager=_mock.MagicMock(),
+            clock=lambda: 100.0,
+        )
+
+        self.assertIsNone(scheduler.grow("t1", "source", "nova-1", needed=1, wait=False))
+
     def test_acquire_skips_other_role_az_and_tenant(self):
         with self.assertRaises(NoCapacityError):
             self._acquire(az="nova-2")

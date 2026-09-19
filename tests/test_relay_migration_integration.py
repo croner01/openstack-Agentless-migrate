@@ -794,3 +794,27 @@ class RelayTransferConcurrencyTest(unittest.TestCase):
         self.assertEqual(
             self.manager._relay_transfer_workers({"relay_transfer_concurrency": 99}), 8
         )
+
+    def test_transfer_workers_clamped_to_explicit_relay_ports(self):
+        """显式端口列表比并发少时收敛并发，避免多出来的盘拿不到网络。"""
+        self.assertEqual(
+            self.manager._relay_transfer_workers(
+                {
+                    "relay_transfer_concurrency": 6,
+                    "relay_source_ports": ["p1", "p2"],
+                    "relay_target_ports": ["q1", "q2"],
+                }
+            ),
+            2,
+        )
+        # 端口足够时不收敛。
+        self.assertEqual(
+            self.manager._relay_transfer_workers(
+                {
+                    "relay_transfer_concurrency": 2,
+                    "relay_source_ports": "p1,p2,p3",
+                    "relay_target_ports": "q1,q2,q3",
+                }
+            ),
+            2,
+        )

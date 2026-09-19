@@ -861,7 +861,8 @@ body.wizard-view .toast-box { bottom: 92px; }
                                     <div><label class="form-label">拷贝重试次数</label><input class="fld mono" type="number" min="0" max="10" name="relay_copy_retries" value="3"></div>
                                     <div><label class="form-label">停滞判死 (秒)</label><input class="fld mono" type="number" min="30" name="relay_stall_timeout" value="300"></div>
                                     <div><label class="form-label" title="打快照与快照派生卷的等待上限。0 = 不限制等待（默认，每 60s 打点记录进度）；商业存储上这一步常是存储侧全量拷贝，大卷几小时都正常，强行判死会让平台在云上还在建盘时就把任务标失败。填正数时按卷大小自适应放宽。">卷/快照就绪超时 (秒)</label><input class="fld mono" type="number" min="0" name="volume_ready_timeout" value="0" placeholder="0 = 不限制（默认）"></div>
-                                    <div><label class="form-label" title="池里没有空闲中转机时的等待上限">等待空闲槽位 (秒)</label><input class="fld mono" type="number" min="0" name="relay_slot_wait_seconds" value="1800"></div>
+                                    <div><label class="form-label" title="池里没有空闲中转机时的等待上限，临时池与常驻池都听这个值：0 = 不限时，池里还有在线节点就一直排队；填正数则等满该秒数仍拿不到槽位才失败。">等待空闲槽位 (秒)</label><input class="fld mono" type="number" min="0" name="relay_slot_wait_seconds" value="1800" placeholder="0 = 不限时"></div>
+                                    <div><label class="form-label" title="挂载 / 卸载卷到中转机的等待上限。留空用平台默认 600 秒；若宿主机热插盘失败（卷状态却仍是 available）会被识别出来，清理残留后自动重试 1 次。0 = 不限时。">挂载超时 (秒)</label><input class="fld mono" type="number" min="0" name="relay_attach_ready_timeout" placeholder="600（默认）"></div>
                                     <div><label class="form-label" title="同时挂载并拷贝几块盘。每块盘占源端/目标端各一个中转机槽位，实际并发受池容量限制；限速是每块盘各自计的，并发调大等于总带宽翻倍。留空则沿用「单台卷拷贝并发」。">传输并发（挂载+拷贝）</label><input class="fld mono" type="number" min="1" max="8" name="relay_transfer_concurrency" placeholder="沿用卷拷贝并发"></div>
                                     <div><label class="form-label" title="出现失败盘时，其余盘先传完，然后等人工在作业详情点「重试」。0 = 等到人工处理为止（可按「取消作业」中断）。">失败盘等待重试 (秒)</label><input class="fld mono" type="number" min="0" name="relay_disk_retry_wait_seconds" value="0" placeholder="0 = 不限时"></div>
                                     <div><label class="form-label">空洞模式</label>
@@ -2990,6 +2991,7 @@ async function startMigration() {
             ['relay_admin_password', 'relay_ssh_public_key', 'relay_ready_timeout',
              'relay_heartbeat_interval', 'relay_heartbeat_timeout', 'relay_copy_retries',
              'relay_stall_timeout', 'relay_slot_wait_seconds',
+             'relay_attach_ready_timeout',
              'relay_transfer_concurrency', 'relay_disk_retry_wait_seconds',
              'volume_ready_timeout'].forEach(name => {
                 const el = $('[name="' + name + '"]');

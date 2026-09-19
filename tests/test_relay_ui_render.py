@@ -476,8 +476,17 @@ class RelayPageRenderTest(unittest.TestCase):
 
         self.assertIn('name="volume_ready_timeout"', html)
         self.assertIn('name="relay_slot_wait_seconds"', html)
-        for field in ("relay_stall_timeout", "relay_slot_wait_seconds", "volume_ready_timeout"):
+        self.assertIn('name="relay_attach_ready_timeout"', html)
+        for field in ("relay_stall_timeout", "relay_slot_wait_seconds",
+                      "relay_attach_ready_timeout", "volume_ready_timeout"):
             self.assertIn("'" + field + "'", html)
+
+    def test_slot_wait_field_documents_unlimited_both_modes(self):
+        """「等待空闲槽位」0 = 不限时，且临时池/常驻池都听这个值。"""
+        html = self._html()
+
+        self.assertIn("0 = 不限时", html)
+        self.assertIn("临时池与常驻池都听这个值", html)
 
     def test_derive_timeout_field_defaults_to_unlimited(self):
         """「卷/快照就绪超时」默认 0 = 不限制等待，页面要写清楚。"""

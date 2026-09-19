@@ -7,12 +7,13 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
-from env_utils import env_float
+from env_utils import env_float, env_int
 
 from relay_orchestrator import RelayVolumeMover
 from relay_pool import RelayPool
 from relay_protocol import DEFAULT_CHUNK, issue_token
 from relay_reaper import TERMINAL_PHASES, RelayReaper
+from relay_scheduler import NodeNotReadyError, NoCapacityError
 from relay_volumes import VolumeLifecycle
 
 #: 台账里已完结记录的保留时长；超过后由 finish() 机会性回收，避免无限增长。
@@ -26,6 +27,71 @@ RELAY_RESULT_TIMEOUT_SECONDS = 0.0
 #: 对账清理"残留"记录的最短静默窗口（秒）。等待建盘/派生卷期间台账会按 60s
 #: 打点刷新 updated_at，所以这个窗口只要覆盖"挂载"这类无打点的步骤即可。
 RELAY_REAPER_MIN_STALE_SECONDS = 3600.0
+
+#: ephemeral 自动扩池的硬上限。池大小只为"对齐传输并发"而扩，不能无限建机：
+#: 峰值需求（vm_concurrency × 每 VM 并发盘数）靠不限时排队兜底，不是靠扩池。
+EPHEMERAL_POOL_HARD_CAP_DEFAULT = 16
+
+#: 传输并发的绝对上限，与「传输并发」表单的 max=8 保持一致。
+TRANSFER_CONCURRENCY_LIMIT = 8
+
+
+def relay_pool_hard_cap() -> int:
+    """ephemeral 自动扩池的硬上限，MIGRATION_RELAY_MAX_POOL_SIZE 可覆盖。"""
+    return env_int(
+        "MIGRATION_RELAY_MAX_POOL_SIZE",
+        EPHEMERAL_POOL_HARD_CAP_DEFAULT,
+        minimum=1,
+    )
+
+
+def effective_transfer_concurrency(options: dict[str, Any]) -> int:
+    """表单口径的传输并发：relay_transfer_concurrency 缺省时沿用卷拷贝并发。"""
+    raw = options.get("relay_transfer_concurrency")
+    if raw is None or str(raw).strip() == "":
+        raw = options.get("volume_concurrency") or 1
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 1
+    return max(1, min(value, TRANSFER_CONCURRENCY_LIMIT))
+
+
+def expand_ephemeral_pool_size(
+    configured: int,
+    port_ids: list[str],
+    options: dict[str, Any],
+    *,
+    side: str,
+) -> int:
+    """临时池大小与传输并发对齐（口径 A，仅 ephemeral）。
+
+    池小并发大时，多出来的盘只能在 1800s 里排队；把池扩到并发即可让每块
+    在途盘都有机器。显式给了中转机端口列表时不扩池——节点数超过端口数会
+    有机器拿不到网络，改为由「传输并发」收敛到端口数并告警。
+    """
+    effective = effective_transfer_concurrency(options)
+    if port_ids:
+        if effective > len(port_ids):
+            logging.warning(
+                "[MIGRATION] %s中转机显式指定了 %s 个端口，传输并发 %s 将收敛到端口数",
+                side,
+                len(port_ids),
+                effective,
+            )
+        return configured
+    cap = relay_pool_hard_cap()
+    target = min(max(int(configured), effective), cap)
+    if target > configured:
+        logging.info(
+            "[MIGRATION] %s中转机池大小由 %s 扩到 %s（传输并发=%s，硬上限=%s）",
+            side,
+            configured,
+            target,
+            effective,
+            cap,
+        )
+    return target
 
 
 def relay_result_timeout_default() -> float:
@@ -92,6 +158,8 @@ class RelayChannelConfig:
     heartbeat_timeout: int = 30
     stall_timeout: float = 300.0
     slot_wait_timeout: float = 1800.0
+    #: 挂载 / 卸载等待上限（秒）；None = 用环境变量兜底（默认 600s），0 = 不限时。
+    attach_ready_timeout: float | None = None
     #: 「打快照 / 快照派生卷」的等待超时（秒）。0 = 不限时（默认）：商业存储
     #: 上这一步常是存储侧全量拷贝，200GiB 也能超过 1 小时，按时间判死会让
     #: 平台在云上还在建盘时就判失败并回收资源。给了正数则按下面 env 的
@@ -159,6 +227,7 @@ _FORM_SCALAR_FIELDS = (
     "relay_copy_retries",
     "relay_stall_timeout",
     "relay_slot_wait_seconds",
+    "relay_attach_ready_timeout",
     "relay_transfer_concurrency",
     "relay_disk_retry_wait_seconds",
     "relay_hole_mode",
@@ -179,6 +248,23 @@ def _as_list(value: Any) -> list[str]:
     if value in (None, ""):
         return []
     return [str(value)]
+
+
+def _form_float(
+    options: dict[str, Any], key: str, *, default: float | None = None
+) -> float | None:
+    """读表单数值：空值返回 default，非法值也回退 default。
+
+    不能写成 ``float(options.get(key) or default)``：``0`` 是合法取值
+    （如「等待空闲槽位」的 0 = 不限时），但 falsy 会被 or 吃掉。
+    """
+    raw = options.get(key)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
 
 
 def _split_ips(value: Any) -> list[str]:
@@ -232,8 +318,25 @@ def parse_relay_options(options: dict[str, Any]) -> RelayChannelConfig | None:
 
     source_size = int(options.get("relay_source_size") or 2)
     target_size = int(options.get("relay_target_size") or 2)
+    source_ports = _as_list(options.get("relay_source_ports"))
+    target_ports = _as_list(options.get("relay_target_ports"))
+    if node_mode == "ephemeral":
+        source_size = expand_ephemeral_pool_size(
+            source_size, source_ports, options, side="源端"
+        )
+        target_size = expand_ephemeral_pool_size(
+            target_size, target_ports, options, side="目标端"
+        )
     if source_size < 1 or target_size < 1:
         raise ValueError("中转机池大小必须大于 0")
+
+    slot_wait = max(
+        _form_float(options, "relay_slot_wait_seconds", default=1800.0) or 0.0,
+        0.0,
+    )
+    attach_timeout = _form_float(options, "relay_attach_ready_timeout")
+    if attach_timeout is not None:
+        attach_timeout = max(min(float(attach_timeout), 7 * 24 * 3600.0), 0.0)
 
     rate_limit_mb = float(options.get("rate_limit_mb_s") or 0)
     hole_mode = str(options.get("relay_hole_mode") or "").strip().lower() or "skip"
@@ -303,7 +406,10 @@ def parse_relay_options(options: dict[str, Any]) -> RelayChannelConfig | None:
             ),
             0.0,
         ),
-        slot_wait_timeout=max(float(options.get("relay_slot_wait_seconds") or 1800.0), 0.0),
+        # 「等待空闲槽位」两种模式统一口径：0 = 不限时；空值取默认 1800s。
+        slot_wait_timeout=slot_wait,
+        # 挂载等待：空值 = 用环境变量兜底（默认 600s），0 = 不限时。
+        attach_ready_timeout=attach_timeout,
         volume_ready_timeout=max(float(options.get("volume_ready_timeout") or 0.0), 0.0),
         # 页面只有一个「卷/快照就绪超时」输入；未单独给快照超时时沿用它。
         snapshot_ready_timeout=max(
@@ -342,14 +448,30 @@ class SchedulerPoolAdapter:
         self.az = az
 
     def acquire(self, task_id: str) -> Any:
-        return self.scheduler.acquire(
-            task_id,
-            job_id=self.job_id,
-            role=self.role,
-            tenant_key=self.tenant_key,
-            az=self.az,
-            vm_id=task_id,
-        )
+        """返回空闲槽位；没有容量时返回 None，交给搬运器统一排队。
+
+        常驻池旧实现把池满当成异常抛错，导致「等待空闲槽位」只对临时池生效。
+        这里改用调度器的 try_acquire：能扩容就扩容，扩不动就返回 None，由
+        ``RelayVolumeMover._acquire_with_wait`` 用作业表单的超时（0=不限时）
+        排队，两种模式口径一致。
+        """
+        try:
+            return self.scheduler.try_acquire(
+                task_id,
+                job_id=self.job_id,
+                role=self.role,
+                tenant_key=self.tenant_key,
+                az=self.az,
+                vm_id=task_id,
+            )
+        except NodeNotReadyError:
+            # 建出来的中转机注册不上是硬故障，不是"池满"：当成池满会让上层
+            # 按轮询反复建机/删机，最后只报"没有空闲机器"，把真正可操作的
+            # 原因（cloud-init / 平台连通性 / bootstrap 401）盖掉。
+            raise
+        except NoCapacityError as exc:
+            logging.info("[MIGRATION] 常驻中转机暂无空闲槽位: %s", exc)
+            return None
 
     def release(self, node_id: str, *, lease_id: str = "") -> None:
         # 带上 job_id / lease_id：同一常驻节点会被同租户的多个作业共享，
@@ -361,6 +483,13 @@ class SchedulerPoolAdapter:
         if callable(pool):
             return pool(self.tenant_key, self.role, self.az)
         return []
+
+    def has_live_holder(self) -> bool:
+        """池内是否还有在线节点；全部失联时不再无限排队。"""
+        described = self.describe()
+        if not described:
+            return False
+        return any("(agent-unreachable)" not in item for item in described)
 
 
 class RelayRuntime:
@@ -404,6 +533,7 @@ class RelayRuntime:
             target_os,
             ready_timeout=config.volume_ready_timeout or None,
             snapshot_timeout=config.snapshot_ready_timeout or None,
+            attach_timeout=config.attach_ready_timeout,
             should_stop=self.should_stop,
         )
         self.source_pool = RelayPool(
@@ -610,6 +740,7 @@ class RelayRuntime:
             full_verify=self.config.full_verify,
             stall_timeout=self.config.stall_timeout,
             slot_wait_timeout=self.config.slot_wait_timeout,
+            should_stop=self.should_stop,
             hole_mode=self.config.hole_mode,
             clock=self.clock,
             source_cloud=self.config.source_cloud,
@@ -619,17 +750,26 @@ class RelayRuntime:
         )
 
     def _scheduler_for(self, role: str, az: str) -> Any:
-        """常驻模式下按池取调度器：容量参数来自该池的建机参数。"""
+        """常驻模式下按池取调度器：容量参数来自该池的建机参数。
+
+        调度器池满时的长等待口径（queue_timeout_seconds）与作业表单
+        「等待空闲槽位」对齐（0 = 不限时），这样两种模式都听同一个字段；
+        真正排队由搬运器负责，这里只保证偶发 wait=True 调用不会用旧默认值。
+        """
         tenant_key = (
             self.config.source_cloud if role == "source" else self.config.target_cloud
         )
+        scheduler = None
         if self.scheduler_factory is not None:
             scheduler = self.scheduler_factory(tenant_key, role, az)
-            if scheduler is not None:
-                return scheduler
-        if self.scheduler is None:
+        if scheduler is None:
+            scheduler = self.scheduler
+        if scheduler is None:
             raise ValueError("persistent 模式缺少 RelayScheduler")
-        return self.scheduler
+        config = getattr(scheduler, "config", None)
+        if config is not None:
+            config.queue_timeout_seconds = float(self.config.slot_wait_timeout or 0.0)
+        return scheduler
 
     def finish(self) -> None:
         """作业收尾：对账清理中间产物；persistent 模式只归还租约。"""

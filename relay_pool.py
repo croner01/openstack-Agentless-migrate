@@ -397,10 +397,25 @@ class RelayPool:
                 # unhealthy 只是瞬时判定：agent 心跳恢复后应当能重新被调度，
                 # 否则一次网络抖动就会把节点在这个作业里永久拉黑。
                 if node.state in {"ready", "unhealthy"} and self.agent_alive(node):
+                    if node.state == "unhealthy" and node.current_task_id:
+                        # 已被 sweep 标死但仍持有任务：不能改派给别的卷，否则
+                        # 同一台机器上会出现两个 owner，释放时把在跑的租约销掉。
+                        continue
                     node.state = "busy"
                     node.current_task_id = task_id
                     return node
             return None
+
+    def has_live_holder(self) -> bool:
+        """池里是否有"迟早会释放槽位"的持有者/可用节点。
+
+        用于不限时排队时的安全检查：池为空、所有 agent 都失联时继续无限等
+        只会永久挂起，此时应当快速失败而不是把作业卡死。
+        """
+        with self._lock:
+            if not self.nodes:
+                return False
+            return any(self.agent_alive(node) for node in self.nodes)
 
     def agent_alive(self, node: RelayNode) -> bool:
         agent = self.state.find_by_name(node.name)

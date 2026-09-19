@@ -37,6 +37,9 @@ class _FakePool:
     def acquire(self, task_id):
         return self._nodes.pop(0) if self._nodes else None
 
+    def has_live_holder(self):
+        return bool(self._nodes)
+
     def release(self, node_id, *, lease_id=""):
         self.released.append(node_id)
 
@@ -125,7 +128,8 @@ class RelayVolumeMoverTest(unittest.TestCase):
             ledger=self.ledger,
             job_id="job-1",
             sleeper=_Sleeper(),
-            # 这些用例断言"没有空闲机器"时的行为，关掉排队保持立即失败。
+            # 这些用例断言"没有空闲机器"时的行为：池里无节点时即便 0=不限时
+            # 也会快速失败（无人会释放），不会把测试挂死。
             slot_wait_timeout=0,
         )
 

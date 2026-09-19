@@ -1,5 +1,6 @@
 import concurrent.futures
 import logging
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -700,7 +701,12 @@ class MigrationManager:
 
     @staticmethod
     def _relay_transfer_workers(options: dict[str, Any]) -> int:
-        """传输并发度：``relay_transfer_concurrency`` 缺省时沿用卷拷贝并发。"""
+        """传输并发度：``relay_transfer_concurrency`` 缺省时沿用卷拷贝并发。
+
+        显式给了中转机端口列表时，并发不能超过端口数：否则多出来的卷拿不到
+        网络端口，会在挂载/建机阶段才报错。这里收敛并发并告警，而不是自动
+        扩池（端口是用户手工指定的，扩池会造出没有网络的节点）。
+        """
         raw = options.get("relay_transfer_concurrency")
         if raw is None or str(raw).strip() == "":
             raw = options.get("volume_concurrency") or 1
@@ -708,7 +714,35 @@ class MigrationManager:
             value = int(raw)
         except (TypeError, ValueError):
             value = 1
-        return max(1, min(value, 8))
+        value = max(1, min(value, 8))
+        port_limits = [
+            count
+            for count in (
+                MigrationManager._relay_port_count(options.get(key))
+                for key in ("relay_source_ports", "relay_target_ports")
+            )
+            if count > 0
+        ]
+        if port_limits:
+            limit = max(1, min(port_limits))
+            if value > limit:
+                logging.warning(
+                    "[MIGRATION] 中转机端口数 %s 少于传输并发 %s，并发收敛为 %s",
+                    limit,
+                    value,
+                    limit,
+                )
+                value = limit
+        return value
+
+    @staticmethod
+    def _relay_port_count(value: Any) -> int:
+        """统计中转机端口数；表单可能是列表，也可能是逗号/空白分隔的字符串。"""
+        if isinstance(value, (list, tuple, set)):
+            return len([item for item in value if str(item).strip()])
+        return len(
+            [part for part in re.split(r"[,;\s]+", str(value or "")) if part.strip()]
+        )
 
     @staticmethod
     def _relay_item_index(item: Any, fallback: int) -> int:

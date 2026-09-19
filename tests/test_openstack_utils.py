@@ -629,6 +629,111 @@ class WaitVolumeStatusTest(unittest.TestCase):
 
         self.assertIn("最后状态 downloading", str(ctx.exception))
 
+    def test_failure_probe_aborts_before_timeout(self):
+        """宿主机热插盘失败时卷可能一直是 available，必须由外部判据快速失败。"""
+        self.conn.block_storage.get_volume.return_value = self._volume("available")
+
+        with mock.patch("openstack_utils.time.sleep"):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.os_utils.wait_volume_status(
+                    "vol-1",
+                    target="in-use",
+                    timeout=600,
+                    poll_interval=5,
+                    failure_probe=lambda: "virDomainAttachDeviceFlags() failed",
+                    failure_probe_interval_polls=1,
+                )
+
+        self.assertIn("挂载失败", str(ctx.exception))
+        self.assertIn("virDomainAttachDeviceFlags() failed", str(ctx.exception))
+
+
+class AttachVolumeFailureTest(unittest.TestCase):
+    """Nova instance action 判据：宿主机挂载失败要能被翻译成可读原因。"""
+
+    class _Action:
+        def __init__(self, request_id, action, result, traceback="", volume_id=""):
+            self.id = request_id
+            self.action = action
+            self.events = [
+                {"event": "compute_attach_volume", "result": result,
+                 "traceback": traceback, "volume_id": volume_id}
+            ]
+
+    def setUp(self):
+        self.conn = mock.MagicMock()
+        self.os_utils = OpenStackUtils(conn=self.conn)
+
+    def test_returns_summary_for_failed_attach_action(self):
+        traceback = (
+            "Traceback (most recent call last):\n"
+            '  File "guest.py", line 1, in attach_device\n'
+            "    raise libvirtError(...)\n"
+            "libvirt.libvirtError: virDomainAttachDeviceFlags() failed\n"
+        )
+        self.conn.compute.server_actions.return_value = [
+            self._Action("req-1", "attach_volume", "Error", traceback, "vol-1")
+        ]
+
+        detail = self.os_utils.attach_volume_failure("srv-1", "vol-1")
+
+        self.assertIn("virDomainAttachDeviceFlags() failed", detail)
+
+    def test_ignores_failure_action_for_another_volume(self):
+        """常驻节点并发挂多块盘：别的卷挂载失败不能算到本卷头上。"""
+        self.conn.compute.server_actions.return_value = [
+            self._Action(
+                "req-other",
+                "attach_volume",
+                "Error",
+                "libvirt.libvirtError: virDomainAttachDeviceFlags() failed",
+                "vol-other",
+            )
+        ]
+
+        self.assertIsNone(self.os_utils.attach_volume_failure("srv-1", "vol-1"))
+
+    def test_matches_failure_action_by_attachment_id(self):
+        """Nova 事件只带 attachment id 时也要能认领本卷的失败。"""
+        self.conn.compute.server_actions.return_value = [
+            self._Action(
+                "req-1",
+                "attach_volume",
+                "Error",
+                "libvirt.libvirtError: virDomainAttachDeviceFlags() failed",
+                "att-1",
+            )
+        ]
+
+        detail = self.os_utils.attach_volume_failure(
+            "srv-1", "vol-1", attachment_id="att-1"
+        )
+
+        self.assertIn("virDomainAttachDeviceFlags() failed", detail)
+
+    def test_ignores_actions_seen_before_this_attempt(self):
+        self.conn.compute.server_actions.return_value = [
+            self._Action("req-old", "attach_volume", "Error", "libvirtError")
+        ]
+
+        detail = self.os_utils.attach_volume_failure(
+            "srv-1", "vol-1", exclude_ids={"req-old"}
+        )
+
+        self.assertIsNone(detail)
+
+    def test_ignores_successful_actions(self):
+        self.conn.compute.server_actions.return_value = [
+            self._Action("req-1", "attach_volume", "Success")
+        ]
+
+        self.assertIsNone(self.os_utils.attach_volume_failure("srv-1", "vol-1"))
+
+    def test_list_server_action_ids_tolerates_api_error(self):
+        self.conn.compute.server_actions.side_effect = RuntimeError("denied")
+
+        self.assertEqual(self.os_utils.list_server_action_ids("srv-1"), set())
+
 
 if __name__ == "__main__":
     unittest.main()

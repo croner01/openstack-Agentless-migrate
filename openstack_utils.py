@@ -21,6 +21,50 @@ def _normalize_status(value: Any) -> str:
     return str(value or "").strip().lower().replace("-", "_")
 
 
+def _summarize_host_attach_error(traceback_text: str) -> str:
+    """把 Nova instance action 的 traceback 压成一行可读的挂载失败原因。"""
+    lines = [line.strip() for line in str(traceback_text or "").splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return "宿主机挂载卷失败（Nova 未给出 traceback）"
+    tail = lines[-1]
+    for line in reversed(lines):
+        lowered = line.lower()
+        if "libvirterror" in lowered or "failed" in lowered or "error" in lowered:
+            tail = line
+            break
+    # 去掉 Python 常见的 "libvirt.libvirtError: " 前缀，保留可检索的关键报错。
+    for marker in (": ",):
+        if marker in tail and tail.split(marker, 1)[0].strip().lower().endswith(
+            "error"
+        ):
+            tail = tail.split(marker, 1)[1].strip()
+            break
+    return tail[:300]
+
+
+def _instance_action_mentions(event: dict[str, Any], wanted: set[str]) -> bool:
+    """判断 instance action 事件是否指向目标卷 / attachment。
+
+    常驻模式一台节点会并发挂多块盘，同一实例上的 attach_volume 失败事件
+    可能属于别的卷；只有事件里明确出现目标卷/attachment 标识时才认领，
+    否则交由"attachment 记录缺失"这条按卷判据处理，避免误伤健康盘。
+    """
+    if not wanted:
+        return True
+    direct = {
+        str(event.get(key) or "")
+        for key in ("volume_id", "attachment_id", "resource_id", "volume")
+    }
+    if wanted & direct:
+        return True
+    text = " ".join(
+        str(event.get(key) or "")
+        for key in ("event", "traceback", "details", "message")
+    )
+    return any(item and item in text for item in wanted)
+
+
 def relay_boot_volume_size(image_bytes: int, *, extra_gib: int = 10) -> int:
     """中转机启动卷大小：镜像大小 + extra_gib，向上取整到 GiB。"""
     size = int(image_bytes or 0) + int(extra_gib) * 1024**3
@@ -1403,6 +1447,78 @@ class OpenStackUtils:
             )
         return getattr(attachment, "id", "") or ""
 
+    def list_server_action_ids(self, server_id: str) -> set[str]:
+        """列出实例最近的 instance action request id。
+
+        挂载前先记下已存在的动作，之后只把"新出现的 attach_volume 且失败"
+        当成本次挂载失败，避免把上一次重试/手工挂载留下的旧失败当成现场。
+        """
+        ids: set[str] = set()
+        try:
+            actions = self.conn.compute.server_actions(server_id)
+        except Exception:  # noqa: BLE001 - 老版本 SDK/权限不足时放弃该判据
+            return ids
+        for action in actions or []:
+            request_id = str(getattr(action, "id", "") or "")
+            if request_id:
+                ids.add(request_id)
+        return ids
+
+    def attach_volume_failure(
+        self,
+        server_id: str,
+        volume_id: str,
+        *,
+        exclude_ids: Any = (),
+        attachment_id: str = "",
+    ) -> str | None:
+        """返回 Nova 侧最近一次 attach_volume 的失败摘要；没有则 None。
+
+        Cinder 卷在宿主机热插盘失败（libvirt 报错）时可能一直是 available，
+        只盯卷状态会干等到超时，所以补一条 instance action 判据：
+        openstacksdk 的 ServerAction.events 里会带 ``result=Error`` 与
+        ``traceback``，能直接看到 ``virDomainAttachDeviceFlags() failed``。
+
+        一台中转机可能并发挂多块盘，只认事件里明确指向本卷/本 attachment
+        的失败，避免把别的卷的挂载失败算到这一块上。
+        """
+        excluded = {str(item) for item in (exclude_ids or ())}
+        wanted = {str(volume_id), str(attachment_id)} - {""}
+        try:
+            actions = self.conn.compute.server_actions(server_id)
+        except Exception:  # noqa: BLE001 - 查询失败时退回卷状态判据
+            return None
+        for action in actions or []:
+            request_id = str(getattr(action, "id", "") or "")
+            if request_id and request_id in excluded:
+                continue
+            data = action.to_dict() if hasattr(action, "to_dict") else {}
+            name = str(
+                data.get("action") or getattr(action, "action", "") or ""
+            ).strip()
+            if name != "attach_volume":
+                continue
+            events = data.get("events")
+            if events is None:
+                events = getattr(action, "events", None) or []
+            for event in events:
+                if hasattr(event, "to_dict"):
+                    event = event.to_dict()
+                if not isinstance(event, dict):
+                    continue
+                if str(event.get("result") or "").strip().lower() not in {
+                    "error",
+                    "failed",
+                }:
+                    continue
+                if not _instance_action_mentions(event, wanted):
+                    continue
+                return _summarize_host_attach_error(
+                    str(event.get("traceback") or "")
+                    or str(event.get("event") or "attach_volume 失败")
+                )
+        return None
+
     def detach_volume(self, server_id: str, volume_id: str) -> None:
         delete = getattr(self.conn.compute, "delete_volume_attachment", None)
         if callable(delete):
@@ -1798,6 +1914,8 @@ class OpenStackUtils:
         context: str = "",
         should_stop: Callable[[], bool] | None = None,
         on_wait: Callable[[float], None] | None = None,
+        failure_probe: Callable[[], str | None] | None = None,
+        failure_probe_interval_polls: int = 6,
     ):
         """等待卷达到目标状态。
 
@@ -1806,7 +1924,9 @@ class OpenStackUtils:
         正常，按时间判死会让平台在云上还在建盘时就判失败并回收资源。等待期间
         每 60s 打点一次记录进度（同时调用 ``on_wait``，调用方用它刷新台账
         时间戳，避免长等待期间被对账逻辑当成孤儿资源清理），需要中止时由
-        ``should_stop`` 回调决定。
+        ``should_stop`` 回调决定。``failure_probe`` 是可选的外部失败判据
+        （如 Nova instance action / attachment 记录），返回非空字符串即
+        立刻按挂载失败收尾，不必干等到超时。
         """
         if timeout is None:
             timeout = volume_ready_timeout_default()
@@ -1843,6 +1963,15 @@ class OpenStackUtils:
                         f"{context}"
                     )
             polls += 1
+            if (
+                failure_probe is not None
+                and polls % max(int(failure_probe_interval_polls or 1), 1) == 0
+            ):
+                detail = failure_probe()
+                if detail:
+                    raise RuntimeError(
+                        f"卷 {volume_id} 挂载失败: {detail}{context}"
+                    )
             if polls % 12 == 0:
                 logging.warning(
                     "[MIGRATION] 卷 %s 等待 %s，当前状态 %s，已等待 %ss%s",

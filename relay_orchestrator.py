@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -78,6 +79,61 @@ def _describe(pool: Any) -> list[str]:
         return []
 
 
+class _FifoSlotQueue:
+    """跨线程的池级排队闸门：让等待最久的作业/盘先拿到释放出来的槽位。
+
+    槽位只有 ``pool.acquire`` 一个入口，天然是"谁先抢到算谁的"；并发准备
+    多块盘时，后启动的线程可能反复插队，把先来的饿死。这里给每个池维护
+    一条票号队列，只有队首能尝试 acquire，成功或退出时把票销掉。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._queues: dict[int, list[int]] = {}
+        self._counter = 0
+
+    def ticket(self, pool: Any) -> tuple[int, int]:
+        key = id(pool)
+        with self._lock:
+            self._counter += 1
+            token = self._counter
+            self._queues.setdefault(key, []).append(token)
+            return key, token
+
+    def is_front(self, key: int, token: int) -> bool:
+        with self._lock:
+            queue = self._queues.get(key)
+            return bool(queue) and queue[0] == token
+
+    def drop(self, key: int, token: int) -> None:
+        with self._lock:
+            queue = self._queues.get(key)
+            if not queue:
+                return
+            if token in queue:
+                queue.remove(token)
+            if not queue:
+                self._queues.pop(key, None)
+
+
+_SLOT_QUEUE = _FifoSlotQueue()
+
+
+def _pool_has_live_holder(pool: Any) -> bool:
+    """池里是否还有"迟早会释放"的持有者；取不到判断时按 True（继续等）。"""
+    probe = getattr(pool, "has_live_holder", None)
+    if callable(probe):
+        try:
+            return bool(probe())
+        except Exception:  # noqa: BLE001 - 诊断失败不改变等待语义
+            return True
+    described = _describe(pool)
+    if not described:
+        # describe 不可用/为空时无法判断，保守继续等，避免误判。
+        return not callable(getattr(pool, "describe", None))
+    return any("(agent-unreachable)" not in item for item in described)
+
+
 @dataclass
 class PreparedVolume:
     """「打快照 → 派生拷贝源 → 建目标空白卷」的产物。
@@ -123,6 +179,8 @@ class RelayVolumeMover:
         hole_mode: str = "skip",
         stall_timeout: float = 300.0,
         slot_wait_timeout: float = 1800.0,
+        #: 取消/停机回调：不限时排队期间必须能被用户取消，否则线程会一直挂着。
+        should_stop: Callable[[], bool] | None = None,
         #: 失败后保留派生卷/快照的时长（秒）；None 时读
         #: MIGRATION_DERIVED_RETENTION_HOURS（默认 24h），0 = 失败即回收。
         derived_retention_window: float | None = None,
@@ -149,6 +207,7 @@ class RelayVolumeMover:
         self.hole_mode = hole_mode
         self.stall_timeout = stall_timeout
         self.slot_wait_timeout = slot_wait_timeout
+        self.should_stop = should_stop or (lambda: False)
         self.derived_retention_window = (
             derived_retention_seconds()
             if derived_retention_window is None
@@ -546,15 +605,22 @@ class RelayVolumeMover:
             source_node = self._acquire_with_wait(
                 self.source_pool, volume.source_volume_id
             )
+            if source_node is None:
+                # 源端都拿不到就不要再抢目标端：既白等一轮，也会把"自己刚
+                # 标记的 busy"写进报错现场，误导排查方向。
+                source_state = ", ".join(_describe(self.source_pool)) or "无节点"
+                raise RuntimeError(
+                    "中转机池没有空闲机器，无法继续拷贝（源端: "
+                    f"{source_state}）"
+                )
             target_node = self._acquire_with_wait(
                 self.target_pool, volume.source_volume_id
             )
-            if source_node is None or target_node is None:
-                source_state = ", ".join(_describe(self.source_pool)) or "无节点"
+            if target_node is None:
                 target_state = ", ".join(_describe(self.target_pool)) or "无节点"
                 raise RuntimeError(
-                    "中转机池没有空闲机器，无法继续拷贝"
-                    f"（源端: {source_state}；目标端: {target_state}）"
+                    "中转机池没有空闲机器，无法继续拷贝（目标端: "
+                    f"{target_state}）"
                 )
             self._save(
                 record,
@@ -789,25 +855,52 @@ class RelayVolumeMover:
 
         ephemeral 池按作业固定创建 N 台机器，池大小小于并发数时立刻报
         "没有空闲机器"会把其它 VM 白白判失败；作业本身是串行消费槽位的，
-        等前一个卷做完就能继续。slot_wait_timeout=0 时保持旧的立即失败行为。
+        等前一个卷做完就能继续。
+
+        ``slot_wait_timeout`` 是作业表单「等待空闲槽位」的统一口径，两种池
+        模式共用：``0`` = 不限时，正数 = 等满该秒数仍拿不到才失败。等待按
+        FIFO 交接，且能被取消/停机信号打断。
+
+        只有 ``0`` = 不限时 时才额外检查"池里确实无人会释放"（池为空、全部
+        agent 失联）：否则无限排队会永久挂起。配了有限超时时不能提前判死——
+        一次心跳抖动会让整池暂时显示 agent-unreachable，但作业表单既然给了
+        等待上限，就应当等满再失败。
         """
         node = pool.acquire(task_id)
-        if node is not None or self.slot_wait_timeout <= 0:
+        if node is not None:
             return node
-        deadline = self.clock() + float(self.slot_wait_timeout)
+        limit = float(self.slot_wait_timeout or 0.0)
+        if limit <= 0 and not _pool_has_live_holder(pool):
+            logging.warning(
+                "[MIGRATION] 不限时排队但池内无人会释放（agent 全部失联），"
+                "立即失败（%s）",
+                "、".join(_describe(pool)) or "无节点",
+            )
+            return None
+        deadline = None if limit <= 0 else self.clock() + limit
         waited = 0.0
-        while node is None and self.clock() < deadline:
-            if int(waited) % 60 == 0:
-                logging.info(
-                    "[MIGRATION] 中转机池已满，等待空闲槽位 %.0fs/%s（%s）",
-                    waited,
-                    f"{self.slot_wait_timeout:.0f}s",
-                    "、".join(_describe(pool)) or "无节点",
-                )
-            self.sleeper(self.poll_interval)
-            waited += self.poll_interval
-            node = pool.acquire(task_id)
-        return node
+        key, token = _SLOT_QUEUE.ticket(pool)
+        try:
+            while True:
+                if self.should_stop():
+                    raise CopyCancelled("等待中转机空闲槽位被取消")
+                if _SLOT_QUEUE.is_front(key, token):
+                    node = pool.acquire(task_id)
+                    if node is not None:
+                        return node
+                if deadline is not None and self.clock() >= deadline:
+                    return None
+                if int(waited) % 60 == 0:
+                    logging.info(
+                        "[MIGRATION] 中转机池已满，等待空闲槽位 %.0fs/%s（%s）",
+                        waited,
+                        "不限时" if deadline is None else f"{limit:.0f}s",
+                        "、".join(_describe(pool)) or "无节点",
+                    )
+                self.sleeper(self.poll_interval)
+                waited += self.poll_interval
+        finally:
+            _SLOT_QUEUE.drop(key, token)
 
     def _sparse_enabled(self, source_node: Any, target_node: Any) -> tuple[bool, str]:
         """两端 agent 都支持空洞帧、且模式不为 off 时才启用。

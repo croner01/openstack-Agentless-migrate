@@ -208,14 +208,33 @@ class VolumeLifecycleTest(unittest.TestCase):
         self.source_os.delete_volume_snapshot.assert_called_once_with("snap-1")
 
     def test_attach_detaches_volume_when_wait_times_out(self):
+        """关闭自动重试时：挂载失败要立刻卸载残留 attachment。"""
         self.source_os.wait_volume_status.side_effect = TimeoutError("超时")
 
         with self.assertRaises(TimeoutError):
-            self.lifecycle.attach(role="source", server_id="relay-s", volume_id="vol-d1")
+            self.lifecycle.attach(
+                role="source", server_id="relay-s", volume_id="vol-d1", retries=0
+            )
 
         self.source_os.detach_volume.assert_called_once_with(
             server_id="relay-s", volume_id="vol-d1"
         )
+
+    def test_attach_retries_once_after_cleaning_attachment(self):
+        """宿主机热插盘失败会先清理残留，再自动重试一次。"""
+        lifecycle = VolumeLifecycle(
+            self.source_os, self.target_os, sleeper=lambda seconds: None
+        )
+        self.source_os.wait_volume_status.side_effect = [
+            RuntimeError("卷 vol-d1 挂载失败: virDomainAttachDeviceFlags() failed"),
+            mock.Mock(status="in-use"),
+        ]
+
+        lifecycle.attach(role="source", server_id="relay-s", volume_id="vol-d1")
+
+        self.assertEqual(self.source_os.attach_volume.call_count, 2)
+        # 第一次失败后卸载残留；重试成功后不再卸载。
+        self.assertEqual(self.source_os.detach_volume.call_count, 1)
 
     def test_attach_rejects_unknown_role(self):
         with self.assertRaises(ValueError):

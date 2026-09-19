@@ -157,6 +157,44 @@ class RelayScheduler:
         vm_id: str = "",
         volume_id: str = "",
     ) -> ScheduledNode:
+        """取槽位；容量不足时先等/扩容，最终仍失败则抛 NoCapacityError。
+
+        ``try_acquire`` 是不进长等待的版本，供上层统一排队（0=不限时）使用。
+        """
+        view = self.try_acquire(
+            task_id,
+            job_id=job_id,
+            role=role,
+            tenant_key=tenant_key,
+            az=az,
+            vm_id=vm_id,
+            volume_id=volume_id,
+            wait=True,
+        )
+        if view is not None:
+            return view
+        raise NoCapacityError(
+            f"中转机池无可用槽位: tenant={tenant_key} role={role} az={az}"
+        )
+
+    def try_acquire(
+        self,
+        task_id: str,
+        *,
+        job_id: str,
+        role: str,
+        tenant_key: str,
+        az: str,
+        vm_id: str = "",
+        volume_id: str = "",
+        wait: bool = False,
+    ) -> ScheduledNode | None:
+        """尝试取槽位；取不到返回 None。
+
+        wait=False（默认）只做"立即取 + 尝试扩容一次"，不进入
+        queue_timeout_seconds 的长等待，交由上层（搬运器）统一排队，
+        这样「等待空闲槽位」的 0=不限时/取消/停机对两种池模式一致。
+        """
         claim_args = {
             "job_id": job_id,
             "role": role,
@@ -168,17 +206,16 @@ class RelayScheduler:
         if view is not None:
             return view
         # 没有空闲槽位才扩容：grow 会 sleep/建机，绝不能持锁执行。
-        for _ in range(4):
-            record = self.grow(tenant_key, role, az, needed=1)
+        # wait=False 时只尝试一轮扩容就返回，避免上层 1s 轮询里反复建机。
+        for _ in range(4 if wait else 1):
+            record = self.grow(tenant_key, role, az, needed=1, wait=wait)
             if record is None:
                 break
             view = self._claim_record(record, task_id, **claim_args)
             if view is not None:
                 return view
             # 建机/挑中的槽位被别的线程先抢走：继续下一轮，由 grow 重新决策。
-        raise NoCapacityError(
-            f"中转机池无可用槽位: tenant={tenant_key} role={role} az={az}"
-        )
+        return None
 
     def _try_claim(
         self,
@@ -341,13 +378,25 @@ class RelayScheduler:
             return len(released)
 
     def grow(
-        self, tenant_key: str, role: str, az: str, *, needed: int
+        self,
+        tenant_key: str,
+        role: str,
+        az: str,
+        *,
+        needed: int,
+        wait: bool = True,
     ) -> RelayNodeRecord | None:
-        """优先复用空闲槽位；不足则扩容，额度满则先跨 AZ 再平衡，最后排队。"""
+        """优先复用空闲槽位；不足则扩容，额度满则先跨 AZ 再平衡。
+
+        ``wait=False`` 时只做一次"取槽位 / 建机 / 跨 AZ 再平衡"的尝试，
+        拿不到就返回 None，不在这里阻塞；上层用它实现统一排队与取消。
+        ``queue_timeout_seconds`` 为 0 表示不限时（仅在 wait=True 时生效）。
+        """
         if self.node_manager is None:
             return None
 
-        deadline = self._clock() + self.config.queue_timeout_seconds
+        limit = float(self.config.queue_timeout_seconds or 0.0)
+        deadline = self._clock() + limit if (wait and limit > 0) else None
         while True:
             record = self.pick_node(tenant_key, role, az)
             if record is not None:
@@ -358,21 +407,28 @@ class RelayScheduler:
                 < self.config.max_nodes
             ):
                 # 先等其他作业释放槽位，再决定是否真的建机。
-                self._sleeper(self.config.scale_up_wait_seconds)
-                record = self.pick_node(tenant_key, role, az)
-                if record is not None:
-                    return record
+                if wait:
+                    self._sleeper(self.config.scale_up_wait_seconds)
+                    record = self.pick_node(tenant_key, role, az)
+                    if record is not None:
+                        return record
                 record = self._create_ready_node(tenant_key, role, az)
                 if record is not None:
                     return record
                 # 建机后槽位仍被抢走/建机失败：回到外层循环继续等待，
                 # 不能落到下面的 rebalance 把别的 AZ 空闲节点删掉。
+                if not wait:
+                    return None
                 continue
 
             if self._rebalance(tenant_key, role, az):
+                if not wait:
+                    return self.pick_node(tenant_key, role, az)
                 continue
 
-            if self._clock() >= deadline:
+            if not wait:
+                return None
+            if deadline is not None and self._clock() >= deadline:
                 raise QueueTimeoutError(
                     "中转机池已满且等待超时: "
                     f"tenant={tenant_key} role={role} az={az}"
