@@ -16,7 +16,20 @@ class VmDiskSummaryRenderTest(unittest.TestCase):
         html = self._html()
 
         self.assertIn('id="vols-vm-disks"', html)
-        self.assertIn("renderVmDiskSummary($('#vols-vm-disks'), vmDiskSummaryItems(vms))", html)
+        # 卷拷贝页签只汇总 RBD 直连通道（vm.volumes）：中转机的盘由「中转机
+        # 通道」页签负责，混进来会出现"汇总有数、下面的卷明细却是空的"。
+        self.assertIn("renderVmDiskSummary($('#vols-vm-disks'), rbdItems)", html)
+        self.assertIn(".filter(item => item.disks.length);", html)
+
+    def test_volume_tab_points_relay_jobs_at_the_relay_tab(self):
+        """整机走中转机时 RBD 两张表全空，必须给出去哪看盘的可操作提示。"""
+        html = self._html()
+
+        self.assertIn('id="vols-rbd-note"', html)
+        self.assertIn('id="vols-rbd-body"', html)
+        self.assertIn("本作业的盘走「中转机通道」", html)
+        self.assertIn("逐盘明细与在途进度见「中转机通道」页签", html)
+        self.assertIn("rbdBody.classList.toggle('hidden', !rbdItems.length && relayVmCount > 0);", html)
 
     def test_relay_tab_and_vm_list_reuse_the_same_summary(self):
         html = self._html()
@@ -163,3 +176,53 @@ class RelayDiskDetailRenderTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VmProgressColumnRenderTest(unittest.TestCase):
+    """中转机作业的 VM 列表进度列与 VM 抽屉都要读 relay_disks；只读 vm.volumes
+    会让整列恒为 —，逼着运维每次切页签找盘。"""
+
+    def setUp(self):
+        self.client = app_module.app.test_client()
+
+    def _html(self) -> str:
+        return self.client.get("/").get_data(as_text=True)
+
+    def test_vm_progress_falls_back_to_relay_disks(self):
+        html = self._html()
+
+        self.assertIn("function vmRelayDiskRows(vm)", html)
+        self.assertIn(
+            "return relayDiskDetailRows([vm], state.relayPayload || null)", html
+        )
+        self.assertIn("function vmPrimaryDiskRow(vm)", html)
+        self.assertIn("function vmPrimaryProgressHTML(vm)", html)
+        self.assertIn("const progressHtml = vmPrimaryProgressHTML(vm);", html)
+        # 快照/派生/排队没有字节流动，用阶段文案兜底，不能显示成空白。
+        self.assertIn("disk.progress_label", html)
+
+    def test_vm_drawer_lists_relay_disks(self):
+        html = self._html()
+
+        self.assertIn("中转机通道（逐盘）", html)
+        self.assertIn("const relayRows = vmRelayDiskRows(vm);", html)
+        self.assertIn("status.appendChild(relayPhaseBadge(row));", html)
+
+    def test_ledger_fallback_is_filtered_by_vm_name(self):
+        """老作业没有 relay_disks 时会退回整份台账，必须按 VM 名过滤，
+        否则会把别的 VM 的盘画到这台 VM 的进度列/抽屉里。"""
+        html = self._html()
+
+        self.assertIn(".filter(row => !row.vm_id || row.vm_id === vm.name);", html)
+
+    def test_relay_snapshot_is_scoped_to_the_current_job(self):
+        html = self._html()
+
+        self.assertIn("state.relayPayload = null;", html)
+        self.assertIn(
+            "if (!state.currentJob || state.currentJob.id !== job.id) state.relayPayload = null;",
+            html,
+        )
+        # 轮询先 renderJob 再取 /relay，取到后要用实时台账补刷 VM 列表进度列。
+        self.assertIn("state.relayPayload = relay;", html)
+        self.assertIn("if (state.currentJob) renderVmTable(vms);", html)

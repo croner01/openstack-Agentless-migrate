@@ -358,25 +358,31 @@ class MigrationManager:
         transfer_workers = self._relay_transfer_workers(options)
         prepare_workers = int(options.get("volume_concurrency") or 1)
         active: list[Any] = []
-        failed: list[dict[str, Any]] = []
         try:
-            prepared, failed = self._prepare_relay_volumes(
+            prepared, prepare_failures = self._prepare_relay_volumes(
                 mover, vm, indexed_entries, volume_types, workers=prepare_workers,
             )
+            # 准备阶段失败的盘不会进 active，得先落到盘明细上，否则这一轮
+            # 聚合失败集合时看不到它。
+            for item in prepare_failures:
+                self._mark_relay_disk_failed(vm, item["index"], item["error"])
             self._sync_relay_disk_targets(vm, prepared)
             active = list(prepared)
 
             # 逐盘失败不再直接判死整台 VM：健康的盘先传完，失败盘进入等待重试。
             while True:
-                failed = failed + self._relay_transfer_volumes(
+                transfer_failures = self._relay_transfer_volumes(
                     mover, vm, active, workers=transfer_workers
                 )
                 active = []
-                if not failed:
-                    break
-                for item in failed:
+                for item in transfer_failures:
                     self._mark_relay_disk_failed(vm, item["index"], item["error"])
                 self._persist()
+                # 等待重试的必须是「VM 上所有仍失败的盘」，而不是本轮新失败的
+                # 增量：用户只勾了一部分盘时，没勾到的失败盘要继续留在队列里。
+                failed = self._relay_failed_disks(vm)
+                if not failed:
+                    break
                 chosen = self._await_relay_disk_retry(vm, failed)
                 retry_entries = [
                     (item["index"], entry_by_index[item["index"]])
@@ -388,7 +394,7 @@ class MigrationManager:
                     item["index"]: str(item.get("target_volume_id") or "")
                     for item in chosen
                 }
-                prepared, failed = self._prepare_relay_volumes(
+                prepared, retry_failures = self._prepare_relay_volumes(
                     mover,
                     vm,
                     retry_entries,
@@ -396,6 +402,8 @@ class MigrationManager:
                     workers=prepare_workers,
                     reuse_targets=reuse,
                 )
+                for item in retry_failures:
+                    self._mark_relay_disk_failed(vm, item["index"], item["error"])
                 self._sync_relay_disk_targets(vm, prepared)
                 active = list(prepared)
         except Exception as exc:  # noqa: BLE001 - 失败原因要落在盘上再往上抛
@@ -685,13 +693,21 @@ class MigrationManager:
                     if not wanted or str(item.get("volume_id")) in wanted
                 ]
                 if not chosen:
-                    chosen = list(failed)
-                logging.info(
-                    "[MIGRATION] VM %s 收到失败盘重试指令，重试 %s 块盘",
-                    vm.name,
-                    len(chosen),
-                )
-                return chosen
+                    # 请求里的盘已经不在失败集合里（状态被并发改掉、或请求过期）。
+                    # 忽略这次请求继续等，让用户重新点一次；绝不能拿别的盘顶替。
+                    logging.warning(
+                        "[MIGRATION] VM %s 收到的失败盘重试指令没有匹配到失败盘，"
+                        "已忽略：%s",
+                        vm.name,
+                        "、".join(sorted(wanted)) or "（空）",
+                    )
+                else:
+                    logging.info(
+                        "[MIGRATION] VM %s 收到失败盘重试指令，重试 %s 块盘",
+                        vm.name,
+                        len(chosen),
+                    )
+                    return chosen
             if deadline is not None and time.time() >= deadline:
                 raise RuntimeError(
                     f"失败盘等待人工重试超过 {int(self._disk_retry_wait)}s，已按失败结束；"
@@ -763,6 +779,29 @@ class MigrationManager:
             if disk.get("status") == "failed":
                 disk["status"] = "pending"
                 disk["error"] = ""
+
+    @staticmethod
+    def _relay_failed_disks(vm: VmTask) -> list[dict[str, Any]]:
+        """聚合 VM 上仍处于失败态的盘，作为等待重试/可点重试的完整集合。
+
+        每轮只重试用户点选的那几块，其余失败盘必须继续留在集合里；因此这里
+        以 ``relay_disks`` 明细为准重建，而不是沿用上一轮的增量列表。
+        """
+        failed: list[dict[str, Any]] = []
+        for index, disk in enumerate(vm.relay_disks or []):
+            if disk.get("status") != "failed":
+                continue
+            failed.append(
+                {
+                    "index": index,
+                    "volume_id": str(disk.get("volume_id") or ""),
+                    "error": str(disk.get("error") or ""),
+                    "target_volume_id": str(disk.get("target_volume_id") or ""),
+                    "retained_until": disk.get("retained_until") or 0.0,
+                    "retain_reason": str(disk.get("retain_reason") or ""),
+                }
+            )
+        return failed
 
     @staticmethod
     def _mark_relay_disk_failed(vm: VmTask, index: Any, error: str) -> None:

@@ -430,6 +430,32 @@ class RelayPageRenderTest(unittest.TestCase):
         self.assertIn('id="bulk-power"', html)
         self.assertIn("power === 'on'", html)
 
+    def test_default_image_is_a_bulk_control_in_the_plan_toolbar(self):
+        """默认目标镜像从「选择 VM」步骤移到规划工具条，和批量 AZ 同一行。"""
+        html = self._html()
+
+        # 第③步工具栏不再有默认镜像选择器。
+        self.assertNotIn("默认目标镜像", html)
+        step3 = html.split('id="wz-s3"', 1)[1].split('id="wz-s4"', 1)[0]
+        self.assertNotIn('id="global-image"', step3)
+        # 规划工具条顺序：批量 AZ → 批量镜像设置 → 批量开机设置 → 应用。
+        step4 = html.split('id="wz-s4"', 1)[1]
+        self.assertIn('id="global-image"', step4)
+        self.assertIn("批量镜像设置…", step4)
+        self.assertLess(step4.index('id="bulk-az"'), step4.index('id="global-image"'))
+        self.assertLess(step4.index('id="global-image"'), step4.index('id="bulk-power"'))
+        self.assertLess(step4.index('id="global-image"'), step4.index('id="bulk-apply"'))
+
+    def test_bulk_image_applies_on_apply_not_on_change(self):
+        """批量镜像和批量 AZ 一致：点「应用」才落到逐台参数，不再改动即覆盖。"""
+        html = self._html()
+
+        self.assertNotIn("$('#global-image').addEventListener('change'", html)
+        self.assertIn("const image = $('#global-image').value;", html)
+        self.assertIn("if (image) row.target_image = image;", html)
+        # 忘点「应用」时给出可操作的提示，而不是只说缺镜像。
+        self.assertIn("「批量镜像设置」选好后需点「应用」", html)
+
     def test_submit_payload_and_detail_view_carry_start_target(self):
         """提交参数、作业详情 chip / 抽屉概览都要带上开关状态。"""
         html = self._html()

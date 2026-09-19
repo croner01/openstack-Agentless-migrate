@@ -780,6 +780,106 @@ class RelayTransferConcurrencyTest(unittest.TestCase):
         self.assertEqual(reuse["index"], fail_index)
         self.assertEqual(reuse["reuse_target_volume_id"], "vol-t2")
 
+    def test_selective_retry_keeps_other_failed_disks_retryable(self):
+        """只勾选部分失败盘重试时，没勾到的盘要继续可点、可重试。
+
+        回归：原来每轮把等待集合换成"本轮准备结果"，所以只重试一块盘成功后，
+        循环就以为没有失败盘了 → 直接走到"仍有云盘未完成"，整台 VM 判死，
+        其余失败盘的重试按钮也一起消失。
+        """
+        failing = {2, 3}
+        attempts: dict[int, int] = {}
+        order: list[int] = []
+
+        def fake_transfer(item):
+            index = int(item.index)
+            order.append(index)
+            attempts[index] = attempts.get(index, 0) + 1
+            if index in failing and attempts[index] == 1:
+                raise RuntimeError(f"404 Volume vol-t{index} could not be found")
+            return {"target_volume_id": item.target_volume_id, "size": 10}
+
+        self.mover.transfer.side_effect = fake_transfer
+        # 先只重试盘 3，再只重试盘 2：勾选顺序与失败顺序相反也必须各自生效。
+        pending = [["vol-s3"], ["vol-s2"]]
+
+        def take():
+            return pending.pop(0) if pending else None
+
+        self.manager._disk_retry_take = take
+
+        self._run(relay_transfer_concurrency=2, relay_disk_retry_wait_seconds=30)
+
+        statuses = [disk["status"] for disk in self.vm.relay_disks]
+        self.assertEqual(statuses, ["success"] * 4)
+        # 重试只重做被勾选的那块盘，且严格按 volume_id 对应。
+        retry_indexes = [
+            call.kwargs["index"] for call in self.mover.prepare.call_args_list[4:]
+        ]
+        self.assertEqual(retry_indexes, [3, 2])
+        self.assertEqual(sorted(order), [0, 1, 2, 2, 3, 3])
+        self.assertEqual(self.vm.relay_disks[2]["error"], "")
+        self.assertEqual(self.vm.relay_disks[3]["error"], "")
+        self.manager.target_os.create_server_from_volumes.assert_called_once()
+
+    def test_retry_request_for_unknown_disk_does_not_retry_others(self):
+        """请求里的 volume_id 对不上失败盘时，宁可继续等，也不能拿别的盘顶替。"""
+        failing = {2, 3}
+        attempts: dict[int, int] = {}
+
+        def fake_transfer(item):
+            index = int(item.index)
+            attempts[index] = attempts.get(index, 0) + 1
+            if index in failing and attempts[index] == 1:
+                raise RuntimeError("挂载失败")
+            return {"target_volume_id": item.target_volume_id, "size": 10}
+
+        self.mover.transfer.side_effect = fake_transfer
+        self.manager._disk_retry_take = lambda: ["vol-does-not-exist"]
+
+        with self.assertRaises(RuntimeError):
+            self._run(relay_disk_retry_wait_seconds=0.05)
+
+        # 没有发生任何重试准备（只做了最初 4 块盘的准备）。
+        self.assertEqual(self.mover.prepare.call_count, 4)
+        self.assertEqual(
+            [disk["status"] for disk in self.vm.relay_disks],
+            ["success", "success", "failed", "failed"],
+        )
+        self.manager.target_os.create_server_from_volumes.assert_not_called()
+
+    def test_retry_failure_returns_to_waiting_instead_of_failing_vm(self):
+        """重试又失败时回到等待队列（还能再点），而不是立刻判死整台 VM。"""
+        attempts: dict[int, int] = {}
+
+        def fake_transfer(item):
+            index = int(item.index)
+            attempts[index] = attempts.get(index, 0) + 1
+            if index == 3 and attempts[index] <= 2:
+                raise RuntimeError("挂载超时")
+            return {"target_volume_id": item.target_volume_id, "size": 10}
+
+        self.mover.transfer.side_effect = fake_transfer
+        pending = [["vol-s3"], ["vol-s3"]]
+
+        def take():
+            return pending.pop(0) if pending else None
+
+        self.manager._disk_retry_take = take
+
+        self._run(relay_disk_retry_wait_seconds=30)
+
+        self.assertEqual(
+            [disk["status"] for disk in self.vm.relay_disks], ["success"] * 4
+        )
+        # 同一块盘被点了两次，就重试两次；每次都要重新准备并回到等待态。
+        retry_indexes = [
+            call.kwargs["index"] for call in self.mover.prepare.call_args_list[4:]
+        ]
+        self.assertEqual(retry_indexes, [3, 3])
+        self.assertEqual(self.mover.transfer.call_count, 6)
+        self.manager.target_os.create_server_from_volumes.assert_called_once()
+
     def test_transfer_workers_falls_back_to_volume_concurrency(self):
         self.assertEqual(
             self.manager._relay_transfer_workers({"volume_concurrency": 4}), 4

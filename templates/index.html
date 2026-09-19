@@ -616,16 +616,19 @@ body.wizard-view .toast-box { bottom: 92px; }
                     </div>
                     <div id="jobtab-vols" class="hidden">
                         <div class="card-body">
-                            <div class="section-lbl" style="margin-top:0">每台虚拟机的云盘</div>
-                            <table class="vol-table" style="width:100%">
-                                <thead><tr><th>VM</th><th>VM 状态</th><th>云盘</th><th>完成</th><th>失败</th><th title="未落终态的盘：排队中 / 拷贝中 / 增量已就绪待切换">进行中</th><th>合计容量</th></tr></thead>
-                                <tbody id="vols-vm-disks"><tr><td colspan="7" class="empty-box">暂无数据</td></tr></tbody>
-                            </table>
-                            <div class="section-lbl">卷明细</div>
-                            <table class="vol-table" style="width:100%">
-                                <thead><tr><th>VM</th><th>源 RBD</th><th>目标 RBD</th><th>模式</th><th>状态</th><th style="min-width:190px">进度</th><th>快照清理</th><th>错误</th></tr></thead>
-                                <tbody id="vols-body"><tr><td colspan="8" class="empty-box">暂无数据</td></tr></tbody>
-                            </table>
+                            <div class="sec-note hidden" id="vols-rbd-note" style="margin-bottom:8px"></div>
+                            <div id="vols-rbd-body">
+                                <div class="section-lbl" style="margin-top:0">每台虚拟机的云盘</div>
+                                <table class="vol-table" style="width:100%">
+                                    <thead><tr><th>VM</th><th>VM 状态</th><th>云盘</th><th>完成</th><th>失败</th><th title="未落终态的盘：排队中 / 拷贝中 / 增量已就绪待切换">进行中</th><th>合计容量</th></tr></thead>
+                                    <tbody id="vols-vm-disks"><tr><td colspan="7" class="empty-box">暂无数据</td></tr></tbody>
+                                </table>
+                                <div class="section-lbl">卷明细</div>
+                                <table class="vol-table" style="width:100%">
+                                    <thead><tr><th>VM</th><th>源 RBD</th><th>目标 RBD</th><th>模式</th><th>状态</th><th style="min-width:190px">进度</th><th>快照清理</th><th>错误</th></tr></thead>
+                                    <tbody id="vols-body"><tr><td colspan="8" class="empty-box">暂无数据</td></tr></tbody>
+                                </table>
+                            </div>
                         </div>
                     </div>
                     <div id="jobtab-relay" class="hidden">
@@ -773,8 +776,6 @@ body.wizard-view .toast-box { bottom: 92px; }
                             <input type="file" class="fld" id="excel_file" name="excel_file" style="width:auto">
                             <button type="button" class="btn btn-sm" id="parse-excel">解析 Excel 清单</button>
                             <div class="spacer"></div>
-                            <label class="form-label" style="margin:0">默认目标镜像</label>
-                            <select class="sel" id="global-image" style="width:220px"><option value="">先验证连接加载目录</option></select>
                             <span class="count" id="wiz-vm-count-lbl">已加载 0 台</span>
                             <span class="count">已选 <b class="mono" id="wiz-sel-count">0</b> 台</span>
                         </div>
@@ -889,9 +890,10 @@ body.wizard-view .toast-box { bottom: 92px; }
 
                         <div class="toolbar" style="border:1px solid var(--line);border-radius:var(--radius-sm);padding:8px 12px;margin-bottom:10px">
                             <b style="font-size:12px">迁移规划</b>
-                            <span class="sec-note">每个源网卡都必须选择目标网络/子网；继承值显示为下拉默认项</span>
+                            <span class="sec-note">每个源网卡都必须选择目标网络/子网；继承值显示为下拉默认项；批量设置选好后点「应用」</span>
                             <div class="spacer"></div>
                             <select class="sel" id="bulk-az" style="width:150px"><option value="">批量目标 AZ…</option></select>
+                            <select class="sel" id="global-image" style="width:190px" title="批量设置每台 VM 的目标镜像，选好后点「应用」；也可在下方逐台覆盖"><option value="">批量镜像设置…</option></select>
                             <select class="sel" id="bulk-power" style="width:150px">
                                 <option value="">批量开机设置…</option>
                                 <option value="on">迁移后开机</option>
@@ -1248,6 +1250,9 @@ const state = {
     jobId: null,
     pollTimer: null,
     currentJob: null,
+    //: 当前作业的中转机运行时快照（/relay 的 relay 字段）。VM 列表的进度列和
+    //: VM 抽屉都复用它，避免为了看一块盘的实时进度反复请求或切页签。
+    relayPayload: null,
     wizStep: 1,
     lastSubmit: null,
     //: 向导里是否有"用户编辑过但还没提交"的内容。只是回放过作业参数、或纯粹
@@ -1599,7 +1604,7 @@ function resetWizard() {
     });
 
     const globalImage = $('#global-image');
-    if (globalImage) globalImage.innerHTML = '<option value="">先验证连接加载目录</option>';
+    if (globalImage) globalImage.innerHTML = '<option value="">批量镜像设置…</option>';
     const bulkAz = $('#bulk-az');
     if (bulkAz) bulkAz.innerHTML = '<option value="">批量目标 AZ…</option>';
     const bulkPower = $('#bulk-power');
@@ -1993,7 +1998,7 @@ function applyTargetCatalog(data) {
     state.catalogLoaded = true;
     const globalImage = $('#global-image');
     globalImage.innerHTML = '';
-    globalImage.appendChild(new Option('（不设默认镜像，逐台选择）', ''));
+    globalImage.appendChild(new Option('批量镜像设置…', ''));
     (data.images || []).forEach(image => globalImage.appendChild(new Option(image.name, image.id)));
     const bulkAz = $('#bulk-az');
     bulkAz.innerHTML = '<option value="">批量目标 AZ…</option>';
@@ -2509,7 +2514,7 @@ function renderPlan(options) {
             row.target_az, 'target_az', '选择目标 AZ'));
         mainTr.appendChild(selectTd(
             (state.targetCatalog.images || []).map(img => ({ id: img.id, label: img.name })),
-            row.target_image || $('#global-image').value, 'target_image', '选择镜像'));
+            row.target_image, 'target_image', '选择镜像'));
         mainTr.appendChild(selectTd(
             (state.targetCatalog.flavors || []).map(f => ({ id: f.id, label: f.name + ' · ' + f.vcpus + 'vCPU/' + f.ram + 'MB' })),
             row.target_flavor, 'target_flavor', '自动匹配'));
@@ -2851,7 +2856,7 @@ function applyBulkToSelected() {
     const image = $('#global-image').value;
     const power = $('#bulk-power') ? $('#bulk-power').value : '';
     if (!az && !image && !power) {
-        toast('请先选择要批量应用的目标 AZ、默认镜像或开机设置', 'error');
+        toast('请先选择要批量应用的目标 AZ、镜像或开机设置', 'error');
         return;
     }
     let count = 0;
@@ -2914,7 +2919,12 @@ async function startMigration() {
     }
     const incomplete = state.previewRows.find(row => !row.target_az || !row.target_image);
     if (incomplete) {
-        toast('VM ' + incomplete.vm_name + ' 缺少目标 AZ 或镜像', 'error');
+        // 批量设置只在点「应用」后落到逐台参数上，忘点时要明确提示，避免卡在
+        // "明明选了镜像却说过不了校验"。
+        const needApply = !incomplete.target_image
+            && $('#global-image') && $('#global-image').value;
+        toast('VM ' + incomplete.vm_name + ' 缺少目标 AZ 或镜像'
+            + (needApply ? '（「批量镜像设置」选好后需点「应用」）' : ''), 'error');
         return;
     }
     const issues = networkIssues();
@@ -3202,6 +3212,37 @@ function vmPrimaryVolume(vm) {
     return active || volumes[volumes.length - 1];
 }
 
+/* 中转机作业的盘不在 vm.volumes 里：VM 列表的「进度」列与 VM 抽屉都要
+   从中转机页签同一份数据（relay_disks + 实时台账）取，否则整列恒为 —。 */
+function vmRelayDiskRows(vm) {
+    // 老作业（没有 relay_disks）时 relayDiskDetailRows 会退回整份台账，
+    // 这里必须按 VM 名过滤，否则会把别的 VM 的盘画到这台 VM 上。
+    return relayDiskDetailRows([vm], state.relayPayload || null)
+        .filter(row => !row.vm_id || row.vm_id === vm.name);
+}
+
+/* 正在拷贝或还没落终态的那块盘优先，全落终态时取最后一块（结果可见）。 */
+function vmPrimaryDiskRow(vm) {
+    const rows = vmRelayDiskRows(vm);
+    if (!rows.length) return null;
+    return rows.find(row => !relayDiskDone(row) && !relayDiskFailed(row))
+        || rows[rows.length - 1];
+}
+
+function vmPrimaryProgressHTML(vm) {
+    const disk = vmPrimaryDiskRow(vm);
+    if (!disk) {
+        const volume = vmPrimaryVolume(vm);
+        return volume ? volumeProgressHTML(volume) : '';
+    }
+    const html = relayProgressHTML(disk);
+    // 打快照/派生/排队这些阶段没有字节流动，进度条是 —；这时用阶段文案
+    // 至少说清"它在哪一步"，不然 VM 列表看起来像什么都没做。
+    return html === '—' && disk.progress_label
+        ? '<div class="sec-note">' + escapeHtml(disk.progress_label) + '</div>'
+        : html;
+}
+
 function jobStage(job) {
     const vms = job.vms || [];
     const ended = s => ['success', 'failed', 'preflight_failed', 'cancelled'].includes(s);
@@ -3249,6 +3290,9 @@ function renderLifecycle(job) {
 }
 
 function renderJob(job) {
+    // 切到别的作业时先丢掉上一份中转机快照：VM 名字可能跨作业重复，
+    // 留着旧快照会把盘画到新作业同名的 VM 上。
+    if (!state.currentJob || state.currentJob.id !== job.id) state.relayPayload = null;
     state.currentJob = job;
     $('#job-id-lbl').textContent = job.id;
     const crumb = $('#crumb-job-id');
@@ -3340,8 +3384,8 @@ function renderVmTable(vms) {
         tr.appendChild(text('td', '', phaseLabel(vm.phase) || vmStatusInfo(vm.status)[1]));
 
         const progTd = text('td');
-        const vol = vmPrimaryVolume(vm);
-        if (vol) progTd.innerHTML = volumeProgressHTML(vol);
+        const progressHtml = vmPrimaryProgressHTML(vm);
+        if (progressHtml) progTd.innerHTML = progressHtml;
         else progTd.appendChild(text('span', 'sec-note', '—'));
         tr.appendChild(progTd);
 
@@ -3378,12 +3422,31 @@ function renderVmTable(vms) {
 }
 
 function renderVolumeTable(vms) {
-    // RBD 全量/增量同样按 VM 汇总"几块盘完成、几块失败"。
-    renderVmDiskSummary($('#vols-vm-disks'), vmDiskSummaryItems(vms));
+    // 「卷拷贝」页签只讲 RBD 直连通道：中转机的盘不写 vm.volumes，用
+    // vmDisksOf 汇总会把中转机的盘混进来，而下面的「卷明细」又是空的。
+    const rbdItems = (vms || [])
+        .map(vm => ({ vm, disks: vm.volumes || [] }))
+        .filter(item => item.disks.length);
+    renderVmDiskSummary($('#vols-vm-disks'), rbdItems);
+    const relayVmCount = (vms || []).filter(vm => (vm.relay_disks || []).length).length;
+    const note = $('#vols-rbd-note');
+    if (note) {
+        const noteText = !relayVmCount ? ''
+            : rbdItems.length
+                ? '另有 ' + relayVmCount + ' 台 VM 走「中转机通道」：逐盘明细与在途进度见'
+                    + '「中转机通道」页签。'
+                : '本作业的盘走「中转机通道」：逐盘明细与在途进度见「中转机通道」页签；'
+                    + '这里只列 RBD 直连通道的卷任务。';
+        note.classList.toggle('hidden', !noteText);
+        note.textContent = noteText;
+    }
+    // 整机都走中转机时，两张 RBD 表全空，只留提示，避免读成"卷任务丢了"。
+    const rbdBody = $('#vols-rbd-body');
+    if (rbdBody) rbdBody.classList.toggle('hidden', !rbdItems.length && relayVmCount > 0);
     const tb = $('#vols-body');
     tb.innerHTML = '';
     let any = false;
-    vms.forEach(vm => {
+    rbdItems.forEach(({ vm }) => {
         (vm.volumes || []).forEach(volume => {
             any = true;
             const tr = document.createElement('tr');
@@ -3538,6 +3601,39 @@ function openVmDrawer(vm) {
             item.appendChild(text('div', 'vol-item-meta', meta.join(' · ')));
 
             if (volume.error) item.appendChild(text('div', 'vol-item-meta err', '错误：' + volume.error));
+            body.appendChild(item);
+        });
+    }
+
+    // 中转机通道的盘不在 vm.volumes 里，抽屉里单独列一段（与「中转机通道」
+    // 页签同一份数据：作业留存的 relay_disks + 在途的实时台账）。
+    const relayRows = vmRelayDiskRows(vm);
+    if (relayRows.length) {
+        body.appendChild(text('div', 'section-lbl', '中转机通道（逐盘）'));
+        relayRows.forEach(row => {
+            const item = document.createElement('div');
+            item.className = 'vol-item';
+
+            const head = document.createElement('div');
+            head.className = 'vol-item-head';
+            head.appendChild(text('span', 'rbd',
+                (relayDiskRoleLabel(row.role) || '盘') + ' '
+                + (row.volume_id || '—') + '  →  ' + (row.target_volume_id || '—')));
+            head.appendChild(text('span', 'sec-note', relayDiskDetailBytes(row)));
+            item.appendChild(head);
+
+            const status = document.createElement('div');
+            status.appendChild(relayPhaseBadge(row));
+            item.appendChild(status);
+
+            const progress = document.createElement('div');
+            const progressHtml = relayProgressHTML(row);
+            progress.innerHTML = (progressHtml === '—' && row.progress_label)
+                ? '<div class="sec-note">' + escapeHtml(row.progress_label) + '</div>'
+                : progressHtml;
+            item.appendChild(progress);
+
+            if (row.error) item.appendChild(text('div', 'vol-item-meta err', '错误：' + row.error));
             body.appendChild(item);
         });
     }
@@ -4356,6 +4452,9 @@ async function refreshRelayPool() {
     // 中转机运行时在作业结束后会被回收（/relay 返回 null），此时改用作业里
     // 持久化的逐盘结果，否则"完成了几块盘、失败了几块盘"会跟着运行时消失。
     const diskRows = relayDiskRows(vms);
+    // VM 列表的「进度」列与 VM 抽屉都复用这份快照（含实时台账），
+    // 所以先落盘再判断页签是否展示。
+    state.relayPayload = relay;
     if (!relay && !diskRows.length) { tab.classList.add('hidden'); return; }
     tab.classList.remove('hidden');
     state.relayNow = (relay && relay.now) || 0;
@@ -4366,6 +4465,10 @@ async function refreshRelayPool() {
         relay ? relayLiveVolumeRows(relay.volumes) : diskRows,
         Boolean(relay)
     );
+    // 上面的轮询顺序是先 renderJob（只有作业自身的数据）再取 /relay，
+    // 这里用刚拿到的实时台账把 VM 列表的进度列补刷一次；VM 表格本来
+    // 每次轮询都会整体重建，不存在额外丢选中状态的问题。
+    if (state.currentJob) renderVmTable(vms);
 }
 
 function relayCounters(relay, diskRows) {
@@ -5207,12 +5310,6 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     $('#parse-excel').addEventListener('click', parseExcel);
     $('#wiz-ck-all').addEventListener('change', event => bulkToggleSourceServers(event.target.checked));
-    $('#global-image').addEventListener('change', () => {
-        const value = $('#global-image').value;
-        state.previewRows.forEach(row => { row.target_image = value; });
-        $$('#plan-body [data-field="target_image"]').forEach(sel => { sel.value = value; });
-        refreshChecklistUI();
-    });
     $('#global-mode').addEventListener('change', () => {
         const value = $('#global-mode').value;
         state.previewRows.forEach(row => { row.mode = value; });
